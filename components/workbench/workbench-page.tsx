@@ -1,23 +1,10 @@
 import Link from "next/link";
-import {
-  ArrowLeft,
-  ArrowRight,
-  ExternalLink,
-  MoreHorizontal,
-  RefreshCw,
-  Send,
-  Square,
-} from "lucide-react";
+import { ExternalLink, Send, Square } from "lucide-react";
 
-import { PreviewSite } from "@/components/demo/preview-site";
+import { WebContainerPreview } from "@/components/preview/webcontainer-preview";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipTrigger,
-} from "@/components/ui/tooltip";
 
 export function WorkbenchPage() {
   return (
@@ -106,83 +93,10 @@ export function WorkbenchPage() {
         </aside>
 
         <section className="workspace">
-          <div className="workspace-toolbar">
-            <div className="preview-tools">
-              <ToolbarButton label="后退">
-                <ArrowLeft />
-              </ToolbarButton>
-              <ToolbarButton label="前进">
-                <ArrowRight />
-              </ToolbarButton>
-              <ToolbarButton label="刷新预览">
-                <RefreshCw />
-              </ToolbarButton>
-            </div>
-            <div className="url-bar">
-              <span className="url-status" />
-              localhost:5173 / overview
-            </div>
-            <div className="preview-tools">
-              <ToolbarButton label="适配视口">
-                <Square />
-              </ToolbarButton>
-              <ToolbarButton label="打开预览">
-                <ExternalLink />
-              </ToolbarButton>
-              <ToolbarButton label="更多预览操作">
-                <MoreHorizontal />
-              </ToolbarButton>
-            </div>
-          </div>
-          <div className="preview-stage">
-            <PreviewSite />
-          </div>
-          <div className="evidence-drawer">
-            <div className="evidence-col">
-              <b>Console</b>
-              <div className="console-line ok">✓ dev server ready in 612ms</div>
-              <div className="console-line">! chart warning captured</div>
-            </div>
-            <div className="evidence-col">
-              <b>Network</b>
-              <span className="network-pill">GET /api/metrics 200</span>
-              <span className="network-pill">7 requests</span>
-              <span className="network-pill">0 failed</span>
-            </div>
-            <div className="evidence-col">
-              <b>Smoke flow</b>
-              <div className="test-line">
-                <span>Open overview</span>
-                <b>Passed</b>
-              </div>
-              <div className="test-line">
-                <span>Change period</span>
-                <b>Running</b>
-              </div>
-            </div>
-          </div>
+          <WebContainerPreview />
         </section>
       </div>
     </div>
-  );
-}
-
-function ToolbarButton({
-  children,
-  label,
-}: {
-  children: React.ReactNode;
-  label: string;
-}) {
-  return (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <Button aria-label={label} size="icon-sm" variant="ghost">
-          {children}
-        </Button>
-      </TooltipTrigger>
-      <TooltipContent>{label}</TooltipContent>
-    </Tooltip>
   );
 }
 
