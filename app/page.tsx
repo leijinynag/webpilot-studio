@@ -1,7 +1,10 @@
+import { AppShell } from "@/components/shell/app-shell";
+import { ProjectsPage } from "@/components/projects/projects-page";
+
 export default function Home() {
   return (
-    <main>
-      <div>Hello world!</div>
-    </main>
+    <AppShell>
+      <ProjectsPage />
+    </AppShell>
   );
 }

@@ -1,14 +1,21 @@
 import type { Metadata } from "next";
-import { Geist } from "next/font/google";
+import { Geist, Instrument_Serif } from "next/font/google";
+import Script from "next/script";
 
+import { ThemeProvider } from "@/components/theme/theme-provider";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { cn } from "@/lib/utils";
 
 import "./globals.css";
 
 const geist = Geist({
   subsets: ["latin"],
-  variable: "--font-geist-sans",
+  variable: "--font-ui",
+});
+
+const instrumentSerif = Instrument_Serif({
+  subsets: ["latin"],
+  variable: "--font-editorial",
+  weight: "400",
 });
 
 export const metadata: Metadata = {
@@ -22,9 +29,40 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="zh-CN" className={cn("font-sans", geist.variable)}>
+    <html
+      lang="zh-CN"
+      className={`${geist.variable} ${instrumentSerif.variable}`}
+      suppressHydrationWarning
+    >
+      <head>
+        <Script id="theme-init" strategy="beforeInteractive">
+          {`
+            (() => {
+              try {
+                const key = "webpilot-theme-v1";
+                const stored = localStorage.getItem(key);
+                const preference =
+                  stored === "light" || stored === "dark" || stored === "system"
+                    ? stored
+                    : "system";
+                const resolved =
+                  preference === "system"
+                    ? matchMedia("(prefers-color-scheme: dark)").matches
+                      ? "dark"
+                      : "light"
+                    : preference;
+                document.documentElement.dataset.theme = resolved;
+                document.documentElement.classList.toggle("dark", resolved === "dark");
+                document.documentElement.style.colorScheme = resolved;
+              } catch {}
+            })();
+          `}
+        </Script>
+      </head>
       <body>
-        <TooltipProvider>{children}</TooltipProvider>
+        <ThemeProvider>
+          <TooltipProvider>{children}</TooltipProvider>
+        </ThemeProvider>
       </body>
     </html>
   );
