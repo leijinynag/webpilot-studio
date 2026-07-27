@@ -1,8 +1,4 @@
-import type {
-  FileSystemTree,
-  WebContainer,
-  WebContainerProcess,
-} from "@webcontainer/api";
+import type { FileSystemTree, WebContainerProcess } from "@webcontainer/api";
 
 import {
   getErrorDetail,
@@ -33,6 +29,15 @@ export type WebContainerAdapter = {
   mount(tree: FileSystemTree): Promise<void>;
   spawn(command: string, args: string[]): Promise<WebContainerProcessAdapter>;
   on(event: "server-ready", listener: ServerReadyListener): () => void;
+  fs: {
+    mkdir(path: string, options: { recursive: true }): Promise<string>;
+    rename(oldPath: string, newPath: string): Promise<void>;
+    rm(
+      path: string,
+      options?: { force?: boolean; recursive?: boolean },
+    ): Promise<void>;
+    writeFile(path: string, data: string | Uint8Array): Promise<void>;
+  };
   teardown(): void;
 };
 
@@ -49,6 +54,14 @@ const MAX_LOG_LINES = 160;
 const ANSI_ESCAPE_PATTERN =
   /[\u001B\u009B][[\]()#;?]*(?:(?:(?:[a-zA-Z\d]*(?:;[-a-zA-Z\d/#&.:=?%@~_]+)*)?\u0007)|(?:(?:\d{1,4}(?:[;:]\d{0,4})*)?[\dA-PR-TZcf-nq-uy=><~]))/g;
 const NPM_SPINNER_LINE_PATTERN = /^[|/\\-]$/;
+const RUNTIME_RESTART_PATHS = new Set([
+  "package.json",
+  "package-lock.json",
+  "pnpm-lock.yaml",
+  "yarn.lock",
+  "rsbuild.config.ts",
+  "rsbuild.config.js",
+]);
 
 async function bootWebContainer(): Promise<WebContainerAdapter> {
   // 动态加载确保 Next.js 服务端构建阶段不会执行依赖浏览器环境的 WebContainer 代码。
@@ -115,6 +128,8 @@ export class WebContainerRuntimeManager {
   private devProcess: WebContainerProcessAdapter | null = null;
   // ready 状态只对当前项目有效；切换项目必须销毁旧容器，避免 mount 合并出跨项目残留文件。
   private activeProjectKey: string | null = null;
+  // mountedFiles 记录运行镜像当前内容，增量同步时据此识别新增、修改和删除。
+  private mountedFiles = new Map<string, string>();
   // generation 是轻量取消令牌。teardown 或未来的新一轮启动会递增它，
   // 旧异步任务即使晚到，也不能再把过期结果写回当前 snapshot。
   private generation = 0;
@@ -142,6 +157,7 @@ export class WebContainerRuntimeManager {
   start(
     tree: FileSystemTree = WEBPILOT_RSBUILD_TEMPLATE,
     projectKey = "default-template",
+    revision: number | null = null,
   ): Promise<WebContainerRuntimeSnapshot> {
     if (
       this.activeProjectKey !== null &&
@@ -155,7 +171,9 @@ export class WebContainerRuntimeManager {
       this.snapshot.phase === "ready" &&
       this.activeProjectKey === projectKey
     ) {
-      return Promise.resolve(this.snapshot);
+      return this.snapshot.syncedRevision === revision
+        ? Promise.resolve(this.snapshot)
+        : this.syncRevision(tree, projectKey, revision);
     }
 
     // Strict Mode、多个预览消费者或用户连续点击重试都可能同时调用 start。
@@ -165,7 +183,7 @@ export class WebContainerRuntimeManager {
     }
 
     this.activeProjectKey = projectKey;
-    const currentStart = this.startRuntime(tree).finally(() => {
+    const currentStart = this.startRuntime(tree, revision).finally(() => {
       // 旧项目的 finally 可能晚于新项目启动；只允许当前 Promise 清理自己的锁。
       if (this.startPromise === currentStart) {
         this.startPromise = null;
@@ -174,6 +192,102 @@ export class WebContainerRuntimeManager {
     this.startPromise = currentStart;
 
     return currentStart;
+  }
+
+  /**
+   * 将一个已成功保存的 Repository revision 写入当前运行镜像。
+   * 普通源码文件使用 fs 增量同步，依赖与构建配置变化则重新启动容器，
+   * 因为仅靠 HMR 无法保证安装结果、Node 进程参数或插件图已经更新。
+   */
+  async syncRevision(
+    tree: FileSystemTree,
+    projectKey: string,
+    revision: number | null,
+  ): Promise<WebContainerRuntimeSnapshot> {
+    if (this.activeProjectKey !== projectKey) {
+      return this.start(tree, projectKey, revision);
+    }
+
+    if (this.startPromise) {
+      await this.startPromise;
+    }
+
+    if (
+      !this.instance ||
+      this.snapshot.phase !== "ready" ||
+      this.activeProjectKey !== projectKey
+    ) {
+      return this.start(tree, projectKey, revision);
+    }
+
+    if (this.snapshot.syncedRevision === revision) {
+      return this.snapshot;
+    }
+
+    const nextFiles = flattenRuntimeTree(tree);
+    const changedPaths = new Set<string>();
+
+    for (const [path, content] of nextFiles) {
+      if (this.mountedFiles.get(path) !== content) {
+        changedPaths.add(path);
+      }
+    }
+
+    for (const path of this.mountedFiles.keys()) {
+      if (!nextFiles.has(path)) {
+        changedPaths.add(path);
+      }
+    }
+
+    if ([...changedPaths].some((path) => RUNTIME_RESTART_PATHS.has(path))) {
+      this.appendLog("[runtime] 依赖或构建配置已变化，正在重建运行镜像...");
+      this.teardown();
+      return this.start(tree, projectKey, revision);
+    }
+
+    try {
+      for (const path of this.mountedFiles.keys()) {
+        if (!nextFiles.has(path)) {
+          await this.instance.fs.rm(path, { force: true });
+          this.appendLog(`[sync] 删除 ${path}`);
+        }
+      }
+
+      for (const [path, content] of nextFiles) {
+        if (this.mountedFiles.get(path) === content) {
+          continue;
+        }
+
+        const parent = path.split("/").slice(0, -1).join("/");
+        if (parent) {
+          await this.instance.fs.mkdir(parent, { recursive: true });
+        }
+        await this.instance.fs.writeFile(path, content);
+        this.appendLog(`[sync] 写入 ${path}`);
+      }
+
+      this.mountedFiles = nextFiles;
+      this.setSnapshot({
+        ...this.snapshot,
+        syncedRevision: revision,
+        diagnostic: null,
+      });
+      this.appendLog(
+        `[runtime] 运行镜像已同步至 revision ${revision ?? "unknown"}。`,
+      );
+      return this.snapshot;
+    } catch (error) {
+      const runtimeError = new WebContainerRuntimeError(
+        "mount_failed",
+        "已保存代码未能同步到浏览器运行镜像。",
+        {
+          cause: error,
+          detail: getErrorDetail(error),
+        },
+      );
+      this.fail(runtimeError);
+      throw runtimeError;
+    }
   }
 
   /**
@@ -189,11 +303,13 @@ export class WebContainerRuntimeManager {
     this.bootPromise = null;
     this.startPromise = null;
     this.activeProjectKey = null;
+    this.mountedFiles = new Map();
     this.setSnapshot(createInitialRuntimeSnapshot());
   }
 
   private async startRuntime(
     tree: FileSystemTree,
+    revision: number | null,
   ): Promise<WebContainerRuntimeSnapshot> {
     const generation = ++this.generation;
     const crossOriginIsolated = this.dependencies.isCrossOriginIsolated();
@@ -238,6 +354,7 @@ export class WebContainerRuntimeManager {
       this.setPhase("mounting");
       this.appendLog("[runtime] 正在挂载固定 Rsbuild 项目模板...");
       await instance.mount(tree);
+      this.mountedFiles = flattenRuntimeTree(tree);
       this.assertGeneration(generation);
 
       this.setPhase("installing");
@@ -274,6 +391,7 @@ export class WebContainerRuntimeManager {
         previewUrl: server.url,
         port: server.port,
         diagnostic: null,
+        syncedRevision: revision,
       });
       this.appendLog(`[runtime] 预览服务已就绪：${server.url}`);
 
@@ -523,5 +641,26 @@ export class WebContainerRuntimeManager {
 
 export const webContainerRuntimeManager = new WebContainerRuntimeManager();
 
-// 只导出类型别名，避免上层组件依赖 WebContainer SDK 的具体实现。
-export type WebContainerInstance = WebContainer;
+// 只导出项目自己的最小接口，避免上层组件依赖 WebContainer SDK 的具体实现。
+export type WebContainerInstance = WebContainerAdapter;
+
+function flattenRuntimeTree(
+  tree: FileSystemTree,
+  parentPath = "",
+  files = new Map<string, string>(),
+): Map<string, string> {
+  for (const [name, entry] of Object.entries(tree)) {
+    const path = parentPath ? `${parentPath}/${name}` : name;
+
+    if ("file" in entry && "contents" in entry.file) {
+      files.set(path, entry.file.contents.toString());
+      continue;
+    }
+
+    if ("directory" in entry) {
+      flattenRuntimeTree(entry.directory, path, files);
+    }
+  }
+
+  return files;
+}

@@ -2869,3 +2869,683 @@ html[data-theme="dark"] .piece-art.travel {
     padding: 22px;
   }
 }
+
+/* M1 IDE refinement：提高工具界面的可读性，并把视觉层级集中到真实工作流。 */
+[data-slot="button"][data-variant="default"] {
+  border-color: var(--primary);
+  color: var(--primary-foreground);
+  background: var(--primary);
+}
+
+[data-slot="button"][data-variant="default"]:hover {
+  color: var(--primary-foreground);
+  background: color-mix(in srgb, var(--primary) 86%, var(--accent));
+}
+
+[data-slot="button"][data-variant="outline"] {
+  border-color: var(--border);
+  color: var(--foreground);
+  background: var(--surface);
+}
+
+[data-slot="button"][data-variant="outline"]:hover,
+[data-slot="button"][data-variant="ghost"]:hover {
+  color: var(--foreground);
+  background: var(--surface-3);
+}
+
+[data-slot="button"][data-variant="ghost"] {
+  color: var(--muted-foreground);
+  background: transparent;
+}
+
+[data-slot="button"][data-variant="destructive"] {
+  border-color: color-mix(in srgb, var(--destructive) 34%, transparent);
+  color: var(--destructive);
+  background: color-mix(in srgb, var(--destructive) 12%, transparent);
+}
+
+.workbench-page {
+  min-height: 0;
+  background: var(--surface);
+}
+
+.app-main:has(.workbench-page) {
+  min-height: 0;
+}
+
+.workbench-top {
+  grid-template-columns: minmax(220px, 1fr) auto minmax(220px, 1fr);
+  min-height: 52px;
+  height: auto;
+  padding: 0 16px;
+  background: var(--surface);
+}
+
+.project-crumb {
+  gap: 9px;
+  font-size: 0.875rem;
+}
+
+.project-crumb a {
+  color: var(--muted-foreground);
+}
+
+.project-crumb a:hover {
+  color: var(--foreground);
+}
+
+.revision-pill {
+  padding: 3px 7px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--muted-foreground);
+  background: var(--surface-2);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.75rem;
+}
+
+.workbench-tabs {
+  gap: 6px;
+  align-self: center;
+  height: 34px;
+  padding: 3px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-control);
+  background: var(--surface-2);
+}
+
+.workbench-tabs [data-slot="toggle-group-item"] {
+  height: 26px;
+  padding: 0 11px;
+  border: 0;
+  border-radius: 5px;
+  font-size: 0.875rem;
+}
+
+.workbench-tabs [data-slot="toggle-group-item"]:hover,
+.workbench-tabs [data-slot="toggle-group-item"][data-state="on"] {
+  border: 0;
+  color: var(--foreground);
+  background: var(--surface);
+  box-shadow: 0 1px 3px color-mix(in srgb, var(--foreground) 9%, transparent);
+}
+
+.workbench-actions {
+  justify-self: end;
+  gap: 8px;
+}
+
+.workbench-actions [data-slot="button"] {
+  min-height: 32px;
+  padding: 0 11px;
+  font-size: 0.875rem;
+}
+
+.workbench-grid {
+  display: block;
+  height: clamp(520px, calc(100dvh - 189px), 760px);
+  min-height: 0;
+  min-width: 0;
+}
+
+.workspace.workspace-ide {
+  display: grid;
+  grid-template-columns: 224px minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
+  height: 100%;
+  min-width: 0;
+  background: var(--surface-2);
+}
+
+.ide-sidebar {
+  min-width: 0;
+  overflow: hidden;
+  border-right: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.ide-panel-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 44px;
+  padding: 0 10px 0 14px;
+  border-bottom: 1px solid var(--border);
+  color: var(--muted-foreground);
+  font-size: 0.8125rem;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.ide-panel-heading > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.ide-panel-heading small {
+  min-width: 20px;
+  padding: 2px 6px;
+  border-radius: 999px;
+  color: var(--faint-foreground);
+  background: var(--surface-2);
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-align: center;
+}
+
+.file-tree {
+  height: calc(100% - 44px);
+  overflow: auto;
+  padding: 8px;
+  scrollbar-width: thin;
+}
+
+.file-tree-row {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  min-width: 0;
+  min-height: 34px;
+  border: 0;
+  border-radius: var(--radius-compact);
+  color: var(--muted-foreground);
+  background: transparent;
+  font-size: 0.875rem;
+}
+
+.file-tree-row:hover {
+  color: var(--foreground);
+  background: var(--surface-2);
+}
+
+.file-tree-row:focus-within {
+  outline: 2px solid color-mix(in srgb, var(--focus-ring) 52%, transparent);
+  outline-offset: -2px;
+}
+
+.file-tree-directory {
+  gap: 6px;
+  cursor: pointer;
+  text-align: left;
+}
+
+.file-tree-row svg {
+  width: 15px;
+  height: 15px;
+  flex: 0 0 auto;
+}
+
+.file-tree-directory svg:first-child {
+  width: 13px;
+  height: 13px;
+}
+
+.file-tree-file {
+  padding-right: 4px;
+}
+
+.file-tree-file.is-active {
+  color: var(--foreground);
+  background: var(--surface-3);
+}
+
+.file-tree-open {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  min-height: 34px;
+  flex: 1;
+  border: 0;
+  color: inherit;
+  background: transparent;
+  cursor: pointer;
+  text-align: left;
+}
+
+.file-tree-open span:not(.dirty-dot) {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-tree-more {
+  opacity: 0;
+}
+
+.file-tree-file:hover .file-tree-more,
+.file-tree-file:focus-within .file-tree-more {
+  opacity: 1;
+}
+
+.dirty-dot,
+.editor-tab i {
+  width: 7px;
+  height: 7px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--warning);
+}
+
+.ide-main {
+  display: grid;
+  grid-template-rows: 44px minmax(0, 1fr) 30px;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.ide-toolbar {
+  display: flex;
+  align-items: stretch;
+  justify-content: space-between;
+  min-width: 0;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.editor-tabs {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+
+.editor-tab {
+  display: flex;
+  align-items: center;
+  min-width: 128px;
+  max-width: 210px;
+  border-right: 1px solid var(--border);
+  color: var(--muted-foreground);
+  background: var(--surface-2);
+}
+
+.editor-tab.is-active {
+  color: var(--foreground);
+  background: var(--surface);
+  box-shadow: inset 0 2px 0 var(--accent);
+}
+
+.editor-tab > button:first-child {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  min-height: 43px;
+  flex: 1;
+  padding: 0 8px 0 12px;
+  border: 0;
+  color: inherit;
+  background: transparent;
+  cursor: pointer;
+  font-size: 0.875rem;
+  text-align: left;
+}
+
+.editor-tab > button:first-child span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.editor-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+  padding: 0 8px;
+  border-left: 1px solid var(--border);
+}
+
+.preview-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  padding: 0 14px;
+}
+
+.preview-heading span {
+  font-size: 0.875rem;
+  font-weight: 700;
+}
+
+.preview-heading small {
+  color: var(--muted-foreground);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.8125rem;
+}
+
+.ide-surface {
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--surface);
+}
+
+.ide-surface.is-preview {
+  display: grid;
+  grid-template-rows: 42px minmax(0, 1fr) 148px;
+  background: var(--surface-2);
+}
+
+.editor-loading,
+.editor-empty {
+  display: grid;
+  height: 100%;
+  place-content: center;
+  gap: 10px;
+  color: var(--muted-foreground);
+  font-size: 0.875rem;
+  text-align: center;
+}
+
+.editor-empty svg {
+  width: 24px;
+  height: 24px;
+  justify-self: center;
+}
+
+.workspace-statusbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  min-width: 0;
+  padding: 0 12px;
+  border-top: 1px solid var(--border);
+  color: var(--muted-foreground);
+  background: var(--surface);
+  font-size: 0.8125rem;
+}
+
+.workspace-statusbar span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspace-statusbar.is-conflict {
+  color: var(--warning);
+}
+
+.workspace-statusbar.is-error {
+  color: var(--destructive);
+}
+
+.workspace-toolbar {
+  min-width: 0;
+  padding: 0 10px;
+}
+
+.preview-tools [data-slot="button"] svg {
+  width: 14px;
+  height: 14px;
+}
+
+.url-bar {
+  width: min(520px, 62%);
+  height: 28px;
+  font-size: 0.8125rem;
+}
+
+.url-bar [data-slot="badge"] {
+  height: 20px;
+  font-size: 0.75rem;
+}
+
+.preview-stage {
+  margin: 12px;
+}
+
+.runtime-placeholder p {
+  font-size: 0.75rem;
+}
+
+.runtime-placeholder > span:not(.runtime-orbit) {
+  font-size: 0.8125rem;
+}
+
+.evidence-drawer {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: 38px minmax(0, 1fr);
+  min-height: 0;
+  border-top: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.evidence-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 0 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.evidence-heading > b {
+  font-size: 0.8125rem;
+}
+
+.runtime-facts {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  max-width: none;
+}
+
+.runtime-fact {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--faint-foreground);
+  font-size: 0.75rem;
+}
+
+.runtime-fact b {
+  color: var(--muted-foreground);
+  font-weight: 600;
+}
+
+.runtime-output {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  min-height: 0;
+}
+
+.runtime-terminal {
+  height: auto;
+  min-height: 0;
+  padding: 8px 12px;
+}
+
+.console-line {
+  margin: 3px 0;
+  font-size: 0.8125rem;
+  line-height: 1.45;
+}
+
+.runtime-diagnostic {
+  width: min(320px, 34vw);
+  padding: 10px 12px;
+  border-left: 1px solid var(--border);
+  font-size: 0.75rem;
+}
+
+.runtime-diagnostic small {
+  font-size: 0.6875rem;
+}
+
+.file-dialog-input {
+  margin-top: 4px;
+}
+
+html[data-theme="dark"]
+  .workbench-tabs
+  [data-slot="toggle-group-item"][data-state="on"],
+html[data-theme="dark"] .editor-tab.is-active {
+  background: #111315;
+}
+
+html[data-theme="dark"] .workspace.workspace-ide,
+html[data-theme="dark"] .ide-surface.is-preview {
+  background: #050607;
+}
+
+@media (max-width: 900px) {
+  .app-frame {
+    padding: 10px;
+  }
+
+  .workbench-top {
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 10px;
+  }
+
+  .workbench-tabs {
+    grid-column: 1 / -1;
+    grid-row: 2;
+    justify-self: center;
+    margin-bottom: 8px;
+  }
+
+  .workbench-actions {
+    grid-column: 2;
+  }
+
+  .workbench-grid {
+    height: max(520px, calc(100dvh - 212px));
+    min-height: 0;
+  }
+
+  .workspace.workspace-ide {
+    grid-template-columns: 190px minmax(0, 1fr);
+  }
+
+  .runtime-facts {
+    gap: 9px;
+  }
+}
+
+@media (max-width: 700px) {
+  .app-frame {
+    padding: 0;
+  }
+
+  .app-browser {
+    border-right: 0;
+    border-left: 0;
+    border-radius: 0;
+  }
+
+  .browser-chrome {
+    display: none;
+  }
+
+  .workbench-top {
+    padding: 10px 12px;
+  }
+
+  .project-crumb {
+    font-size: 0.8125rem;
+  }
+
+  .workbench-actions [data-slot="button"]:first-child {
+    display: none;
+  }
+
+  .workbench-grid {
+    height: auto;
+    min-height: 0;
+  }
+
+  .workspace.workspace-ide {
+    grid-template-columns: 1fr;
+    grid-template-rows: 168px minmax(640px, calc(100dvh - 168px));
+  }
+
+  .ide-sidebar {
+    border-right: 0;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .ide-main {
+    min-height: 640px;
+  }
+
+  .file-tree-more {
+    opacity: 1;
+  }
+
+  .ide-surface.is-preview {
+    grid-template-rows: 42px minmax(320px, 1fr) 190px;
+  }
+
+  .url-bar {
+    width: auto;
+    min-width: 0;
+    flex: 1;
+  }
+
+  .url-bar [data-slot="badge"],
+  .runtime-fact:first-child {
+    display: none;
+  }
+
+  .runtime-output {
+    grid-template-columns: 1fr;
+    overflow: hidden;
+  }
+
+  .runtime-diagnostic {
+    width: auto;
+    border-top: 1px solid var(--border);
+    border-left: 0;
+  }
+
+  .evidence-drawer {
+    grid-template-rows: 58px minmax(0, 1fr);
+  }
+
+  .evidence-heading {
+    display: grid;
+    grid-template-columns: 1fr;
+    align-content: center;
+    gap: 4px;
+    padding: 7px 12px;
+  }
+
+  .runtime-facts {
+    gap: 12px;
+    min-width: 0;
+  }
+
+  .runtime-terminal {
+    overflow: auto;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+
+  .workspace-statusbar span:last-child {
+    display: none;
+  }
+}
+
+/* 导航属于高频产品控件，不沿用早期草图里的缩微字号。 */
+.browser-address,
+.guest-workspace {
+  font-size: 0.75rem;
+}
+
+.global-links {
+  font-size: 0.8125rem;
+}
+
+.brand-lockup {
+  font-size: 1.0625rem;
+}

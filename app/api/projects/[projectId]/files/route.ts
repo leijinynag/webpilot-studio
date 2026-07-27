@@ -45,8 +45,13 @@ export async function POST(
       content: body.content,
       expectedRevision: body.expectedRevision,
     });
+    const file = await repository.readFile({
+      ownerId,
+      projectId,
+      path: body.path,
+    });
 
-    return NextResponse.json({ result });
+    return NextResponse.json({ file, result });
   } catch (error) {
     return apiErrorResponse(error);
   }
@@ -94,8 +99,13 @@ export async function PATCH(
       toPath: body.toPath,
       expectedRevision: body.expectedRevision,
     });
+    const file = await repository.readFile({
+      ownerId,
+      projectId,
+      path: body.toPath,
+    });
 
-    return NextResponse.json({ result });
+    return NextResponse.json({ file, result });
   } catch (error) {
     return apiErrorResponse(error);
   }

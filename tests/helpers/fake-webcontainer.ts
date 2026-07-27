@@ -42,6 +42,21 @@ export class FakeWebContainer implements WebContainerAdapter {
   previewUrl = "https://5173-webpilot.local";
   private serverReadyListener: ((port: number, url: string) => void) | null =
     null;
+  readonly fs = {
+    mkdir: async (path: string) => {
+      this.calls.push(`mkdir:${path}`);
+      return path;
+    },
+    rename: async (fromPath: string, toPath: string) => {
+      this.calls.push(`rename:${fromPath}:${toPath}`);
+    },
+    rm: async (path: string) => {
+      this.calls.push(`rm:${path}`);
+    },
+    writeFile: async (path: string, content: string | Uint8Array) => {
+      this.calls.push(`write:${path}:${content.toString()}`);
+    },
+  };
 
   async mount(tree: FileSystemTree): Promise<void> {
     this.calls.push("mount");

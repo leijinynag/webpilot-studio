@@ -31,8 +31,16 @@ test("creates a project, restores it after refresh, and opens the workbench", as
   await page.getByRole("link", { name: "New project" }).click();
   await page.getByLabel("Project name").fill("E2E persisted project");
   await page.getByRole("button", { name: "Create project" }).click();
-  await expect(page).toHaveURL(/\/p\/[0-9a-f-]{36}$/);
-  await expect(page.getByText("Dashboard refinement")).toBeVisible();
+  // 该流程会在 Neon 事务内创建项目并写入完整模板；并行 E2E 下网络数据库
+  // 可能超过 Playwright 默认的 5 秒断言窗口，但 UI 会持续展示 Creating 状态。
+  await expect(page).toHaveURL(/\/p\/[0-9a-f-]{36}$/, { timeout: 15_000 });
+  // 工作台不再依赖 M0 阶段的临时 Agent 文案，改为校验真实 M1 编辑器骨架。
+  await expect(page.getByText("E2E persisted project")).toBeVisible();
+  await expect(page.getByLabel("Explorer")).toBeVisible();
+  await expect(page.getByLabel("Repository revision 1")).toBeVisible();
+  await expect(
+    page.getByRole("radio", { name: "Preview", exact: true }),
+  ).toBeVisible();
 
   const projectURL = page.url();
   await page.goto("/");

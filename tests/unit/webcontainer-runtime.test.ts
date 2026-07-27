@@ -40,6 +40,7 @@ describe("WebContainerRuntimeManager", () => {
     expect(boot).toHaveBeenCalledTimes(1);
     expect(first.phase).toBe("ready");
     expect(second.previewUrl).toBe(runtime.previewUrl);
+    expect(first.syncedRevision).toBeNull();
     expect(runtime.calls).toEqual([
       "mount",
       "npm install --no-fund --no-audit --force",
@@ -53,6 +54,67 @@ describe("WebContainerRuntimeManager", () => {
       "starting",
       "ready",
     ]);
+  });
+
+  it("把普通源码 revision 增量同步到已运行的容器", async () => {
+    const runtime = new FakeWebContainer();
+    const manager = new WebContainerRuntimeManager({
+      boot: async () => runtime,
+      isCrossOriginIsolated: () => true,
+    });
+    const firstTree = {
+      src: {
+        directory: {
+          "index.tsx": { file: { contents: "revision-1" } },
+          "old.ts": { file: { contents: "remove-me" } },
+        },
+      },
+    };
+    const secondTree = {
+      src: {
+        directory: {
+          "index.tsx": { file: { contents: "revision-2" } },
+          "new.ts": { file: { contents: "new-file" } },
+        },
+      },
+    };
+
+    await manager.start(firstTree, "project-a", 1);
+    await manager.syncRevision(secondTree, "project-a", 2);
+
+    expect(runtime.calls).toContain("rm:src/old.ts");
+    expect(runtime.calls).toContain("write:src/index.tsx:revision-2");
+    expect(runtime.calls).toContain("write:src/new.ts:new-file");
+    expect(manager.getSnapshot().syncedRevision).toBe(2);
+  });
+
+  it("依赖清单变化时重建容器而不是假设 HMR 可处理", async () => {
+    const firstRuntime = new FakeWebContainer();
+    const secondRuntime = new FakeWebContainer();
+    const boot = vi
+      .fn<() => Promise<FakeWebContainer>>()
+      .mockResolvedValueOnce(firstRuntime)
+      .mockResolvedValueOnce(secondRuntime);
+    const manager = new WebContainerRuntimeManager({
+      boot,
+      isCrossOriginIsolated: () => true,
+    });
+
+    await manager.start(
+      { "package.json": { file: { contents: '{"version":1}' } } },
+      "project-a",
+      1,
+    );
+    await manager.syncRevision(
+      { "package.json": { file: { contents: '{"version":2}' } } },
+      "project-a",
+      2,
+    );
+
+    expect(firstRuntime.calls).toContain("teardown");
+    expect(secondRuntime.calls).toContain("mount");
+    expect(boot).toHaveBeenCalledTimes(2);
+    expect(manager.getSnapshot().syncedRevision).toBe(2);
   });
 
   it("缺少 Cross-Origin Isolation 时在 boot 前失败", async () => {

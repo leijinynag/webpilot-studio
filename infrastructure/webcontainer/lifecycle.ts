@@ -38,6 +38,8 @@ export type WebContainerRuntimeSnapshot = {
   port: number | null;
   logs: string[];
   diagnostic: WebContainerDiagnostic | null;
+  // 仅在 Repository revision 已完整写入运行镜像后更新，用于阻止 UI 把旧预览标记成最新。
+  syncedRevision: number | null;
   // null 表示浏览器能力尚未检查，区别于已检查且明确不满足隔离要求的 false。
   crossOriginIsolated: boolean | null;
 };
@@ -50,6 +52,7 @@ export function createInitialRuntimeSnapshot(): WebContainerRuntimeSnapshot {
     port: null,
     logs: [],
     diagnostic: null,
+    syncedRevision: null,
     crossOriginIsolated: null,
   };
 }

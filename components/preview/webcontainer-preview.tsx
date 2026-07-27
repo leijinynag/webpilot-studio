@@ -32,9 +32,11 @@ import { webContainerRuntimeManager } from "@/infrastructure/webcontainer/runtim
 export function WebContainerPreview({
   files,
   projectId,
+  revision,
 }: {
   files: readonly ProjectFileSnapshot[];
   projectId: string;
+  revision: number;
 }) {
   // Manager 是 React 外部状态源。useSyncExternalStore 能在并发渲染下提供一致快照，
   // 也避免把 WebContainer 的进程状态复制成多份组件本地 state。
@@ -56,11 +58,13 @@ export function WebContainerPreview({
 
   useEffect(() => {
     // React Strict Mode 会重复执行开发态 effect，Manager 内部负责合并为同一次启动。
-    void webContainerRuntimeManager.start(projectTree, projectId).catch(() => {
-      // 错误已经写入可订阅 snapshot，由页面统一展示诊断，避免产生未处理 Promise。
-    });
+    void webContainerRuntimeManager
+      .start(projectTree, projectId, revision)
+      .catch(() => {
+        // 错误已经写入可订阅 snapshot，由页面统一展示诊断，避免产生未处理 Promise。
+      });
     // 组件卸载时不 teardown：路由切换后仍应复用同一标签页内昂贵的 WebContainer 实例。
-  }, [projectId, projectTree]);
+  }, [projectId, projectTree, revision]);
 
   // previewUrl 只在 server-ready 后写入；二次校验 phase 可防止服务退出后继续渲染旧 iframe。
   const isReady = snapshot.phase === "ready" && snapshot.previewUrl;
@@ -81,7 +85,7 @@ export function WebContainerPreview({
   function retryRuntime() {
     // Manager 会在可用时复用已 boot 的实例，仅重新执行失败后的项目启动链。
     void webContainerRuntimeManager
-      .start(projectTree, projectId)
+      .start(projectTree, projectId, revision)
       .catch(() => undefined);
   }
 
@@ -181,10 +185,25 @@ export function WebContainerPreview({
       </div>
 
       <div className="evidence-drawer">
-        {/* Terminal 展示原始过程，Runtime 展示结构化事实，Diagnostics 聚焦可行动错误。 */}
-        <div className="evidence-col runtime-console">
-          <b>Terminal</b>
-          <div aria-live="polite" className="runtime-terminal">
+        <header className="evidence-heading">
+          <b>Runtime</b>
+          <div className="runtime-facts" aria-label="运行时状态">
+            <RuntimeFact
+              label="State"
+              value={WEB_CONTAINER_PHASE_LABELS[snapshot.phase]}
+            />
+            <RuntimeFact
+              label="Port"
+              value={snapshot.port?.toString() ?? "5173"}
+            />
+            <RuntimeFact
+              label="Revision"
+              value={snapshot.syncedRevision?.toString() ?? "Pending"}
+            />
+          </div>
+        </header>
+        <div className="runtime-output">
+          <div aria-live="polite" className="runtime-terminal runtime-console">
             {visibleLogs.length > 0 ? (
               visibleLogs.map((line, index) => (
                 <div className="console-line" key={`${index}-${line}`}>
@@ -195,46 +214,14 @@ export function WebContainerPreview({
               <div className="console-line">等待运行时输出...</div>
             )}
           </div>
-        </div>
-        <div className="evidence-col">
-          <b>Runtime</b>
-          <div className="runtime-facts">
-            <RuntimeFact
-              label="Lifecycle"
-              value={WEB_CONTAINER_PHASE_LABELS[snapshot.phase]}
-            />
-            <RuntimeFact
-              label="Isolation"
-              value={
-                snapshot.crossOriginIsolated === null
-                  ? "Checking"
-                  : snapshot.crossOriginIsolated
-                    ? "Enabled"
-                    : "Blocked"
-              }
-            />
-            <RuntimeFact
-              label="Port"
-              value={snapshot.port?.toString() ?? "5173"}
-            />
-          </div>
-        </div>
-        <div className="evidence-col">
-          <b>Diagnostics</b>
           {snapshot.diagnostic ? (
-            <div className="runtime-diagnostic">
+            <aside className="runtime-diagnostic">
               <span>{snapshot.diagnostic.message}</span>
               {snapshot.diagnostic.detail ? (
                 <small>{snapshot.diagnostic.detail}</small>
               ) : null}
-            </div>
-          ) : (
-            <div className="runtime-diagnostic runtime-diagnostic-ok">
-              {snapshot.phase === "ready"
-                ? "WebContainer、依赖安装与 dev server 均已通过。"
-                : "启动诊断将在此处持续更新。"}
-            </div>
-          )}
+            </aside>
+          ) : null}
         </div>
       </div>
     </>
@@ -281,10 +268,10 @@ function RuntimePlaceholder({
 
 function RuntimeFact({ label, value }: { label: string; value: string }) {
   return (
-    <div className="test-line">
+    <span className="runtime-fact">
       <span>{label}</span>
       <b>{value}</b>
-    </div>
+    </span>
   );
 }
 
