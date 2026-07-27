@@ -5,6 +5,7 @@ import { serverEnvSchema } from "@/infrastructure/env/schema";
 export const serverEnv = serverEnvSchema.parse({
   DATABASE_URL: process.env.DATABASE_URL,
   BLOB_READ_WRITE_TOKEN: process.env.BLOB_READ_WRITE_TOKEN,
+  ANON_SESSION_SECRET: process.env.ANON_SESSION_SECRET,
   LLM_PROVIDER: process.env.LLM_PROVIDER,
   LLM_BASE_URL: process.env.LLM_BASE_URL,
   LLM_API_KEY: process.env.LLM_API_KEY,

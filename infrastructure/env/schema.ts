@@ -31,6 +31,7 @@ export const serverEnvSchema = z
   .object({
     DATABASE_URL: optionalUrl,
     BLOB_READ_WRITE_TOKEN: optionalString,
+    ANON_SESSION_SECRET: optionalString,
     LLM_PROVIDER: optionalString,
     LLM_BASE_URL: optionalUrl,
     LLM_API_KEY: optionalString,
