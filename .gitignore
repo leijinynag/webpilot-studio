@@ -39,6 +39,11 @@ yarn-error.log*
 # vercel
 .vercel
 
+# Vercel Marketplace CLI 会把供应商 Agent skill 安装到项目目录。
+# 这些文件只服务本机开发工具，不属于应用源码或部署产物。
+/.agents/
+/skills-lock.json
+
 # typescript
 *.tsbuildinfo
 next-env.d.ts

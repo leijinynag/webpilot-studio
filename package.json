@@ -4,21 +4,26 @@
   "private": true,
   "packageManager": "pnpm@11.9.0",
   "engines": {
-    "node": ">=20.9.0"
+    "node": "22.x"
   },
   "scripts": {
     "dev": "next dev",
     "build": "next build",
+    "vercel-build": "pnpm lint && pnpm typecheck && pnpm test && pnpm build",
     "start": "next start",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "test": "vitest run",
+    "test": "NODE_ENV=test vitest run",
+    "test:infrastructure": "vitest run --config vitest.infrastructure.config.ts",
     "test:watch": "vitest",
-    "test:e2e": "playwright test"
+    "test:e2e": "playwright test",
+    "test:e2e:preview": "playwright test tests/e2e/preview-deployment.spec.ts --workers=1"
   },
   "dependencies": {
+    "@neondatabase/serverless": "1.1.0",
+    "@vercel/blob": "2.6.1",
     "@webcontainer/api": "1.6.4",
     "class-variance-authority": "0.7.1",
     "clsx": "2.1.1",

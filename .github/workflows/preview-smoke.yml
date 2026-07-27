@@ -1,0 +1,71 @@
+name: Vercel Preview Smoke
+
+on:
+  deployment_status:
+  workflow_dispatch:
+    inputs:
+      preview_url:
+        description: Vercel Preview URL
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: preview-smoke-${{ github.event.deployment.id || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    name: Isolation and WebContainer smoke
+    # Vercel Git Integration 会在 Preview 成功后发送 deployment_status。
+    # workflow_dispatch 保留给首次连接和故障排查时手动验证指定 URL。
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (
+        github.event.deployment_status.state == 'success' &&
+        github.event.deployment.environment == 'Preview'
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      PLAYWRIGHT_BASE_URL: >-
+        ${{ github.event_name == 'workflow_dispatch' &&
+            inputs.preview_url ||
+            github.event.deployment_status.environment_url }}
+      VERCEL_AUTOMATION_BYPASS_SECRET: ${{ secrets.VERCEL_AUTOMATION_BYPASS_SECRET }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Playwright Chromium
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Validate deployment URL
+        run: test -n "$PLAYWRIGHT_BASE_URL"
+
+      - name: Run deployed WebContainer smoke
+        run: pnpm test:e2e:preview
+
+      - name: Upload Playwright report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: preview-smoke-report-${{ github.run_id }}
+          path: playwright-report/
+          if-no-files-found: ignore
+          retention-days: 7

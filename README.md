@@ -20,7 +20,7 @@ remain outside this Git repository.
 
 ## Requirements
 
-- Node.js 20.9 or newer
+- Node.js 22.x
 - pnpm 11.9.0
 
 Use Corepack when pnpm is not already available:
@@ -65,6 +65,42 @@ Install the Playwright Chromium binary once on a new machine:
 ```bash
 pnpm exec playwright install chromium
 ```
+
+## Vercel Preview Verification
+
+`vercel.json` uses `pnpm vercel-build` as the deployment build command. Every
+Vercel build must therefore pass lint, TypeScript, Vitest, and the production
+Next.js build before a deployment can become ready.
+
+The `Vercel Preview Smoke` GitHub workflow listens for successful Preview
+deployment statuses and then runs Playwright against the remote deployment:
+
+- verifies the deployed COOP/COEP response headers;
+- verifies `window.crossOriginIsolated`;
+- boots the real WebContainer and waits for its iframe preview.
+
+Run the same remote smoke manually with:
+
+```bash
+PLAYWRIGHT_BASE_URL=https://your-preview.vercel.app \
+  pnpm test:e2e:preview
+```
+
+If Vercel Deployment Protection is enabled, configure the optional
+`VERCEL_AUTOMATION_BYPASS_SECRET` GitHub Actions secret. The test exchanges the
+secret for a same-site bypass cookie before loading the application.
+
+## Infrastructure Verification
+
+After linking the Vercel project and its Development environment, run:
+
+```bash
+vercel env run -- pnpm test:infrastructure
+```
+
+This performs a read-only Neon Postgres probe and an upload/delete cycle against
+the private Vercel Blob store. See `docs/infrastructure.md` for the environment
+boundaries and cleanup behavior.
 
 ## Architecture Boundaries
 

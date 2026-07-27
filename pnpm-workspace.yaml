@@ -1,4 +1,7 @@
 allowBuilds:
+  # Vite 仅把 esbuild 作为可选开发能力；当前构建链使用 Rolldown/Turbopack，
+  # 明确禁止脚本可以让全新 CI 安装通过，同时避免执行不需要的二进制下载逻辑。
+  esbuild: false
   sharp: true
   unrs-resolver: true
 minimumReleaseAgeExclude:
