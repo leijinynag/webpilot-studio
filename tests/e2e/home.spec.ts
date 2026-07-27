@@ -1,6 +1,24 @@
-import { expect, test } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
 
-test("loads the projects shell and navigates to a project", async ({
+async function createProject(page: Page, name: string): Promise<string> {
+  // 先访问页面让 proxy 建立匿名会话；API 与后续页面会共享同一个浏览器 Cookie。
+  await page.goto("/");
+  const response = await page.request.post("/api/projects", {
+    data: {
+      name,
+      storageKind: "database",
+      template: "rsbuild",
+    },
+  });
+  expect(response.status()).toBe(201);
+  const body = (await response.json()) as {
+    project: { id: string };
+  };
+
+  return body.project.id;
+}
+
+test("creates a project, restores it after refresh, and opens the workbench", async ({
   page,
 }) => {
   await page.goto("/");
@@ -9,19 +27,51 @@ test("loads the projects shell and navigates to a project", async ({
   await expect(
     page.getByRole("heading", { name: /Make something worth keeping/i }),
   ).toBeVisible();
-  await page.getByRole("link", { name: /Atlas Finance/i }).click();
-  await expect(page).toHaveURL(/\/p\/atlas-finance$/);
+
+  await page.getByRole("link", { name: "New project" }).click();
+  await page.getByLabel("Project name").fill("E2E persisted project");
+  await page.getByRole("button", { name: "Create project" }).click();
+  await expect(page).toHaveURL(/\/p\/[0-9a-f-]{36}$/);
   await expect(page.getByText("Dashboard refinement")).toBeVisible();
+
+  const projectURL = page.url();
+  await page.goto("/");
+  await expect(
+    page.getByRole("link", { name: "打开 E2E persisted project" }),
+  ).toBeVisible();
+  await page.reload();
+  await page.getByRole("link", { name: "打开 E2E persisted project" }).click();
+  await expect(page).toHaveURL(projectURL);
+});
+
+test("soft deletes and restores a project from the workspace", async ({
+  page,
+}) => {
+  await createProject(page, "Recoverable project");
+  await page.reload();
+
+  await page.getByRole("button", { name: "删除 Recoverable project" }).click();
+  await expect(page.getByRole("dialog")).toBeVisible();
+  await page.getByRole("button", { name: "Delete", exact: true }).click();
+  await expect(
+    page.getByRole("link", { name: "打开 Recoverable project" }),
+  ).toHaveCount(0);
+
+  await page.getByRole("button", { name: "恢复 Recoverable project" }).click();
+  await expect(
+    page.getByRole("link", { name: "打开 Recoverable project" }),
+  ).toBeVisible();
 });
 
 test("exposes all 0.2 routes", async ({ page }) => {
+  const projectId = await createProject(page, "Route coverage project");
   const routes = [
     "/",
     "/new",
-    "/p/atlas-finance",
-    "/p/atlas-finance/source-control",
+    `/p/${projectId}`,
+    `/p/${projectId}/source-control`,
     "/showcase",
-    "/p/atlas-finance/publish",
+    `/p/${projectId}/publish`,
   ];
 
   for (const route of routes) {
@@ -31,7 +81,8 @@ test("exposes all 0.2 routes", async ({ page }) => {
 });
 
 test("serves the app with WebContainer isolation headers", async ({ page }) => {
-  const response = await page.goto("/p/atlas-finance");
+  const projectId = await createProject(page, "Isolation project");
+  const response = await page.goto(`/p/${projectId}`);
 
   // 不只检查配置文件，还从真实文档响应与浏览器能力两侧确认隔离确实生效。
   expect(response?.headers()["cross-origin-opener-policy"]).toBe("same-origin");
@@ -64,7 +115,8 @@ test("boots a real WebContainer preview when live smoke is enabled", async ({
     "设置 RUN_WEBCONTAINER_SMOKE=1 后执行真实浏览器安装与 dev server smoke。",
   );
 
-  await page.goto("/p/atlas-finance");
+  const projectId = await createProject(page, "Live WebContainer project");
+  await page.goto(`/p/${projectId}`);
   await expect(page.getByTitle("WebContainer 项目预览")).toBeVisible({
     timeout: 180_000,
   });

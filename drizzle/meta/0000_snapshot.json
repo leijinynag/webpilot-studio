@@ -156,12 +156,8 @@
           "name": "project_files_project_id_projects_id_fk",
           "tableFrom": "project_files",
           "tableTo": "projects",
-          "columnsFrom": [
-            "project_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["project_id"],
+          "columnsTo": ["id"],
           "onDelete": "cascade",
           "onUpdate": "no action"
         },
@@ -169,12 +165,8 @@
           "name": "project_files_blob_hash_project_file_blobs_hash_fk",
           "tableFrom": "project_files",
           "tableTo": "project_file_blobs",
-          "columnsFrom": [
-            "blob_hash"
-          ],
-          "columnsTo": [
-            "hash"
-          ],
+          "columnsFrom": ["blob_hash"],
+          "columnsTo": ["hash"],
           "onDelete": "no action",
           "onUpdate": "no action"
         }
@@ -230,12 +222,8 @@
           "name": "project_revision_files_revision_id_project_revisions_id_fk",
           "tableFrom": "project_revision_files",
           "tableTo": "project_revisions",
-          "columnsFrom": [
-            "revision_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["revision_id"],
+          "columnsTo": ["id"],
           "onDelete": "cascade",
           "onUpdate": "no action"
         },
@@ -243,12 +231,8 @@
           "name": "project_revision_files_blob_hash_project_file_blobs_hash_fk",
           "tableFrom": "project_revision_files",
           "tableTo": "project_file_blobs",
-          "columnsFrom": [
-            "blob_hash"
-          ],
-          "columnsTo": [
-            "hash"
-          ],
+          "columnsFrom": ["blob_hash"],
+          "columnsTo": ["hash"],
           "onDelete": "no action",
           "onUpdate": "no action"
         }
@@ -256,10 +240,7 @@
       "compositePrimaryKeys": {
         "project_revision_files_pk": {
           "name": "project_revision_files_pk",
-          "columns": [
-            "revision_id",
-            "path"
-          ]
+          "columns": ["revision_id", "path"]
         }
       },
       "uniqueConstraints": {},
@@ -360,12 +341,8 @@
           "name": "project_revisions_project_id_projects_id_fk",
           "tableFrom": "project_revisions",
           "tableTo": "projects",
-          "columnsFrom": [
-            "project_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["project_id"],
+          "columnsTo": ["id"],
           "onDelete": "cascade",
           "onUpdate": "no action"
         }
@@ -510,19 +487,12 @@
     "public.project_status": {
       "name": "project_status",
       "schema": "public",
-      "values": [
-        "creating",
-        "ready",
-        "error"
-      ]
+      "values": ["creating", "ready", "error"]
     },
     "public.project_storage_kind": {
       "name": "project_storage_kind",
       "schema": "public",
-      "values": [
-        "database",
-        "browser_git"
-      ]
+      "values": ["database", "browser_git"]
     }
   },
   "schemas": {},

@@ -3,6 +3,15 @@ import { describe, expect, it, vi } from "vitest";
 import { WebContainerRuntimeManager } from "@/infrastructure/webcontainer/runtime-manager";
 import { FakeWebContainer } from "@/tests/helpers/fake-webcontainer";
 
+function createDeferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((promiseResolve) => {
+    resolve = promiseResolve;
+  });
+
+  return { promise, resolve };
+}
+
 describe("WebContainerRuntimeManager", () => {
   it("合并并发启动请求，并完整推进到 ready", async () => {
     const runtime = new FakeWebContainer();
@@ -86,5 +95,43 @@ describe("WebContainerRuntimeManager", () => {
     expect(snapshot.logs.join("\n")).toContain("dependencies installed");
     expect(snapshot.logs).not.toContain("[install] |");
     expect(snapshot.diagnostic?.message).toContain("退出码 1");
+  });
+
+  it("项目切换后忽略旧项目迟到的 boot 和 finally", async () => {
+    const firstRuntime = new FakeWebContainer();
+    const secondRuntime = new FakeWebContainer();
+    secondRuntime.previewUrl = "https://5173-second-project.local";
+    const firstBoot = createDeferred<FakeWebContainer>();
+    const boot = vi
+      .fn<() => Promise<FakeWebContainer>>()
+      .mockImplementationOnce(() => firstBoot.promise)
+      .mockResolvedValueOnce(secondRuntime);
+    const manager = new WebContainerRuntimeManager({
+      boot,
+      isCrossOriginIsolated: () => true,
+      serverReadyTimeoutMs: 1_000,
+    });
+
+    const firstStart = manager.start({}, "project-a");
+    // 等待第一轮进入 boot，随后在其完成前切换项目。
+    await Promise.resolve();
+    const secondStart = manager.start({}, "project-b");
+    await expect(secondStart).resolves.toMatchObject({
+      phase: "ready",
+      previewUrl: secondRuntime.previewUrl,
+    });
+
+    firstBoot.resolve(firstRuntime);
+    await expect(firstStart).rejects.toBeInstanceOf(Error);
+
+    expect(firstRuntime.calls).toContain("teardown");
+    expect(secondRuntime.calls).not.toContain("teardown");
+    expect(manager.getSnapshot()).toMatchObject({
+      phase: "ready",
+      previewUrl: secondRuntime.previewUrl,
+    });
+    // 旧 Promise 的 finally 没有清理新项目锁，重复调用不会再次 boot。
+    await manager.start({}, "project-b");
+    expect(boot).toHaveBeenCalledTimes(2);
   });
 });

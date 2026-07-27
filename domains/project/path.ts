@@ -1,7 +1,4 @@
-import {
-  PROJECT_ERROR_CODES,
-  ProjectError,
-} from "@/domains/project/errors";
+import { PROJECT_ERROR_CODES, ProjectError } from "@/domains/project/errors";
 
 const RESERVED_ROOT_SEGMENTS = new Set([".git", "node_modules"]);
 

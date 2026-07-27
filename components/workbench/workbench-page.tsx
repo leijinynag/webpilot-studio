@@ -5,16 +5,26 @@ import { WebContainerPreview } from "@/components/preview/webcontainer-preview";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
+import type {
+  ProjectDescription,
+  ProjectFileSnapshot,
+} from "@/domains/project/types";
 
-export function WorkbenchPage() {
+export function WorkbenchPage({
+  files,
+  project,
+}: {
+  files: readonly ProjectFileSnapshot[];
+  project: ProjectDescription;
+}) {
   return (
     <div className="workbench-page page-in">
       <div className="workbench-top">
         <div className="project-crumb">
           <span>Projects</span>
           <span>/</span>
-          <b>Atlas Finance</b>
-          <span>Saved just now</span>
+          <b>{project.name}</b>
+          <span>Revision {project.revision}</span>
         </div>
         <ToggleGroup
           aria-label="工作台视图"
@@ -25,7 +35,7 @@ export function WorkbenchPage() {
           <ToggleGroupItem value="preview">Preview</ToggleGroupItem>
           <ToggleGroupItem value="code">Code</ToggleGroupItem>
           <ToggleGroupItem asChild value="changes">
-            <Link href="/p/atlas-finance/source-control">
+            <Link href={`/p/${project.id}/source-control`}>
               Changes <Badge variant="outline">3</Badge>
             </Link>
           </ToggleGroupItem>
@@ -33,13 +43,13 @@ export function WorkbenchPage() {
         </ToggleGroup>
         <div className="workbench-actions">
           <Button asChild size="sm" variant="outline">
-            <Link href="/p/atlas-finance/source-control">Source Control</Link>
+            <Link href={`/p/${project.id}/source-control`}>Source Control</Link>
           </Button>
           <Button size="sm" variant="ghost">
             Export
           </Button>
           <Button asChild className="app-button-accent" size="sm">
-            <Link href="/p/atlas-finance/publish">
+            <Link href={`/p/${project.id}/publish`}>
               <ExternalLink data-icon="inline-start" />
               Publish
             </Link>
@@ -93,7 +103,7 @@ export function WorkbenchPage() {
         </aside>
 
         <section className="workspace">
-          <WebContainerPreview />
+          <WebContainerPreview files={files} projectId={project.id} />
         </section>
       </div>
     </div>

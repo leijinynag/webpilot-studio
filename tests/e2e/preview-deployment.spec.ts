@@ -21,6 +21,23 @@ async function enableVercelAutomationBypass(page: Page): Promise<void> {
   expect(response.ok()).toBe(true);
 }
 
+async function createPreviewProject(page: Page): Promise<string> {
+  await page.goto("/");
+  const response = await page.request.post("/api/projects", {
+    data: {
+      name: "Vercel preview smoke",
+      storageKind: "database",
+      template: "rsbuild",
+    },
+  });
+  expect(response.status()).toBe(201);
+  const body = (await response.json()) as {
+    project: { id: string };
+  };
+
+  return body.project.id;
+}
+
 test.describe("Vercel Preview deployment", () => {
   test.skip(
     !previewBaseURL,
@@ -30,8 +47,9 @@ test.describe("Vercel Preview deployment", () => {
   test("保留跨源隔离并完成真实 WebContainer 启动", async ({ page }) => {
     test.setTimeout(180_000);
     await enableVercelAutomationBypass(page);
+    const projectId = await createPreviewProject(page);
 
-    const response = await page.goto("/p/atlas-finance");
+    const response = await page.goto(`/p/${projectId}`);
 
     // 响应头和浏览器运行时状态必须同时通过，仅检查配置文件无法证明部署平台实际保留了 Header。
     expect(response?.headers()["cross-origin-opener-policy"]).toBe(

@@ -10,6 +10,7 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
+import type { ProjectDescription } from "@/domains/project/types";
 
 const diffLines = [
   ["31", "31", "export function Dashboard() {", "normal"],
@@ -38,7 +39,11 @@ const diffLines = [
   ["40", "47", "    </main>", "normal"],
 ] as const;
 
-export function SourceControlPage() {
+export function SourceControlPage({
+  project,
+}: {
+  project: ProjectDescription;
+}) {
   const groupedFiles = ["Staged changes", "Changes", "Untracked"].map(
     (group) => ({
       group,
@@ -192,7 +197,7 @@ export function SourceControlPage() {
             </div>
           </div>
         </div>
-        <Link className="back-to-workbench" href="/p/atlas-finance">
+        <Link className="back-to-workbench" href={`/p/${project.id}`}>
           返回 Agent 工作台
         </Link>
       </aside>

@@ -2,6 +2,7 @@ import { notFound } from "next/navigation";
 
 import { AppShell } from "@/components/shell/app-shell";
 import { PublishPage } from "@/components/publish/publish-page";
+import { loadOwnedProject } from "@/domains/project/server";
 
 export default async function PublishRoute({
   params,
@@ -9,14 +10,15 @@ export default async function PublishRoute({
   params: Promise<{ projectId: string }>;
 }) {
   const { projectId } = await params;
+  const data = await loadOwnedProject(projectId);
 
-  if (projectId !== "atlas-finance") {
+  if (!data) {
     notFound();
   }
 
   return (
     <AppShell>
-      <PublishPage />
+      <PublishPage project={data.project} />
     </AppShell>
   );
 }

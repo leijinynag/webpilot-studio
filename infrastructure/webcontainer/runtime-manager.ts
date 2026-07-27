@@ -113,6 +113,8 @@ export class WebContainerRuntimeManager {
   private bootPromise: Promise<WebContainerAdapter> | null = null;
   private startPromise: Promise<WebContainerRuntimeSnapshot> | null = null;
   private devProcess: WebContainerProcessAdapter | null = null;
+  // ready 状态只对当前项目有效；切换项目必须销毁旧容器，避免 mount 合并出跨项目残留文件。
+  private activeProjectKey: string | null = null;
   // generation 是轻量取消令牌。teardown 或未来的新一轮启动会递增它，
   // 旧异步任务即使晚到，也不能再把过期结果写回当前 snapshot。
   private generation = 0;
@@ -139,9 +141,20 @@ export class WebContainerRuntimeManager {
 
   start(
     tree: FileSystemTree = WEBPILOT_RSBUILD_TEMPLATE,
+    projectKey = "default-template",
   ): Promise<WebContainerRuntimeSnapshot> {
+    if (
+      this.activeProjectKey !== null &&
+      this.activeProjectKey !== projectKey
+    ) {
+      this.teardown();
+    }
+
     // ready 状态代表当前 dev server 仍由 Manager 持有，无需重复挂载和安装依赖。
-    if (this.snapshot.phase === "ready") {
+    if (
+      this.snapshot.phase === "ready" &&
+      this.activeProjectKey === projectKey
+    ) {
       return Promise.resolve(this.snapshot);
     }
 
@@ -151,11 +164,16 @@ export class WebContainerRuntimeManager {
       return this.startPromise;
     }
 
-    this.startPromise = this.startRuntime(tree).finally(() => {
-      this.startPromise = null;
+    this.activeProjectKey = projectKey;
+    const currentStart = this.startRuntime(tree).finally(() => {
+      // 旧项目的 finally 可能晚于新项目启动；只允许当前 Promise 清理自己的锁。
+      if (this.startPromise === currentStart) {
+        this.startPromise = null;
+      }
     });
+    this.startPromise = currentStart;
 
-    return this.startPromise;
+    return currentStart;
   }
 
   /**
@@ -170,6 +188,7 @@ export class WebContainerRuntimeManager {
     this.instance = null;
     this.bootPromise = null;
     this.startPromise = null;
+    this.activeProjectKey = null;
     this.setSnapshot(createInitialRuntimeSnapshot());
   }
 
@@ -211,7 +230,7 @@ export class WebContainerRuntimeManager {
     });
 
     try {
-      const instance = await this.getOrBootInstance();
+      const instance = await this.getOrBootInstance(generation);
       this.assertGeneration(generation);
 
       // mount、install、start 存在严格数据依赖：后一阶段只能在前一阶段成功后开始。
@@ -231,7 +250,7 @@ export class WebContainerRuntimeManager {
         "--no-audit",
         "--force",
       ]);
-      await this.consumeProcessOutput(installProcess, "install");
+      await this.consumeProcessOutput(installProcess, "install", generation);
       const installExitCode = await installProcess.exit;
 
       if (installExitCode !== 0) {
@@ -260,6 +279,11 @@ export class WebContainerRuntimeManager {
 
       return this.snapshot;
     } catch (error) {
+      // 项目切换会递增 generation。过期链路只需结束，不能把新项目状态覆盖成 failed。
+      if (generation !== this.generation) {
+        throw error;
+      }
+
       // 主动创建的运行时错误已经携带稳定诊断，不能再被阶段映射覆盖。
       if (error instanceof WebContainerRuntimeError) {
         this.fail(error);
@@ -281,7 +305,9 @@ export class WebContainerRuntimeManager {
     }
   }
 
-  private async getOrBootInstance(): Promise<WebContainerAdapter> {
+  private async getOrBootInstance(
+    generation: number,
+  ): Promise<WebContainerAdapter> {
     if (this.instance) {
       this.appendLog("[runtime] 复用当前标签页中的 WebContainer 实例。");
       return this.instance;
@@ -290,17 +316,28 @@ export class WebContainerRuntimeManager {
     // boot 本身也单独去重，避免未来出现“不启动项目、只预热容器”的调用后重复 boot。
     if (!this.bootPromise) {
       this.appendLog("[runtime] 正在 boot WebContainer...");
-      this.bootPromise = this.dependencies
+      const currentBoot = this.dependencies
         .boot()
         .then((instance) => {
+          if (generation !== this.generation) {
+            instance.teardown();
+            throw new WebContainerRuntimeError(
+              "dev_server_failed",
+              "本次 WebContainer boot 已被新的项目替代。",
+            );
+          }
+
           this.instance = instance;
           return instance;
         })
         .catch((error: unknown) => {
           // boot 失败后清除缓存，允许用户修复环境后重新发起真正的新启动。
-          this.bootPromise = null;
+          if (this.bootPromise === currentBoot) {
+            this.bootPromise = null;
+          }
           throw error;
         });
+      this.bootPromise = currentBoot;
     }
 
     return this.bootPromise;
@@ -361,7 +398,7 @@ export class WebContainerRuntimeManager {
     const process = await instance.spawn("npm", ["run", "dev"]);
     this.devProcess = process;
     // dev server 是常驻进程，输出流通常不会结束，因此这里只后台消费，不能 await 后再等就绪事件。
-    void this.consumeProcessOutput(process, "dev");
+    void this.consumeProcessOutput(process, "dev", generation);
 
     // exit 同时覆盖两种情况：就绪前退出应拒绝 start；就绪后退出则把已展示的预览标记为失效。
     void process.exit.then((exitCode) => {
@@ -400,11 +437,16 @@ export class WebContainerRuntimeManager {
   private async consumeProcessOutput(
     process: WebContainerProcessAdapter,
     source: "install" | "dev",
+    generation: number,
   ): Promise<void> {
     try {
       await process.output.pipeTo(
         new WritableStream<string>({
           write: (chunk) => {
+            if (generation !== this.generation) {
+              return;
+            }
+
             // 终端控制符和 npm 单字符 spinner 对诊断没有价值，还会污染浏览器文本布局。
             // 按行清洗后再写入 snapshot，可让真实错误内容保持可复制、可测试。
             for (const line of chunk
@@ -421,6 +463,10 @@ export class WebContainerRuntimeManager {
         }),
       );
     } catch (error) {
+      if (generation !== this.generation) {
+        return;
+      }
+
       // 输出流中断不一定代表进程退出；记录辅助信息即可，最终状态仍由 exit/server-ready 决定。
       this.appendLog(
         `[runtime] 无法继续读取 ${source} 输出：${getErrorDetail(error) ?? "未知错误"}`,

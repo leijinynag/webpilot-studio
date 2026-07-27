@@ -1,6 +1,12 @@
 "use client";
 
-import { useEffect, useRef, useState, useSyncExternalStore } from "react";
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
 import {
   ArrowLeft,
   ArrowRight,
@@ -18,10 +24,18 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
+import { buildProjectTemplate } from "@/domains/project/template";
+import type { ProjectFileSnapshot } from "@/domains/project/types";
 import { WEB_CONTAINER_PHASE_LABELS } from "@/infrastructure/webcontainer/lifecycle";
 import { webContainerRuntimeManager } from "@/infrastructure/webcontainer/runtime-manager";
 
-export function WebContainerPreview() {
+export function WebContainerPreview({
+  files,
+  projectId,
+}: {
+  files: readonly ProjectFileSnapshot[];
+  projectId: string;
+}) {
   // Manager 是 React 外部状态源。useSyncExternalStore 能在并发渲染下提供一致快照，
   // 也避免把 WebContainer 的进程状态复制成多份组件本地 state。
   const snapshot = useSyncExternalStore(
@@ -32,14 +46,21 @@ export function WebContainerPreview() {
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const [frameRevision, setFrameRevision] = useState(0);
   const [compactViewport, setCompactViewport] = useState(false);
+  const projectTree = useMemo(
+    () =>
+      buildProjectTemplate(
+        files.map((file) => ({ path: file.path, content: file.content })),
+      ),
+    [files],
+  );
 
   useEffect(() => {
     // React Strict Mode 会重复执行开发态 effect，Manager 内部负责合并为同一次启动。
-    void webContainerRuntimeManager.start().catch(() => {
+    void webContainerRuntimeManager.start(projectTree, projectId).catch(() => {
       // 错误已经写入可订阅 snapshot，由页面统一展示诊断，避免产生未处理 Promise。
     });
     // 组件卸载时不 teardown：路由切换后仍应复用同一标签页内昂贵的 WebContainer 实例。
-  }, []);
+  }, [projectId, projectTree]);
 
   // previewUrl 只在 server-ready 后写入；二次校验 phase 可防止服务退出后继续渲染旧 iframe。
   const isReady = snapshot.phase === "ready" && snapshot.previewUrl;
@@ -59,7 +80,9 @@ export function WebContainerPreview() {
 
   function retryRuntime() {
     // Manager 会在可用时复用已 boot 的实例，仅重新执行失败后的项目启动链。
-    void webContainerRuntimeManager.start().catch(() => undefined);
+    void webContainerRuntimeManager
+      .start(projectTree, projectId)
+      .catch(() => undefined);
   }
 
   return (

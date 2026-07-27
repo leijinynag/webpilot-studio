@@ -34,3 +34,50 @@ export function flattenProjectTemplate(
 
   return files;
 }
+
+/**
+ * 将数据库中的扁平文件快照还原为 WebContainer.mount 接受的目录树。
+ * 路径已经由 Repository 校验；这里仍检测文件/目录冲突，避免损坏的数据静默覆盖节点。
+ */
+export function buildProjectTemplate(
+  files: readonly ProjectTemplateFile[],
+): FileSystemTree {
+  const root: FileSystemTree = {};
+
+  for (const file of files) {
+    const segments = file.path.split("/");
+    let directory = root;
+
+    for (const [index, segment] of segments.entries()) {
+      const isFile = index === segments.length - 1;
+
+      if (isFile) {
+        if (directory[segment]) {
+          throw new Error(`项目路径发生文件冲突：${file.path}`);
+        }
+
+        directory[segment] = {
+          file: { contents: file.content },
+        };
+        continue;
+      }
+
+      const existing = directory[segment];
+
+      if (!existing) {
+        const nextDirectory: FileSystemTree = {};
+        directory[segment] = { directory: nextDirectory };
+        directory = nextDirectory;
+        continue;
+      }
+
+      if (!("directory" in existing)) {
+        throw new Error(`项目路径发生目录冲突：${file.path}`);
+      }
+
+      directory = existing.directory;
+    }
+  }
+
+  return root;
+}

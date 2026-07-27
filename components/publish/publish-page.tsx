@@ -4,8 +4,9 @@ import { Check, ExternalLink, Smartphone } from "lucide-react";
 import { PreviewSite } from "@/components/demo/preview-site";
 import { Button } from "@/components/ui/button";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
+import type { ProjectDescription } from "@/domains/project/types";
 
-export function PublishPage() {
+export function PublishPage({ project }: { project: ProjectDescription }) {
   return (
     <div className="publish-page page-in">
       <section className="publish-preview">
@@ -53,7 +54,7 @@ export function PublishPage() {
             </label>
             <input
               className="field"
-              defaultValue="Atlas Finance"
+              defaultValue={project.name}
               id="publish-title"
             />
           </div>
@@ -107,7 +108,7 @@ export function PublishPage() {
             <ExternalLink data-icon="inline-end" />
           </Button>
         </div>
-        <Link className="back-to-workbench" href="/p/atlas-finance">
+        <Link className="back-to-workbench" href={`/p/${project.id}`}>
           返回 Agent 工作台
         </Link>
       </section>

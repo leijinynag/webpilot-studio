@@ -1,16 +1,67 @@
+"use client";
+
 import Link from "next/link";
-import { ArrowRight, X } from "lucide-react";
+import { ArrowRight, Database, GitBranch, LoaderCircle, X } from "lucide-react";
+import { useRouter } from "next/navigation";
+import { FormEvent, useState } from "react";
 
 import { Button } from "@/components/ui/button";
+import type { ProjectDescription } from "@/domains/project/types";
 
 const templates = [
-  { name: "Blank", className: "blank" },
-  { name: "Dashboard", className: "dashboard" },
-  { name: "Landing", className: "landing" },
-  { name: "Portfolio", className: "portfolio" },
-];
+  { name: "Blank", className: "blank", available: true },
+  { name: "Dashboard", className: "dashboard", available: false },
+  { name: "Landing", className: "landing", available: false },
+  { name: "Portfolio", className: "portfolio", available: false },
+] as const;
+
+type CreateProjectResponse = {
+  project?: ProjectDescription;
+  error?: {
+    message?: string;
+  };
+};
 
 export function NewProjectPage() {
+  const router = useRouter();
+  const [name, setName] = useState("Untitled project");
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function createProject(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setSubmitting(true);
+    setError(null);
+
+    try {
+      const response = await fetch("/api/projects", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name,
+          storageKind: "database",
+          template: "rsbuild",
+        }),
+      });
+      const body = (await response.json()) as CreateProjectResponse;
+
+      if (!response.ok || !body.project) {
+        throw new Error(body.error?.message ?? "项目创建失败，请稍后重试。");
+      }
+
+      // 使用服务端生成的 UUID 跳转；随后刷新仍由匿名 Cookie 找回同一个项目。
+      router.push(`/p/${body.project.id}`);
+      router.refresh();
+    } catch (creationError) {
+      setError(
+        creationError instanceof Error
+          ? creationError.message
+          : "项目创建失败，请稍后重试。",
+      );
+      setSubmitting(false);
+    }
+  }
+
   return (
     <div className="create-page page-in">
       <section className="create-intro">
@@ -32,11 +83,11 @@ export function NewProjectPage() {
         </div>
       </section>
 
-      <section className="create-form">
+      <form className="create-form" onSubmit={createProject}>
         <div className="form-heading">
           <div>
             <h2 className="font-editorial">Project setup</h2>
-            <p>这些设置稍后仍可调整，存储类型迁移会经过独立确认。</p>
+            <p>当前版本使用数据库持久化，Browser Git 将在后续里程碑接入。</p>
           </div>
           <Button
             aria-label="关闭新建项目"
@@ -55,48 +106,70 @@ export function NewProjectPage() {
             Project name
           </label>
           <input
+            autoFocus
             className="field"
-            defaultValue="Untitled project"
+            disabled={submitting}
             id="project-name"
+            maxLength={120}
+            onChange={(event) => setName(event.target.value)}
+            required
+            value={name}
           />
         </div>
 
         <div className="form-section">
           <span className="field-label">Repository</span>
           <div className="storage-options">
-            <div className="storage-option active">
+            <button
+              aria-pressed="true"
+              className="storage-option active"
+              type="button"
+            >
               <div className="storage-option-head">
-                <b>Browser Git</b>
+                <b>
+                  <Database />
+                  Database
+                </b>
                 <span className="radio" />
               </div>
-              <p>
-                代码保存在当前浏览器的 IndexedDB
-                中，提供完整暂存、提交、历史和分支体验。
-              </p>
-            </div>
-            <div className="storage-option">
+              <p>代码保存在 PostgreSQL，刷新和跨会话访问时可恢复当前项目。</p>
+            </button>
+            <button
+              aria-disabled="true"
+              className="storage-option unavailable"
+              disabled
+              type="button"
+            >
               <div className="storage-option-head">
-                <b>Database</b>
-                <span className="radio" />
+                <b>
+                  <GitBranch />
+                  Browser Git
+                </b>
+                <span className="storage-coming-soon">Coming later</span>
               </div>
-              <p>
-                代码保存在云端数据库，跨设备更方便；第一版不提供远程 Git 操作。
-              </p>
-            </div>
+              <p>浏览器内完整 Git 暂存、提交、历史和分支将在后续里程碑开放。</p>
+            </button>
           </div>
         </div>
 
         <div className="form-section">
           <span className="field-label">Starting point</span>
           <div className="template-strip">
-            {templates.map((template, index) => (
-              <div
-                className={`template ${index === 0 ? "active" : ""}`}
+            {templates.map((template) => (
+              <button
+                className={`template ${
+                  template.available ? "active" : "unavailable"
+                }`}
+                disabled={!template.available}
                 key={template.name}
+                type="button"
               >
                 <div className={`template-preview ${template.className}`} />
-                <span>{template.name}</span>
-              </div>
+                <span>
+                  {template.name}
+                  {!template.available ? " · Later" : ""}
+                </span>
+              </button>
             ))}
           </div>
         </div>
@@ -107,23 +180,35 @@ export function NewProjectPage() {
           </label>
           <textarea
             className="field"
-            defaultValue="Build a calm financial dashboard for independent creative studios. Use warm neutrals, clear comparison charts, and a compact mobile layout."
+            disabled
             id="first-request"
+            placeholder="Agent workflow will be connected in a later milestone."
           />
         </div>
+
+        {error ? (
+          <p className="form-error" role="alert">
+            {error}
+          </p>
+        ) : null}
 
         <div className="create-actions">
           <Button asChild variant="outline">
             <Link href="/">Cancel</Link>
           </Button>
-          <Button asChild className="app-button-accent">
-            <Link href="/p/atlas-finance">
-              Create and start
-              <ArrowRight data-icon="inline-end" />
-            </Link>
+          <Button
+            className="app-button-accent"
+            disabled={submitting || name.trim().length === 0}
+            type="submit"
+          >
+            {submitting ? (
+              <LoaderCircle className="project-state-spinner" />
+            ) : null}
+            {submitting ? "Creating..." : "Create project"}
+            {!submitting ? <ArrowRight data-icon="inline-end" /> : null}
           </Button>
         </div>
-      </section>
+      </form>
     </div>
   );
 }

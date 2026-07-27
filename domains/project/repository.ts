@@ -1,6 +1,12 @@
 import { createHash } from "node:crypto";
 
 import { and, asc, desc, eq, isNull, sql } from "drizzle-orm";
+import type { PgDatabase } from "drizzle-orm/pg-core";
+import type {
+  PgQueryResultHKT,
+  PgTransaction,
+} from "drizzle-orm/pg-core/session";
+import type { ExtractTablesWithRelations } from "drizzle-orm/relations";
 
 import {
   projectFileBlobs,
@@ -21,14 +27,19 @@ import type {
   ProjectStorageKind,
   ProjectSummary,
 } from "@/domains/project/types";
-import type { AppDatabase } from "@/infrastructure/db/client";
+import { databaseSchema } from "@/infrastructure/db/schema";
 
-type DatabaseLike = AppDatabase;
-// 从数据库实例的 transaction 回调中提取事务类型，避免手写 schema 泛型
-// 与 Drizzle 版本内部的 ExtractTablesWithRelations 产生不兼容。
-type TransactionLike = Parameters<
-  Parameters<DatabaseLike["transaction"]>[0]
->[0];
+type RelationalSchema = ExtractTablesWithRelations<typeof databaseSchema>;
+type DatabaseLike<TQueryResult extends PgQueryResultHKT> = PgDatabase<
+  TQueryResult,
+  typeof databaseSchema,
+  RelationalSchema
+>;
+type TransactionLike<TQueryResult extends PgQueryResultHKT> = PgTransaction<
+  TQueryResult,
+  typeof databaseSchema,
+  RelationalSchema
+>;
 
 export type ProjectRepository = {
   listProjects(input: {
@@ -109,8 +120,10 @@ const DEFAULT_SEARCH_OPTIONS: Required<ProjectSearchOptions> = {
   maxTotalCharacters: 20_000,
 };
 
-export class DatabaseProjectRepository implements ProjectRepository {
-  constructor(private readonly db: DatabaseLike) {}
+export class DatabaseProjectRepository<
+  TQueryResult extends PgQueryResultHKT,
+> implements ProjectRepository {
+  constructor(private readonly db: DatabaseLike<TQueryResult>) {}
 
   async listProjects(input: {
     ownerId: string;
@@ -731,8 +744,10 @@ export class DatabaseProjectRepository implements ProjectRepository {
     kind: "write" | "delete" | "rename";
     changedPaths: string[];
     operation: (
-      tx: TransactionLike,
-      project: Awaited<ReturnType<DatabaseProjectRepository["getProject"]>>,
+      tx: TransactionLike<TQueryResult>,
+      project: Awaited<
+        ReturnType<DatabaseProjectRepository<TQueryResult>["getProject"]>
+      >,
     ) => Promise<void>;
   }): Promise<ProjectMutationResult> {
     const project = await this.getProject(input);
@@ -808,7 +823,7 @@ function hashContent(content: string): string {
 }
 
 async function ensureBlob(
-  tx: TransactionLike,
+  tx: TransactionLike<PgQueryResultHKT>,
   content: string,
 ): Promise<string> {
   const hash = hashContent(content);
@@ -826,7 +841,7 @@ async function ensureBlob(
 }
 
 async function insertRevision(
-  tx: TransactionLike,
+  tx: TransactionLike<PgQueryResultHKT>,
   input: {
     projectId: string;
     revision: number;
@@ -852,7 +867,7 @@ async function insertRevision(
 }
 
 async function assertRevision(
-  tx: TransactionLike,
+  tx: TransactionLike<PgQueryResultHKT>,
   project: typeof projects.$inferSelect,
   expectedRevision: number,
 ): Promise<void> {
@@ -888,7 +903,7 @@ async function assertRevision(
 }
 
 async function finishMutation(
-  tx: TransactionLike,
+  tx: TransactionLike<PgQueryResultHKT>,
   project: typeof projects.$inferSelect,
   input: {
     expectedRevision: number;
