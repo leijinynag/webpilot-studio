@@ -22,6 +22,7 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { CodeEditor } from "@/components/workbench/code-editor";
+import { AgentPanel } from "@/components/workbench/agent-panel";
 import { EditorTabs } from "@/components/workbench/editor-tabs";
 import { FileOperationDialog } from "@/components/workbench/file-operation-dialog";
 import { FileTree } from "@/components/workbench/file-tree";
@@ -76,6 +77,7 @@ export function ProjectWorkspace({
   const [view, setView] = useState<WorkspaceView>("preview");
   const [operation, setOperation] = useState<FileOperation>(null);
   const [mutationPending, setMutationPending] = useState(false);
+  const [agentRevision, setAgentRevision] = useState(project.revision);
   const editorRef = useRef<editor.IStandaloneCodeEditor | null>(null);
   const stateRef = useRef(state);
   stateRef.current = state;
@@ -200,6 +202,16 @@ export function ProjectWorkspace({
         type: "error",
         message: "无法连接 Repository，本地草稿仍被保留。",
       });
+    }
+  }
+
+  function handleAgentRevisionChange(nextRevision: number) {
+    setAgentRevision(nextRevision);
+
+    // Agent mutation 已经写入 Repository 后，工作台必须重新读取服务端快照。
+    // reducer 会保留 dirty draft，只替换没有本地修改的文件，避免静默覆盖用户输入。
+    if (nextRevision > stateRef.current.revision) {
+      void refreshRepositorySnapshot();
     }
   }
 
@@ -398,6 +410,11 @@ export function ProjectWorkspace({
       </header>
 
       <div className="workbench-grid">
+        <AgentPanel
+          onRevisionChange={handleAgentRevisionChange}
+          projectId={project.id}
+          revision={agentRevision}
+        />
         <section className="workspace workspace-ide">
           <div className="ide-sidebar">
             <div aria-label="Explorer" className="ide-panel-heading">
@@ -472,7 +489,7 @@ export function ProjectWorkspace({
               ) : (
                 <div className="preview-heading">
                   <span>Live preview</span>
-                  <small>r{state.revision}</small>
+                  <small>r{Math.max(state.revision, agentRevision)}</small>
                 </div>
               )}
             </div>

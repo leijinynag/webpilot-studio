@@ -153,6 +153,23 @@ export type AgentRunEvent = {
   createdAt: Date;
 };
 
+export type ConversationRecord = {
+  id: string;
+  projectId: string;
+  ownerId: string;
+  title: string;
+  createdAt: Date;
+  updatedAt: Date;
+};
+
+export type AgentConversationSnapshot = {
+  conversation: ConversationRecord;
+  transcript: TranscriptMessage[];
+  runs: AgentRunRecord[];
+  events: AgentRunEvent[];
+  tools: ToolInvocationRecord[];
+};
+
 export type ToolInvocationRecord = {
   id: string;
   runId: string;

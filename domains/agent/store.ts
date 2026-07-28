@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 
-import { and, asc, eq, gt, inArray, isNull, lt, or } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, isNull, lt, or } from "drizzle-orm";
 import type { PgDatabase } from "drizzle-orm/pg-core";
 import type { PgQueryResultHKT } from "drizzle-orm/pg-core/session";
 import type { ExtractTablesWithRelations } from "drizzle-orm/relations";
@@ -14,6 +14,8 @@ import type {
   AgentRunEvent,
   AgentRunRecord,
   AgentRunStatus,
+  AgentConversationSnapshot,
+  ConversationRecord,
   FrozenAgentRunProfile,
   ToolInvocationRecord,
   TranscriptMessage,
@@ -122,6 +124,12 @@ export class AgentStore<TQueryResult extends PgQueryResultHKT> {
               404,
             );
           }
+
+          // 复用会话时同步更新时间，列表页才能把刚刚活跃的会话排到前面。
+          await tx
+            .update(conversations)
+            .set({ updatedAt: new Date() })
+            .where(eq(conversations.id, conversationId));
         } else {
           const [conversation] = await tx
             .insert(conversations)
@@ -230,6 +238,135 @@ export class AgentStore<TQueryResult extends PgQueryResultHKT> {
     }
 
     return toAgentRunRecord(run);
+  }
+
+  async createConversation(input: {
+    ownerId: string;
+    projectId: string;
+    title: string;
+  }): Promise<ConversationRecord> {
+    const [project] = await this.db
+      .select({ id: projects.id })
+      .from(projects)
+      .where(
+        and(
+          eq(projects.id, input.projectId),
+          eq(projects.ownerId, input.ownerId),
+          isNull(projects.deletedAt),
+        ),
+      );
+
+    if (!project) {
+      throw new AgentError(
+        AGENT_ERROR_CODES.invalidRequest,
+        "项目不存在或不属于当前匿名工作区。",
+        404,
+      );
+    }
+
+    const [conversation] = await this.db
+      .insert(conversations)
+      .values({
+        ownerId: input.ownerId,
+        projectId: input.projectId,
+        title: normalizeConversationTitle(input.title),
+      })
+      .returning();
+
+    if (!conversation) {
+      throw new Error("创建 Conversation 失败。");
+    }
+
+    return toConversationRecord(conversation);
+  }
+
+  async listConversations(input: {
+    ownerId: string;
+    projectId: string;
+  }): Promise<ConversationRecord[]> {
+    const rows = await this.db
+      .select()
+      .from(conversations)
+      .where(
+        and(
+          eq(conversations.ownerId, input.ownerId),
+          eq(conversations.projectId, input.projectId),
+          isNull(conversations.deletedAt),
+        ),
+      )
+      .orderBy(desc(conversations.updatedAt), desc(conversations.createdAt));
+
+    return rows.map(toConversationRecord);
+  }
+
+  /**
+   * 工作台刷新时一次性读取会话事实。客户端只把它当作投影，
+   * 不在本地拼接 transcript、Run 或工具结果，避免 SSE 乱序造成脏状态。
+   */
+  async getConversationSnapshot(input: {
+    ownerId: string;
+    conversationId: string;
+  }): Promise<AgentConversationSnapshot> {
+    const [conversation] = await this.db
+      .select()
+      .from(conversations)
+      .where(
+        and(
+          eq(conversations.id, input.conversationId),
+          eq(conversations.ownerId, input.ownerId),
+          isNull(conversations.deletedAt),
+        ),
+      );
+
+    if (!conversation) {
+      throw new AgentError(
+        AGENT_ERROR_CODES.runNotFound,
+        "Conversation 不存在或不属于当前匿名工作区。",
+        404,
+      );
+    }
+
+    const [transcriptRows, runRows] = await Promise.all([
+      this.db
+        .select()
+        .from(transcriptMessages)
+        .where(eq(transcriptMessages.conversationId, input.conversationId))
+        .orderBy(asc(transcriptMessages.seq)),
+      this.db
+        .select()
+        .from(agentRuns)
+        .where(
+          and(
+            eq(agentRuns.conversationId, input.conversationId),
+            eq(agentRuns.ownerId, input.ownerId),
+          ),
+        )
+        .orderBy(asc(agentRuns.createdAt)),
+    ]);
+
+    const runIds = runRows.map((run) => run.id);
+    const [eventRows, toolRows] = runIds.length
+      ? await Promise.all([
+          this.db
+            .select()
+            .from(agentRunEvents)
+            .where(inArray(agentRunEvents.runId, runIds))
+            .orderBy(asc(agentRunEvents.sequence)),
+          this.db
+            .select()
+            .from(toolInvocations)
+            .where(inArray(toolInvocations.runId, runIds))
+            .orderBy(asc(toolInvocations.createdAt)),
+        ])
+      : [[], []];
+
+    return {
+      conversation: toConversationRecord(conversation),
+      transcript: transcriptRows.map(toTranscriptMessage),
+      runs: runRows.map(toAgentRunRecord),
+      events: eventRows,
+      tools: toolRows,
+    };
   }
 
   async countActiveRuns(input: {
@@ -863,6 +1000,19 @@ function toTranscriptMessage(
         data: asRecord(payload.data),
       };
   }
+}
+
+function toConversationRecord(
+  row: typeof conversations.$inferSelect,
+): ConversationRecord {
+  return {
+    id: row.id,
+    projectId: row.projectId,
+    ownerId: row.ownerId,
+    title: row.title,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+  };
 }
 
 function toAgentRunRecord(row: typeof agentRuns.$inferSelect): AgentRunRecord {
