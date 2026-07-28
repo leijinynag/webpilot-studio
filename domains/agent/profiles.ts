@@ -1,0 +1,171 @@
+import { createHash } from "node:crypto";
+
+import { AGENT_ERROR_CODES, AgentError } from "@/domains/agent/errors";
+import { FILE_TOOL_DEFINITIONS } from "@/domains/agent/tool-contracts";
+import type {
+  AgentLocale,
+  FrozenAgentRunProfile,
+  RepositoryCapability,
+} from "@/domains/agent/types";
+
+export const SYSTEM_PROMPT_PROFILE_ID = "webpilot-system-v1";
+export const FILE_TOOLSET_PROFILE_ID = "webpilot-files-v1";
+export const DEEPSEEK_MODEL_PROFILE_ID = "deepseek-agent-v1";
+
+type SystemPromptContext = {
+  locale: AgentLocale;
+  projectId: string;
+  revision: number;
+  repositoryCapability: RepositoryCapability;
+};
+
+const SYSTEM_PROMPT_PROFILES = {
+  [SYSTEM_PROMPT_PROFILE_ID]: (context: SystemPromptContext) => {
+    const responseLanguage =
+      context.locale === "zh-CN" ? "简体中文" : "English";
+
+    return [
+      "You are the coding agent inside WebPilot Studio.",
+      `Respond to the user in ${responseLanguage}.`,
+      `Repository storage: ${context.repositoryCapability.storageKind}.`,
+      `Project id: ${context.projectId}. Current frozen revision: ${context.revision}.`,
+      "",
+      "Repository rules:",
+      "1. Inspect the repository with list_files/search_text before choosing files.",
+      "2. Read an existing file before write_file, delete_file, or rename_file touches it.",
+      "3. Perform at most one file mutation per model turn and use the latest expectedRevision.",
+      "4. After a mutation, continue from the returned revision. Never guess a revision.",
+      "5. Keep changes minimal and preserve the existing project conventions.",
+      "",
+      "Verification and stopping rules:",
+      "1. File tools prove only repository state; do not claim build or browser verification.",
+      "2. Stop immediately on cancellation, revision conflict, invalid tool result, or exhausted budget.",
+      "3. When the requested edit is complete, explain what changed and any verification still required.",
+      "4. Do not call tools after the task is complete.",
+    ].join("\n");
+  },
+} satisfies Record<string, (context: SystemPromptContext) => string>;
+
+const TOOLSET_PROFILES = {
+  [FILE_TOOLSET_PROFILE_ID]: FILE_TOOL_DEFINITIONS,
+} as const;
+
+export function resolveSystemPromptProfile(
+  profileId: string,
+  context: SystemPromptContext,
+): { id: string; digest: string; content: string } {
+  const factory =
+    SYSTEM_PROMPT_PROFILES[profileId as keyof typeof SYSTEM_PROMPT_PROFILES];
+
+  if (!factory) {
+    throw new AgentError(
+      AGENT_ERROR_CODES.profileUnavailable,
+      `System Prompt profile ${profileId} 在当前部署中不可用。`,
+      500,
+      { profileId },
+    );
+  }
+
+  const content = factory(context);
+  return { id: profileId, content, digest: sha256(content) };
+}
+
+export function resolveToolsetProfile(profileId: string) {
+  const tools = TOOLSET_PROFILES[profileId as keyof typeof TOOLSET_PROFILES];
+
+  if (!tools) {
+    throw new AgentError(
+      AGENT_ERROR_CODES.profileUnavailable,
+      `Toolset profile ${profileId} 在当前部署中不可用。`,
+      500,
+      { profileId },
+    );
+  }
+
+  return {
+    id: profileId,
+    tools,
+    digest: sha256(stableStringify(tools)),
+  };
+}
+
+export function createFrozenAgentProfile(input: {
+  locale: AgentLocale;
+  projectId: string;
+  revision: number;
+  repositoryCapability: RepositoryCapability;
+  provider: "deepseek";
+  model: string;
+  maxModelTurns: number;
+  maxWallTimeSeconds: number;
+}): FrozenAgentRunProfile {
+  const prompt = resolveSystemPromptProfile(SYSTEM_PROMPT_PROFILE_ID, input);
+  const toolset = resolveToolsetProfile(FILE_TOOLSET_PROFILE_ID);
+
+  return {
+    locale: input.locale,
+    provider: input.provider,
+    model: input.model,
+    promptProfile: prompt.id,
+    promptDigest: prompt.digest,
+    toolsetProfile: toolset.id,
+    toolsetDigest: toolset.digest,
+    modelProfile: DEEPSEEK_MODEL_PROFILE_ID,
+    repositoryCapability: input.repositoryCapability,
+    budget: {
+      maxModelTurns: input.maxModelTurns,
+      maxWallTimeSeconds: input.maxWallTimeSeconds,
+      maxOutputCharacters: 24_000,
+      maxToolResultCharacters: 20_000,
+    },
+  };
+}
+
+export function assertFrozenProfilesAvailable(input: {
+  promptProfile: string;
+  promptDigest: string;
+  toolsetProfile: string;
+  toolsetDigest: string;
+  promptContext: SystemPromptContext;
+}) {
+  const prompt = resolveSystemPromptProfile(
+    input.promptProfile,
+    input.promptContext,
+  );
+  const toolset = resolveToolsetProfile(input.toolsetProfile);
+
+  if (
+    prompt.digest !== input.promptDigest ||
+    toolset.digest !== input.toolsetDigest
+  ) {
+    throw new AgentError(
+      AGENT_ERROR_CODES.profileUnavailable,
+      "冻结的 Prompt 或 Toolset 与当前部署版本不一致。",
+      500,
+    );
+  }
+
+  return { prompt, toolset };
+}
+
+function sha256(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function stableStringify(value: unknown): string {
+  if (Array.isArray(value)) {
+    return `[${value.map(stableStringify).join(",")}]`;
+  }
+
+  if (value && typeof value === "object") {
+    return `{${Object.entries(value)
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(
+        ([key, nestedValue]) =>
+          `${JSON.stringify(key)}:${stableStringify(nestedValue)}`,
+      )
+      .join(",")}}`;
+  }
+
+  return JSON.stringify(value);
+}

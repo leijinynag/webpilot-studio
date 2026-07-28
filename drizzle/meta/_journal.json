@@ -8,6 +8,20 @@
       "when": 1785157601905,
       "tag": "0000_spooky_firelord",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1785166844054,
+      "tag": "0001_elite_madelyne_pryor",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1785167984564,
+      "tag": "0002_glamorous_jackal",
+      "breakpoints": true
     }
   ]
 }
