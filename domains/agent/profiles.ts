@@ -10,7 +10,10 @@ import type {
 
 export const SYSTEM_PROMPT_PROFILE_ID = "webpilot-system-v1";
 export const FILE_TOOLSET_PROFILE_ID = "webpilot-files-v1";
-export const DEEPSEEK_MODEL_PROFILE_ID = "deepseek-agent-v1";
+// 领域层只记录“编码 Agent 模型配置”这一能力，不绑定具体供应商。
+// 当前可用的 DeepSeek adapter 在 infrastructure 层完成映射，未来替换
+// Provider 时不需要修改 Agent Run、Transcript 或 Orchestrator。
+export const CODING_AGENT_MODEL_PROFILE_ID = "coding-agent-v1";
 
 type SystemPromptContext = {
   locale: AgentLocale;
@@ -94,7 +97,7 @@ export function createFrozenAgentProfile(input: {
   projectId: string;
   revision: number;
   repositoryCapability: RepositoryCapability;
-  provider: "deepseek";
+  provider: string;
   model: string;
   maxModelTurns: number;
   maxWallTimeSeconds: number;
@@ -110,7 +113,7 @@ export function createFrozenAgentProfile(input: {
     promptDigest: prompt.digest,
     toolsetProfile: toolset.id,
     toolsetDigest: toolset.digest,
-    modelProfile: DEEPSEEK_MODEL_PROFILE_ID,
+    modelProfile: CODING_AGENT_MODEL_PROFILE_ID,
     repositoryCapability: input.repositoryCapability,
     budget: {
       maxModelTurns: input.maxModelTurns,

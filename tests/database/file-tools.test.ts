@@ -15,7 +15,7 @@ const profile: FrozenAgentRunProfile = {
   promptDigest: "prompt-digest",
   toolsetProfile: "webpilot-files-v1",
   toolsetDigest: "toolset-digest",
-  modelProfile: "deepseek-agent-v1",
+  modelProfile: "coding-agent-v1",
   repositoryCapability: {
     storageKind: "database",
     canRead: true,
