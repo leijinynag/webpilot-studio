@@ -180,4 +180,52 @@ describe("FileToolExecutor", () => {
       await fixture.testDatabase.close();
     }
   });
+
+  it("keeps the winning repository content after a stale mutation", async () => {
+    const fixture = await createFixture();
+
+    try {
+      const read = await fixture.executor.execute({
+        run: fixture.run,
+        toolCallId: "call-read-before-conflict",
+        toolName: "read_file",
+        argumentsJson: { path: "src/App.tsx" },
+      });
+      expect(read.ok).toBe(true);
+
+      const winningMutation = await fixture.repository.writeFile({
+        ownerId: fixture.run.ownerId,
+        projectId: fixture.run.projectId,
+        path: "src/App.tsx",
+        content: "export const winner = true",
+        expectedRevision: 1,
+      });
+      expect(winningMutation.revision).toBe(2);
+
+      const staleMutation = await fixture.executor.execute({
+        run: fixture.run,
+        toolCallId: "call-stale-write",
+        toolName: "write_file",
+        argumentsJson: {
+          path: "src/App.tsx",
+          content: "export const loser = true",
+          expectedRevision: 1,
+        },
+      });
+      const file = await fixture.repository.readFile({
+        ownerId: fixture.run.ownerId,
+        projectId: fixture.run.projectId,
+        path: "src/App.tsx",
+      });
+
+      expect(staleMutation).toMatchObject({
+        ok: false,
+        conflict: true,
+        error: { code: AGENT_ERROR_CODES.revisionConflict },
+      });
+      expect(file.content).toBe("export const winner = true");
+    } finally {
+      await fixture.testDatabase.close();
+    }
+  });
 });

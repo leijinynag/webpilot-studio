@@ -336,6 +336,62 @@ describe("AgentOrchestrator", () => {
     }
   });
 
+  it("stops before a tool mutation when cancellation arrives during the model turn", async () => {
+    const fixture = await createFixture();
+    let cancelRequested = false;
+    const provider: LlmProvider = {
+      async *streamTurn(input) {
+        // 模拟用户在 Provider 流式返回期间点击 Stop。
+        await fixture.store.requestCancellation({
+          ownerId: fixture.run.ownerId,
+          runId: fixture.run.id,
+        });
+        cancelRequested = true;
+        yield {
+          type: "tool_call_delta",
+          index: 0,
+          toolCallId: "call-write-after-stop",
+          toolName: "write_file",
+          argumentsDelta:
+            '{"path":"src/App.tsx","content":"不应写入","expectedRevision":1}',
+        };
+        yield { type: "finish", reason: "tool_calls" };
+        void input;
+      },
+    };
+
+    try {
+      await new AgentOrchestrator(
+        fixture.store,
+        provider,
+        fixture.fileTools,
+      ).run({
+        ownerId: fixture.run.ownerId,
+        runId: fixture.run.id,
+      });
+
+      const file = await fixture.repository.readFile({
+        ownerId: fixture.run.ownerId,
+        projectId: fixture.run.projectId,
+        path: "src/App.tsx",
+      });
+      const run = await fixture.store.getRun({
+        ownerId: fixture.run.ownerId,
+        runId: fixture.run.id,
+      });
+
+      expect(cancelRequested).toBe(true);
+      expect(file.content).toContain("旧标题");
+      expect(run).toMatchObject({
+        status: "cancelled",
+        currentRevision: 1,
+        errorCode: AGENT_ERROR_CODES.cancelled,
+      });
+    } finally {
+      await fixture.testDatabase.close();
+    }
+  });
+
   it("fails explicitly when the frozen prompt digest is unavailable", async () => {
     const fixture = await createFixture({ promptDigest: "stale-digest" });
     const provider = new ScriptedProvider([]);

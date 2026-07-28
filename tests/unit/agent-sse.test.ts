@@ -34,4 +34,29 @@ describe("Agent Run SSE", () => {
   it("emits a comment heartbeat that does not advance the cursor", () => {
     expect(formatAgentHeartbeatSse()).toBe(": heartbeat\n\n");
   });
+
+  it("keeps event type and sequence stable for cursor-based replay", () => {
+    const first = formatAgentRunEventSse({
+      id: "event-1",
+      runId: "run-1",
+      sequence: 10,
+      type: "run.progress",
+      payload: { phase: "model" },
+      createdAt: new Date("2026-07-27T12:00:00.000Z"),
+    });
+    const replayedAfterCursor = formatAgentRunEventSse({
+      id: "event-2",
+      runId: "run-1",
+      sequence: 11,
+      type: "tool.started",
+      payload: { toolName: "read_file" },
+      createdAt: new Date("2026-07-27T12:00:01.000Z"),
+    });
+
+    expect(first).toContain("id: 10\n");
+    expect(first).toContain("event: run.progress\n");
+    expect(replayedAfterCursor).toContain("id: 11\n");
+    expect(replayedAfterCursor).toContain("event: tool.started\n");
+    expect(replayedAfterCursor).not.toContain("id: 10\n");
+  });
 });
