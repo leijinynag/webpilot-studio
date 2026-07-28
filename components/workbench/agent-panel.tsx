@@ -23,6 +23,10 @@ import {
 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import {
+  clientToolRequestSchema,
+  type ClientToolRequest,
+} from "@/domains/agent/evidence";
 import type {
   AgentConversationSnapshot,
   AgentRunRecord,
@@ -36,6 +40,7 @@ import { cn } from "@/lib/utils";
 type AgentPanelProps = {
   projectId: string;
   revision: number;
+  onClientToolRequest?: (request: ClientToolRequest) => void;
   onRevisionChange?: (revision: number) => void;
 };
 
@@ -59,6 +64,7 @@ const TERMINAL_STATUSES = new Set([
 export function AgentPanel({
   projectId,
   revision,
+  onClientToolRequest,
   onRevisionChange,
 }: AgentPanelProps) {
   const [conversations, setConversations] = useState<ConversationRecord[]>([]);
@@ -239,6 +245,16 @@ export function AgentPanel({
         persistedEvent.type === "assistant.completed"
       ) {
         setStreamingAssistantText("");
+      } else if (
+        persistedEvent?.runId === runId &&
+        persistedEvent.type === "client_tool.requested"
+      ) {
+        const requestResult = clientToolRequestSchema.safeParse(
+          persistedEvent.payload,
+        );
+        if (requestResult.success) {
+          onClientToolRequest?.(requestResult.data);
+        }
       }
 
       // 增量文本先即时投影，快照随后负责收敛 Transcript、工具和 Run 状态。
@@ -270,10 +286,13 @@ export function AgentPanel({
       "model.finished",
       "tool.started",
       "tool.completed",
+      "client_tool.requested",
+      "client_tool.completed",
+      "client_tool.result_ignored",
     ]) {
       stream.addEventListener(eventType, handleEvent);
     }
-  }, [activeRun?.id, loadAgentSnapshot]);
+  }, [activeRun?.id, loadAgentSnapshot, onClientToolRequest]);
 
   useEffect(() => {
     reconnectStreamRef.current = reconnectStream;
@@ -300,6 +319,42 @@ export function AgentPanel({
       }
     }
   }, [onRevisionChange, snapshot?.runs]);
+
+  useEffect(() => {
+    if (!activeRun || activeRun.status !== "awaiting_client_tool") {
+      return;
+    }
+
+    const invocation = snapshot?.tools
+      .slice()
+      .reverse()
+      .find(
+        (tool) =>
+          tool.runId === activeRun.id &&
+          tool.executionDomain === "client" &&
+          tool.status === "running",
+      );
+
+    if (!invocation) {
+      return;
+    }
+
+    // SSE 可能在页面刷新期间错过；ledger 与 Run 快照共同重建同一个请求，
+    // idempotencyKey 保证恢复执行和实时事件最终指向同一项客户端工作。
+    const requestResult = clientToolRequestSchema.safeParse({
+      runId: activeRun.id,
+      projectId,
+      toolCallId: invocation.toolCallId,
+      toolName: invocation.toolName,
+      idempotencyKey: invocation.idempotencyKey,
+      revision: invocation.revisionBefore,
+      arguments: invocation.argumentsJson,
+    });
+
+    if (requestResult.success) {
+      onClientToolRequest?.(requestResult.data);
+    }
+  }, [activeRun, onClientToolRequest, projectId, snapshot?.tools]);
 
   useEffect(() => {
     if (streamingAssistantText) {

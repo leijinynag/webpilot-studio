@@ -88,6 +88,79 @@ describe("WebContainerRuntimeManager", () => {
     expect(manager.getSnapshot().syncedRevision).toBe(2);
   });
 
+  it("相同 revision 的不同运行镜像 key 仍会触发同步", async () => {
+    const runtime = new FakeWebContainer();
+    const manager = new WebContainerRuntimeManager({
+      boot: async () => runtime,
+      isCrossOriginIsolated: () => true,
+    });
+    const repositoryTree = {
+      "index.html": { file: { contents: "<div>repository</div>" } },
+    };
+    const instrumentedTree = {
+      "index.html": { file: { contents: "<div>runtime bridge</div>" } },
+    };
+
+    await manager.start(repositoryTree, "project-a", 2, "repository:2");
+    await manager.start(instrumentedTree, "project-a", 2, "agent:call-1:2");
+
+    expect(runtime.calls).toContain(
+      "write:index.html:<div>runtime bridge</div>",
+    );
+    expect(manager.getSnapshot().syncedRevision).toBe(2);
+  });
+
+  it("串行执行同项目的并发同步，避免运行镜像交错覆盖", async () => {
+    const runtime = new FakeWebContainer();
+    const manager = new WebContainerRuntimeManager({
+      boot: async () => runtime,
+      isCrossOriginIsolated: () => true,
+    });
+    const repositoryWriteStarted = createDeferred<void>();
+    const releaseRepositoryWrite = createDeferred<void>();
+    const originalWriteFile = runtime.fs.writeFile;
+    runtime.fs.writeFile = async (path, content) => {
+      if (path === "index.html" && content.toString() === "repository") {
+        repositoryWriteStarted.resolve();
+        await releaseRepositoryWrite.promise;
+      }
+      await originalWriteFile(path, content);
+    };
+
+    await manager.start(
+      { "index.html": { file: { contents: "base" } } },
+      "project-a",
+      1,
+    );
+    const repositorySync = manager.syncRevision(
+      { "index.html": { file: { contents: "repository" } } },
+      "project-a",
+      2,
+      "repository:2",
+    );
+    await repositoryWriteStarted.promise;
+    const agentSync = manager.syncRevision(
+      { "index.html": { file: { contents: "runtime bridge" } } },
+      "project-a",
+      2,
+      "agent:call-1:2",
+    );
+
+    // 第一轮写入仍被阻塞时，第二轮不能提前触碰文件系统。
+    expect(runtime.calls).not.toContain("write:index.html:runtime bridge");
+    releaseRepositoryWrite.resolve();
+    await Promise.all([repositorySync, agentSync]);
+
+    const repositoryWriteIndex = runtime.calls.indexOf(
+      "write:index.html:repository",
+    );
+    const agentWriteIndex = runtime.calls.indexOf(
+      "write:index.html:runtime bridge",
+    );
+    expect(repositoryWriteIndex).toBeGreaterThan(-1);
+    expect(agentWriteIndex).toBeGreaterThan(repositoryWriteIndex);
+  });
+
   it("依赖清单变化时重建容器而不是假设 HMR 可处理", async () => {
     const firstRuntime = new FakeWebContainer();
     const secondRuntime = new FakeWebContainer();
@@ -157,6 +230,33 @@ describe("WebContainerRuntimeManager", () => {
     expect(snapshot.logs.join("\n")).toContain("dependencies installed");
     expect(snapshot.logs).not.toContain("[install] |");
     expect(snapshot.diagnostic?.message).toContain("退出码 1");
+  });
+
+  it("安装输出流未关闭时仍以 exit code 推进生命周期", async () => {
+    const runtime = new FakeWebContainer();
+    const originalSpawn = runtime.spawn.bind(runtime);
+    runtime.spawn = async (command, args) => {
+      const process = await originalSpawn(command, args);
+
+      if (args[0] === "install") {
+        Object.defineProperty(process, "output", {
+          value: new ReadableStream<string>({
+            start(controller) {
+              controller.enqueue("install still streaming\n");
+            },
+          }),
+        });
+      }
+
+      return process;
+    };
+    const manager = new WebContainerRuntimeManager({
+      boot: async () => runtime,
+      isCrossOriginIsolated: () => true,
+      installTimeoutMs: 1_000,
+    });
+
+    await expect(manager.start()).resolves.toMatchObject({ phase: "ready" });
   });
 
   it("项目切换后忽略旧项目迟到的 boot 和 finally", async () => {

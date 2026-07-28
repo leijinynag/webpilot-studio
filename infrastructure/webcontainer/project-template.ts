@@ -20,6 +20,9 @@ const packageJson = {
   dependencies: {
     "@rsbuild/core": "2.1.8",
     "@rsbuild/plugin-react": "2.1.0",
+    // Rsbuild 对 @rspack/core 使用兼容范围。若不显式固定，npm 可能安装比
+    // WASI binding 更新的小版本，最终在浏览器里通过 server-ready 却无法完成构建。
+    "@rspack/core": "2.1.5",
     "@rspack/binding-wasm32-wasi": "2.1.5",
     "@types/react": "19.2.17",
     "@types/react-dom": "19.2.3",
@@ -68,6 +71,11 @@ import { pluginReact } from "@rsbuild/plugin-react";
 
 export default defineConfig({
   plugins: [pluginReact()],
+  html: {
+    // Rsbuild 默认使用内置 HTML 模板，并不会自动读取项目根目录的 index.html。
+    // Runtime Bridge 会临时注入该文件，因此必须显式把它设为真实编译模板。
+    template: "./index.html",
+  },
   server: {
     host: "0.0.0.0",
     port: ${WEBPILOT_PREVIEW_PORT},

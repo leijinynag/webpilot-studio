@@ -22,6 +22,17 @@ type Run = {
   errorMessage: string | null;
 };
 
+type ToolInvocation = {
+  runId: string;
+  toolName: string;
+  status: string;
+  resultJson: {
+    ok?: boolean;
+    build?: { errors?: string[] };
+    runtime?: { rendered?: boolean };
+  } | null;
+};
+
 async function createProject(page: Page, name: string): Promise<Project> {
   // 先建立匿名 owner Cookie；项目 API 和工作台请求必须共享同一浏览器会话。
   await page.goto("/");
@@ -74,7 +85,9 @@ test.describe("Agent workspace live flow", () => {
   test("completes a natural-language edit and restores the conversation after refresh", async ({
     page,
   }) => {
-    test.setTimeout(240_000);
+    // 真实链路包含 DeepSeek 多轮调用与浏览器内首次 npm install。测试预算需要
+    // 高于 Runtime 自身的 180 秒安装超时，避免网络慢时由测试先行中断。
+    test.setTimeout(360_000);
     const project = await createProject(page, "M2 live agent edit");
     await page.goto(`/p/${project.id}`);
 
@@ -93,12 +106,38 @@ test.describe("Agent workspace live flow", () => {
     );
     expect(runResponse.status()).toBe(201);
     const runBody = (await runResponse.json()) as { run: Run };
-    const run = await waitForTerminalRun(page, runBody.run.id);
+    const run = await waitForTerminalRun(page, runBody.run.id, 300_000);
 
     expect(run.status, run.errorMessage ?? "Agent Run 未成功完成。").toBe(
       "succeeded",
     );
     expect(run.currentRevision).toBeGreaterThan(project.revision);
+
+    const agentSnapshotResponse = await page.request.get(
+      `/api/projects/${project.id}/agent?conversationId=${run.conversationId}`,
+    );
+    expect(agentSnapshotResponse.ok()).toBe(true);
+    const agentSnapshotBody = (await agentSnapshotResponse.json()) as {
+      snapshot: { tools: ToolInvocation[] } | null;
+    };
+    const previewInvocations =
+      agentSnapshotBody.snapshot?.tools.filter(
+        (tool) => tool.runId === run.id && tool.toolName === "run_preview",
+      ) ?? [];
+    const finalPreviewInvocation = previewInvocations.at(-1);
+
+    // Agent 最终 succeeded 只代表它完成了本轮决策，不能替代浏览器运行事实。
+    // Tool Ledger 按 createdAt 升序返回；模型可能根据失败证据主动重试，因此必须验证
+    // 最后一次 run_preview，而不是把已经被后续成功验证取代的首次失败当成最终结果。
+    expect(previewInvocations.length).toBeGreaterThan(0);
+    expect(finalPreviewInvocation).toMatchObject({
+      status: "succeeded",
+      resultJson: {
+        ok: true,
+        build: { errors: [] },
+        runtime: { rendered: true },
+      },
+    });
 
     const fileResponse = await page.request.get(
       `/api/projects/${project.id}/files/src/index.tsx`,
@@ -112,8 +151,10 @@ test.describe("Agent workspace live flow", () => {
 
     // 页面重新加载后，Transcript 仍应来自 Conversation 聚合快照，而不是内存状态。
     await page.reload();
-    await expect(page.getByText(prompt, { exact: true })).toBeVisible();
-    await expect(page.getByText("Completed", { exact: true })).toBeVisible();
+    await expect(
+      page.getByRole("article").filter({ hasText: prompt }),
+    ).toBeVisible();
+    await expect(page.getByText("已完成", { exact: true })).toBeVisible();
     await expect(
       page.getByLabel(`Repository revision ${run.currentRevision}`),
     ).toBeVisible();

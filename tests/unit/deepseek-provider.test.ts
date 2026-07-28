@@ -92,6 +92,58 @@ describe("DeepSeekProvider", () => {
     });
   });
 
+  it("maps domain tool result fields to the DeepSeek wire format", async () => {
+    const fetchImplementation = vi.fn(async (_input, init) => {
+      const body = JSON.parse(String(init?.body)) as {
+        messages: Array<Record<string, unknown>>;
+      };
+
+      expect(body.messages.at(-1)).toEqual({
+        role: "tool",
+        content: '{"ok":true}',
+        tool_call_id: "call-1",
+      });
+
+      return streamResponse([
+        'data: {"choices":[{"index":0,"delta":{"content":"完成"},"finish_reason":"stop"}]}\n\n',
+        "data: [DONE]\n\n",
+      ]);
+    });
+    const provider = new DeepSeekProvider({
+      apiKey: "test-key",
+      fetchImplementation,
+    });
+
+    for await (const event of provider.streamTurn({
+      model: "deepseek-v4-pro",
+      messages: [
+        {
+          role: "assistant",
+          content: null,
+          toolCalls: [
+            {
+              id: "call-1",
+              name: "read_file",
+              argumentsJson: '{"path":"src/index.tsx"}',
+            },
+          ],
+        },
+        {
+          role: "tool",
+          toolCallId: "call-1",
+          content: '{"ok":true}',
+        },
+      ],
+      tools: [],
+      maxOutputTokens: 128,
+    })) {
+      // 消费完整流，确保请求体断言与 SSE 解析都执行。
+      void event;
+    }
+
+    expect(fetchImplementation).toHaveBeenCalledOnce();
+  });
+
   it("rejects a stream that ends without [DONE]", async () => {
     const provider = new DeepSeekProvider({
       apiKey: "test-key",

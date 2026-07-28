@@ -134,6 +134,14 @@ export async function GET(request: Request) {
     });
 
     for (const run of runs) {
+      if (
+        run.status !== "queued" &&
+        run.status !== "running" &&
+        run.status !== "awaiting_async_job"
+      ) {
+        continue;
+      }
+
       after(async () => {
         await launchAgentRun({ ownerId, runId: run.id });
       });

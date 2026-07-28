@@ -17,6 +17,7 @@ describe("database migration", () => {
           and table_name in (
             'agent_run_events',
             'agent_runs',
+            'agent_evidence',
             'conversations',
             'projects',
             'project_files',
@@ -30,6 +31,7 @@ describe("database migration", () => {
       `);
 
       expect(result.rows.map((row) => row.table_name)).toEqual([
+        "agent_evidence",
         "agent_run_events",
         "agent_runs",
         "conversations",

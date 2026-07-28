@@ -75,6 +75,12 @@ export const toolInvocationStatus = pgEnum("tool_invocation_status", [
   "cancelled",
 ]);
 
+export const agentEvidenceKind = pgEnum("agent_evidence_kind", [
+  "build",
+  "runtime",
+  "console",
+]);
+
 export const projects = pgTable(
   "projects",
   {
@@ -480,6 +486,48 @@ export const toolInvocations = pgTable(
   ],
 );
 
+export const agentEvidence = pgTable(
+  "agent_evidence",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    runId: uuid("run_id")
+      .notNull()
+      .references(() => agentRuns.id, { onDelete: "cascade" }),
+    toolCallId: text("tool_call_id").notNull(),
+    projectId: uuid("project_id")
+      .notNull()
+      .references(() => projects.id, { onDelete: "cascade" }),
+    ownerId: text("owner_id").notNull(),
+    revision: integer("revision").notNull(),
+    kind: agentEvidenceKind("kind").notNull(),
+    payload: jsonb("payload").$type<Record<string, unknown>>().notNull(),
+    createdAt: timestamp("created_at", {
+      withTimezone: true,
+      mode: "date",
+    })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    check("agent_evidence_revision_check", sql`${table.revision} >= 0`),
+    uniqueIndex("agent_evidence_run_call_kind_uidx").on(
+      table.runId,
+      table.toolCallId,
+      table.kind,
+    ),
+    index("agent_evidence_project_revision_idx").on(
+      table.projectId,
+      table.revision,
+      table.createdAt,
+    ),
+    index("agent_evidence_owner_run_idx").on(
+      table.ownerId,
+      table.runId,
+      table.createdAt,
+    ),
+  ],
+);
+
 export const databaseSchema = {
   projects,
   projectFileBlobs,
@@ -491,6 +539,7 @@ export const databaseSchema = {
   agentRuns,
   agentRunEvents,
   toolInvocations,
+  agentEvidence,
 };
 
 export type ProjectRow = typeof projects.$inferSelect;

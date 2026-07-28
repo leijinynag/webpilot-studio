@@ -30,7 +30,6 @@ export async function launchAgentRun(input: {
     if (
       run.status === "queued" ||
       run.status === "running" ||
-      run.status === "awaiting_client_tool" ||
       run.status === "awaiting_async_job"
     ) {
       await store.transitionRun({

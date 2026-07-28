@@ -5,6 +5,10 @@ import {
   AgentError,
   isAgentError,
 } from "@/domains/agent/errors";
+import {
+  RUN_PREVIEW_TOOL_NAME,
+  runPreviewToolArgumentsSchema,
+} from "@/domains/agent/evidence";
 import type {
   FileToolExecutor,
   FileToolResultEnvelope,
@@ -29,6 +33,8 @@ type AgentStorePort = Pick<
   | "appendEvent"
   | "appendTranscript"
   | "claimExecution"
+  | "registerToolInvocation"
+  | "markToolInvocationRunning"
   | "getRun"
   | "listTranscript"
   | "releaseExecutionLease"
@@ -94,7 +100,12 @@ export class AgentOrchestrator {
           status: "running",
         });
       } else if (run.status !== "running") {
-        // 首版只有纯服务端文件工具；等待 client/worker 的状态不在本里程碑恢复。
+        // 等待浏览器工具时由 SSE/Conversation 快照恢复请求，服务端 Loop 不应
+        // 抢跑或把一个健康的 awaiting 状态误判成失败。
+        if (run.status === "awaiting_client_tool") {
+          return;
+        }
+
         throw new AgentError(
           AGENT_ERROR_CODES.runConflict,
           `当前 Run 状态 ${run.status} 不能由服务端 Agent Loop 推进。`,
@@ -217,6 +228,16 @@ export class AgentOrchestrator {
               revision: run.currentRevision,
             },
           });
+
+          if (toolCall.name === RUN_PREVIEW_TOOL_NAME) {
+            await this.suspendForRunPreview({
+              run,
+              toolCall,
+              argumentsJson,
+              leaseId,
+            });
+            return;
+          }
 
           const result = await this.fileTools.execute({
             run,
@@ -391,6 +412,89 @@ export class AgentOrchestrator {
         ok: result.ok,
         revision: result.ok ? result.revision : run.currentRevision,
         ...(result.ok ? {} : { errorCode: result.error.code }),
+      },
+    });
+  }
+
+  private async suspendForRunPreview(input: {
+    run: AgentRunRecord;
+    toolCall: AccumulatedToolCall;
+    argumentsJson: unknown;
+    leaseId: string;
+  }): Promise<void> {
+    const argumentsResult = runPreviewToolArgumentsSchema.safeParse(
+      input.argumentsJson,
+    );
+
+    if (!argumentsResult.success) {
+      throw new AgentError(
+        AGENT_ERROR_CODES.toolInvalidArguments,
+        "工具 run_preview 的参数不合法。",
+        400,
+        { issues: argumentsResult.error.issues },
+      );
+    }
+
+    if (argumentsResult.data.revision !== input.run.currentRevision) {
+      throw new AgentError(
+        AGENT_ERROR_CODES.revisionConflict,
+        "run_preview 必须验证 Agent 当前持有的最新 revision。",
+        409,
+        {
+          requestedRevision: argumentsResult.data.revision,
+          currentRevision: input.run.currentRevision,
+        },
+      );
+    }
+
+    const idempotencyKey = `${input.run.id}:${input.toolCall.id}`;
+    const registration = await this.store.registerToolInvocation({
+      runId: input.run.id,
+      toolCallId: input.toolCall.id,
+      toolName: RUN_PREVIEW_TOOL_NAME,
+      executionDomain: "client",
+      argumentsJson: argumentsResult.data,
+      idempotencyKey,
+      revisionBefore: input.run.currentRevision,
+    });
+
+    if (!registration.created) {
+      throw new AgentError(
+        AGENT_ERROR_CODES.toolAlreadyExecuted,
+        "重复的 run_preview Tool Call 不能再次下发浏览器。",
+        409,
+        { toolCallId: input.toolCall.id },
+      );
+    }
+
+    await this.store.markToolInvocationRunning({
+      runId: input.run.id,
+      toolCallId: input.toolCall.id,
+    });
+    await this.store.transitionRun({
+      ownerId: input.run.ownerId,
+      runId: input.run.id,
+      status: "awaiting_client_tool",
+    });
+
+    // 必须在发布 SSE 请求前释放服务端租约。浏览器可能立即完成验证，
+    // 若旧租约仍存在，结果接口恢复 Agent Loop 时会拿不到执行权。
+    await this.store.releaseExecutionLease({
+      ownerId: input.run.ownerId,
+      runId: input.run.id,
+      leaseId: input.leaseId,
+    });
+    await this.store.appendEvent({
+      runId: input.run.id,
+      type: "client_tool.requested",
+      payload: {
+        runId: input.run.id,
+        projectId: input.run.projectId,
+        toolCallId: input.toolCall.id,
+        toolName: RUN_PREVIEW_TOOL_NAME,
+        idempotencyKey,
+        revision: input.run.currentRevision,
+        arguments: argumentsResult.data,
       },
     });
   }

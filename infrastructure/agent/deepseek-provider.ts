@@ -223,6 +223,16 @@ export class DeepSeekProvider implements LlmProvider {
 }
 
 function toDeepSeekMessage(message: ProviderMessage) {
+  if (message.role === "tool") {
+    // 领域层保持供应商无关的 camelCase；DeepSeek 的 OpenAI 兼容协议
+    // 要求工具结果使用 tool_call_id，否则第二轮请求会直接返回 HTTP 400。
+    return {
+      role: "tool" as const,
+      content: message.content,
+      tool_call_id: message.toolCallId,
+    };
+  }
+
   if (message.role !== "assistant" || !message.toolCalls) {
     return message;
   }

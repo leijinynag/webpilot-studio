@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 
 import { and, asc, desc, eq, gt, inArray, isNull, lt, or } from "drizzle-orm";
 import type { PgDatabase } from "drizzle-orm/pg-core";
@@ -6,6 +7,10 @@ import type { PgQueryResultHKT } from "drizzle-orm/pg-core/session";
 import type { ExtractTablesWithRelations } from "drizzle-orm/relations";
 
 import { AGENT_ERROR_CODES, AgentError } from "@/domains/agent/errors";
+import {
+  RUN_PREVIEW_TOOL_NAME,
+  type RunPreviewResult,
+} from "@/domains/agent/evidence";
 import {
   isTerminalAgentRunStatus,
   reduceAgentRunStatus,
@@ -21,6 +26,7 @@ import type {
   TranscriptMessage,
 } from "@/domains/agent/types";
 import {
+  agentEvidence,
   agentRunEvents,
   agentRuns,
   conversations,
@@ -812,6 +818,265 @@ export class AgentStore<TQueryResult extends PgQueryResultHKT> {
     }
 
     return updated;
+  }
+
+  /**
+   * 浏览器工具结果、Evidence、Transcript 与 Run 恢复必须原子提交。
+   * 否则 Serverless 实例在任意两步之间中断时，会出现“证据已保存但 Run
+   * 仍等待”或“Run 已继续但模型看不到 Tool Result”的不可恢复状态。
+   */
+  async completeClientToolResult(input: {
+    ownerId: string;
+    runId: string;
+    projectId: string;
+    toolCallId: string;
+    toolName: typeof RUN_PREVIEW_TOOL_NAME;
+    idempotencyKey: string;
+    revision: number;
+    result: RunPreviewResult;
+  }): Promise<{
+    disposition: "accepted" | "duplicate" | "ignored";
+    run: AgentRunRecord;
+  }> {
+    return this.db.transaction(async (tx) => {
+      const [runRow] = await tx
+        .select()
+        .from(agentRuns)
+        .where(
+          and(
+            eq(agentRuns.id, input.runId),
+            eq(agentRuns.ownerId, input.ownerId),
+            eq(agentRuns.projectId, input.projectId),
+          ),
+        );
+
+      if (!runRow) {
+        throw new AgentError(
+          AGENT_ERROR_CODES.runNotFound,
+          "Agent Run 不存在、项目不匹配或不属于当前匿名工作区。",
+          404,
+        );
+      }
+
+      const [invocation] = await tx
+        .select()
+        .from(toolInvocations)
+        .where(
+          and(
+            eq(toolInvocations.runId, input.runId),
+            eq(toolInvocations.toolCallId, input.toolCallId),
+          ),
+        );
+
+      if (
+        !invocation ||
+        invocation.toolName !== input.toolName ||
+        invocation.executionDomain !== "client" ||
+        invocation.idempotencyKey !== input.idempotencyKey
+      ) {
+        throw new AgentError(
+          AGENT_ERROR_CODES.toolInvalidArguments,
+          "Client Tool Result 与已登记的 invocation 不匹配。",
+          409,
+          { toolCallId: input.toolCallId, toolName: input.toolName },
+        );
+      }
+
+      if (
+        invocation.status === "succeeded" ||
+        invocation.status === "failed" ||
+        invocation.status === "cancelled"
+      ) {
+        if (
+          invocation.resultJson &&
+          isDeepStrictEqual(invocation.resultJson, input.result)
+        ) {
+          return {
+            disposition: "duplicate",
+            run: toAgentRunRecord(runRow),
+          };
+        }
+
+        throw new AgentError(
+          AGENT_ERROR_CODES.toolAlreadyExecuted,
+          "同一幂等键已经提交过不同的 Client Tool Result。",
+          409,
+        );
+      }
+
+      const ignoredReason =
+        runRow.status !== "awaiting_client_tool"
+          ? "run_not_awaiting_client_tool"
+          : invocation.status !== "running"
+            ? "invocation_not_running"
+            : runRow.currentRevision !== input.revision ||
+                input.result.revision !== input.revision
+              ? "stale_revision"
+              : null;
+
+      if (ignoredReason) {
+        await tx.insert(agentRunEvents).values({
+          runId: input.runId,
+          type: "client_tool.result_ignored",
+          payload: {
+            toolCallId: input.toolCallId,
+            toolName: input.toolName,
+            reason: ignoredReason,
+            submittedRevision: input.revision,
+            currentRevision: runRow.currentRevision,
+          },
+        });
+
+        return {
+          disposition: "ignored",
+          run: toAgentRunRecord(runRow),
+        };
+      }
+
+      const invocationStatus = input.result.ok ? "succeeded" : "failed";
+      const [completedInvocation] = await tx
+        .update(toolInvocations)
+        .set({
+          status: invocationStatus,
+          resultJson: input.result,
+          revisionAfter: input.revision,
+          errorCode: input.result.ok ? null : "PREVIEW_VERIFICATION_FAILED",
+          completedAt: new Date(),
+        })
+        .where(
+          and(
+            eq(toolInvocations.id, invocation.id),
+            eq(toolInvocations.status, "running"),
+          ),
+        )
+        .returning();
+
+      if (!completedInvocation) {
+        const [latestInvocation] = await tx
+          .select()
+          .from(toolInvocations)
+          .where(eq(toolInvocations.id, invocation.id));
+
+        if (
+          latestInvocation?.resultJson &&
+          isDeepStrictEqual(latestInvocation.resultJson, input.result)
+        ) {
+          return {
+            disposition: "duplicate",
+            run: toAgentRunRecord(runRow),
+          };
+        }
+
+        throw new AgentError(
+          AGENT_ERROR_CODES.toolAlreadyExecuted,
+          "Client Tool invocation 已被其他请求完成。",
+          409,
+        );
+      }
+
+      await tx.insert(agentEvidence).values([
+        {
+          runId: input.runId,
+          toolCallId: input.toolCallId,
+          projectId: input.projectId,
+          ownerId: input.ownerId,
+          revision: input.revision,
+          kind: "build",
+          payload: input.result.build,
+        },
+        {
+          runId: input.runId,
+          toolCallId: input.toolCallId,
+          projectId: input.projectId,
+          ownerId: input.ownerId,
+          revision: input.revision,
+          kind: "runtime",
+          payload: input.result.runtime,
+        },
+        {
+          runId: input.runId,
+          toolCallId: input.toolCallId,
+          projectId: input.projectId,
+          ownerId: input.ownerId,
+          revision: input.revision,
+          kind: "console",
+          payload: input.result.console,
+        },
+      ]);
+
+      await tx.insert(transcriptMessages).values({
+        conversationId: runRow.conversationId,
+        runId: runRow.id,
+        role: "tool",
+        kind: "tool_result",
+        payload: {
+          toolCallId: input.toolCallId,
+          toolName: input.toolName,
+          resultJson: input.result,
+        },
+      });
+
+      const now = new Date();
+      const [updatedRun] = await tx
+        .update(agentRuns)
+        .set({
+          status: "running",
+          updatedAt: now,
+        })
+        .where(
+          and(
+            eq(agentRuns.id, input.runId),
+            eq(agentRuns.ownerId, input.ownerId),
+            eq(agentRuns.status, "awaiting_client_tool"),
+          ),
+        )
+        .returning();
+
+      if (!updatedRun) {
+        throw new AgentError(
+          AGENT_ERROR_CODES.runConflict,
+          "Client Tool Result 提交时 Run 状态已发生变化。",
+          409,
+        );
+      }
+
+      await tx.insert(agentRunEvents).values([
+        {
+          runId: input.runId,
+          type: "tool.completed",
+          payload: {
+            toolCallId: input.toolCallId,
+            toolName: input.toolName,
+            ok: input.result.ok,
+            revision: input.revision,
+          },
+        },
+        {
+          runId: input.runId,
+          type: "client_tool.completed",
+          payload: {
+            toolCallId: input.toolCallId,
+            toolName: input.toolName,
+            ok: input.result.ok,
+            revision: input.revision,
+          },
+        },
+        {
+          runId: input.runId,
+          type: "run.status_changed",
+          payload: {
+            previousStatus: "awaiting_client_tool",
+            status: "running",
+            currentRevision: input.revision,
+          },
+        },
+      ]);
+
+      return {
+        disposition: "accepted",
+        run: toAgentRunRecord(updatedRun),
+      };
+    });
   }
 
   async findSuccessfulRead(input: {

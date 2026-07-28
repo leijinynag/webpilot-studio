@@ -1,7 +1,14 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useMemo, useReducer, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useReducer,
+  useRef,
+  useState,
+} from "react";
 import type { editor } from "monaco-editor";
 import {
   Code2,
@@ -27,6 +34,10 @@ import { EditorTabs } from "@/components/workbench/editor-tabs";
 import { FileOperationDialog } from "@/components/workbench/file-operation-dialog";
 import { FileTree } from "@/components/workbench/file-tree";
 import { PROJECT_ERROR_CODES } from "@/domains/project/errors";
+import type {
+  ClientToolRequest,
+  RunPreviewResult,
+} from "@/domains/agent/evidence";
 import type {
   ProjectDescription,
   ProjectFileSnapshot,
@@ -78,6 +89,8 @@ export function ProjectWorkspace({
   const [operation, setOperation] = useState<FileOperation>(null);
   const [mutationPending, setMutationPending] = useState(false);
   const [agentRevision, setAgentRevision] = useState(project.revision);
+  const [clientToolRequest, setClientToolRequest] =
+    useState<ClientToolRequest | null>(null);
   const editorRef = useRef<editor.IStandaloneCodeEditor | null>(null);
   const stateRef = useRef(state);
   stateRef.current = state;
@@ -171,7 +184,7 @@ export function ProjectWorkspace({
     dispatch({ type: "error", message });
   }
 
-  async function refreshRepositorySnapshot() {
+  const refreshRepositorySnapshot = useCallback(async () => {
     try {
       const [projectResponse, filesResponse] = await Promise.all([
         fetch(`/api/projects/${project.id}`, { cache: "no-store" }),
@@ -203,7 +216,7 @@ export function ProjectWorkspace({
         message: "无法连接 Repository，本地草稿仍被保留。",
       });
     }
-  }
+  }, [project.id]);
 
   function handleAgentRevisionChange(nextRevision: number) {
     setAgentRevision(nextRevision);
@@ -214,6 +227,71 @@ export function ProjectWorkspace({
       void refreshRepositorySnapshot();
     }
   }
+
+  const handleClientToolRequest = useCallback(
+    (request: ClientToolRequest) => {
+      if (request.projectId !== project.id) {
+        return;
+      }
+
+      setClientToolRequest((current) =>
+        current?.toolCallId === request.toolCallId ? current : request,
+      );
+      setView("preview");
+
+      // Tool Call 在文件 mutation 落库后才会下发。若 SSE 比工作台快照先到，
+      // 主动拉取目标 revision；reducer 仍会保护用户尚未保存的本地草稿。
+      if (request.revision > stateRef.current.revision) {
+        void refreshRepositorySnapshot();
+      }
+    },
+    [project.id, refreshRepositorySnapshot],
+  );
+
+  const handleClientToolResult = useCallback(
+    async (request: ClientToolRequest, result: RunPreviewResult) => {
+      try {
+        const response = await fetch(
+          `/api/agent-runs/${request.runId}/client-tool-results`,
+          {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              projectId: request.projectId,
+              toolCallId: request.toolCallId,
+              toolName: request.toolName,
+              idempotencyKey: request.idempotencyKey,
+              revision: request.revision,
+              result,
+            }),
+          },
+        );
+        const body = (await response.json().catch(() => ({}))) as {
+          disposition?: "accepted" | "duplicate" | "ignored";
+          error?: { message?: string };
+        };
+
+        if (!response.ok) {
+          throw new Error(body.error?.message ?? "Preview 证据提交失败。");
+        }
+
+        setClientToolRequest((current) =>
+          current?.toolCallId === request.toolCallId ? null : current,
+        );
+      } catch (error) {
+        const message =
+          error instanceof Error
+            ? error.message
+            : "Preview 证据提交失败，请稍后重试。";
+        dispatch({
+          type: "error",
+          message,
+        });
+        throw error instanceof Error ? error : new Error(message);
+      }
+    },
+    [],
+  );
 
   async function submitFileOperation(value: string) {
     if (!operation || mutationPending) {
@@ -411,6 +489,7 @@ export function ProjectWorkspace({
 
       <div className="workbench-grid">
         <AgentPanel
+          onClientToolRequest={handleClientToolRequest}
           onRevisionChange={handleAgentRevisionChange}
           projectId={project.id}
           revision={agentRevision}
@@ -521,7 +600,9 @@ export function ProjectWorkspace({
                 )
               ) : (
                 <WebContainerPreview
+                  clientToolRequest={clientToolRequest}
                   files={repositoryFiles}
+                  onClientToolResult={handleClientToolResult}
                   projectId={project.id}
                   revision={state.revision}
                 />

@@ -46,6 +46,7 @@ export type WebContainerAdapter = {
 export type WebContainerRuntimeDependencies = {
   boot: () => Promise<WebContainerAdapter>;
   isCrossOriginIsolated: () => boolean;
+  installTimeoutMs?: number;
   serverReadyTimeoutMs?: number;
 };
 
@@ -125,9 +126,15 @@ export class WebContainerRuntimeManager {
   private instance: WebContainerAdapter | null = null;
   private bootPromise: Promise<WebContainerAdapter> | null = null;
   private startPromise: Promise<WebContainerRuntimeSnapshot> | null = null;
+  // 普通 Repository 刷新与 Agent 运行镜像可能在同一 revision 上同时到达。
+  // 文件系统写入必须串行，否则两次 diff 会基于同一旧快照计算并交错覆盖 index.html。
+  private syncTail: Promise<void> = Promise.resolve();
   private devProcess: WebContainerProcessAdapter | null = null;
   // ready 状态只对当前项目有效；切换项目必须销毁旧容器，避免 mount 合并出跨项目残留文件。
   private activeProjectKey: string | null = null;
+  // Repository revision 与运行镜像身份并不总是一一对应。run_preview 会在相同
+  // revision 上临时注入 Bridge，因此需要独立 key 触发同步，不能把它误判为旧镜像。
+  private activeRuntimeKey: string | null = null;
   // mountedFiles 记录运行镜像当前内容，增量同步时据此识别新增、修改和删除。
   private mountedFiles = new Map<string, string>();
   // generation 是轻量取消令牌。teardown 或未来的新一轮启动会递增它，
@@ -139,6 +146,7 @@ export class WebContainerRuntimeManager {
       boot: dependencies?.boot ?? bootWebContainer,
       isCrossOriginIsolated:
         dependencies?.isCrossOriginIsolated ?? isBrowserCrossOriginIsolated,
+      installTimeoutMs: dependencies?.installTimeoutMs ?? 180_000,
       serverReadyTimeoutMs: dependencies?.serverReadyTimeoutMs ?? 120_000,
     };
   }
@@ -158,6 +166,7 @@ export class WebContainerRuntimeManager {
     tree: FileSystemTree = WEBPILOT_RSBUILD_TEMPLATE,
     projectKey = "default-template",
     revision: number | null = null,
+    runtimeKey = `revision:${revision ?? "unknown"}`,
   ): Promise<WebContainerRuntimeSnapshot> {
     if (
       this.activeProjectKey !== null &&
@@ -171,24 +180,35 @@ export class WebContainerRuntimeManager {
       this.snapshot.phase === "ready" &&
       this.activeProjectKey === projectKey
     ) {
-      return this.snapshot.syncedRevision === revision
+      return this.activeRuntimeKey === runtimeKey
         ? Promise.resolve(this.snapshot)
-        : this.syncRevision(tree, projectKey, revision);
+        : this.syncRevision(tree, projectKey, revision, runtimeKey);
     }
 
     // Strict Mode、多个预览消费者或用户连续点击重试都可能同时调用 start。
-    // 返回同一个 Promise 可以保证完整启动链在任一时刻最多执行一次。
+    // 若后来的请求携带不同 runtimeKey，则在当前启动完成后补一次增量同步。
+    // 这覆盖“普通 Preview 正在安装时 Agent 请求注入 Bridge”的真实竞态。
     if (this.startPromise) {
-      return this.startPromise;
+      return this.startPromise.then(() => {
+        if (this.activeProjectKey !== projectKey) {
+          return this.start(tree, projectKey, revision, runtimeKey);
+        }
+
+        return this.activeRuntimeKey === runtimeKey
+          ? this.snapshot
+          : this.syncRevision(tree, projectKey, revision, runtimeKey);
+      });
     }
 
     this.activeProjectKey = projectKey;
-    const currentStart = this.startRuntime(tree, revision).finally(() => {
-      // 旧项目的 finally 可能晚于新项目启动；只允许当前 Promise 清理自己的锁。
-      if (this.startPromise === currentStart) {
-        this.startPromise = null;
-      }
-    });
+    const currentStart = this.startRuntime(tree, revision, runtimeKey).finally(
+      () => {
+        // 旧项目的 finally 可能晚于新项目启动；只允许当前 Promise 清理自己的锁。
+        if (this.startPromise === currentStart) {
+          this.startPromise = null;
+        }
+      },
+    );
     this.startPromise = currentStart;
 
     return currentStart;
@@ -199,28 +219,50 @@ export class WebContainerRuntimeManager {
    * 普通源码文件使用 fs 增量同步，依赖与构建配置变化则重新启动容器，
    * 因为仅靠 HMR 无法保证安装结果、Node 进程参数或插件图已经更新。
    */
-  async syncRevision(
+  syncRevision(
     tree: FileSystemTree,
     projectKey: string,
     revision: number | null,
+    runtimeKey = `revision:${revision ?? "unknown"}`,
   ): Promise<WebContainerRuntimeSnapshot> {
     if (this.activeProjectKey !== projectKey) {
-      return this.start(tree, projectKey, revision);
+      return this.start(tree, projectKey, revision, runtimeKey);
     }
 
+    const queuedSync = this.syncTail.then(
+      () => this.performSyncRevision(tree, projectKey, revision, runtimeKey),
+      () => this.performSyncRevision(tree, projectKey, revision, runtimeKey),
+    );
+    // 单次同步失败仍应原样返回给调用方，但不能让队列永久停在 rejected。
+    this.syncTail = queuedSync.then(
+      () => undefined,
+      () => undefined,
+    );
+
+    return queuedSync;
+  }
+
+  private async performSyncRevision(
+    tree: FileSystemTree,
+    projectKey: string,
+    revision: number | null,
+    runtimeKey: string,
+  ): Promise<WebContainerRuntimeSnapshot> {
     if (this.startPromise) {
       await this.startPromise;
     }
 
-    if (
-      !this.instance ||
-      this.snapshot.phase !== "ready" ||
-      this.activeProjectKey !== projectKey
-    ) {
-      return this.start(tree, projectKey, revision);
+    // 排队期间用户可能已经切换项目。旧同步只能自然结束，不能重新启动旧项目
+    // 并覆盖当前工作台持有的 WebContainer。
+    if (this.activeProjectKey !== projectKey) {
+      return this.snapshot;
     }
 
-    if (this.snapshot.syncedRevision === revision) {
+    if (!this.instance || this.snapshot.phase !== "ready") {
+      return this.start(tree, projectKey, revision, runtimeKey);
+    }
+
+    if (this.activeRuntimeKey === runtimeKey) {
       return this.snapshot;
     }
 
@@ -267,6 +309,7 @@ export class WebContainerRuntimeManager {
       }
 
       this.mountedFiles = nextFiles;
+      this.activeRuntimeKey = runtimeKey;
       this.setSnapshot({
         ...this.snapshot,
         syncedRevision: revision,
@@ -303,6 +346,7 @@ export class WebContainerRuntimeManager {
     this.bootPromise = null;
     this.startPromise = null;
     this.activeProjectKey = null;
+    this.activeRuntimeKey = null;
     this.mountedFiles = new Map();
     this.setSnapshot(createInitialRuntimeSnapshot());
   }
@@ -310,6 +354,7 @@ export class WebContainerRuntimeManager {
   private async startRuntime(
     tree: FileSystemTree,
     revision: number | null,
+    runtimeKey: string,
   ): Promise<WebContainerRuntimeSnapshot> {
     const generation = ++this.generation;
     const crossOriginIsolated = this.dependencies.isCrossOriginIsolated();
@@ -355,6 +400,7 @@ export class WebContainerRuntimeManager {
       this.appendLog("[runtime] 正在挂载固定 Rsbuild 项目模板...");
       await instance.mount(tree);
       this.mountedFiles = flattenRuntimeTree(tree);
+      this.activeRuntimeKey = runtimeKey;
       this.assertGeneration(generation);
 
       this.setPhase("installing");
@@ -367,8 +413,28 @@ export class WebContainerRuntimeManager {
         "--no-audit",
         "--force",
       ]);
-      await this.consumeProcessOutput(installProcess, "install", generation);
-      const installExitCode = await installProcess.exit;
+      // stdout 在部分 WebContainer/npm 组合里会比进程退出更晚关闭。
+      // 输出持续后台消费，安装阶段的完成事实以 exit code 为准，避免界面永久卡在 installing。
+      const installOutput = this.consumeProcessOutput(
+        installProcess,
+        "install",
+        generation,
+      );
+      const installExitCode = await withTimeout(
+        installProcess.exit,
+        this.dependencies.installTimeoutMs,
+        () =>
+          new WebContainerRuntimeError(
+            "install_failed",
+            "依赖安装超时，运行镜像未能完成准备。",
+            {
+              detail: `npm install 在 ${this.dependencies.installTimeoutMs}ms 内未退出。`,
+            },
+          ),
+      );
+      // 给已结束进程的剩余输出一个很短的排空窗口；超时后继续启动，
+      // 后台消费者仍会在流真正关闭时自行结束。
+      await Promise.race([installOutput, delayMilliseconds(500)]);
 
       if (installExitCode !== 0) {
         throw new WebContainerRuntimeError(
@@ -663,4 +729,29 @@ function flattenRuntimeTree(
   }
 
   return files;
+}
+
+function delayMilliseconds(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
+}
+
+function withTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  createError: () => Error,
+): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timeout = window.setTimeout(() => reject(createError()), timeoutMs);
+
+    promise.then(
+      (value) => {
+        window.clearTimeout(timeout);
+        resolve(value);
+      },
+      (error) => {
+        window.clearTimeout(timeout);
+        reject(error);
+      },
+    );
+  });
 }
