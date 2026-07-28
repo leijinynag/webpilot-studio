@@ -1,4 +1,8 @@
-import type { ProviderMessage, TranscriptMessage } from "@/domains/agent/types";
+import type {
+  AgentRunEvent,
+  ProviderMessage,
+  TranscriptMessage,
+} from "@/domains/agent/types";
 
 const DEFAULT_MAX_MESSAGE_CHARACTERS = 24_000;
 
@@ -75,4 +79,40 @@ export function assembleProviderMessages(
   }
 
   return messages;
+}
+
+/**
+ * Assistant 的增量文本先以 Run Event 形式持久化，完整轮次结束后才追加
+ * 到 Transcript。这个投影只负责恢复“尚未落库为完整消息”的临时文本，
+ * 不会把流式中间态混入下一次模型上下文。
+ */
+export function projectPendingAssistantText(
+  events: readonly AgentRunEvent[],
+  activeRunId: string | null,
+): string {
+  if (!activeRunId) {
+    return "";
+  }
+
+  let text = "";
+
+  for (const event of events
+    .filter((item) => item.runId === activeRunId)
+    .toSorted((left, right) => left.sequence - right.sequence)) {
+    if (event.type === "assistant.completed") {
+      text = "";
+      continue;
+    }
+
+    if (event.type !== "assistant.delta") {
+      continue;
+    }
+
+    const delta = event.payload.text;
+    if (typeof delta === "string") {
+      text += delta;
+    }
+  }
+
+  return text;
 }

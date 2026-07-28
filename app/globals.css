@@ -3577,6 +3577,19 @@ html[data-theme="dark"] .ide-surface.is-preview {
   overflow-wrap: anywhere;
 }
 
+.agent-message.is-streaming p {
+  min-height: 1.55em;
+}
+
+.agent-message.is-streaming .agent-message-label {
+  color: var(--accent);
+}
+
+.agent-message.is-streaming .agent-message-label svg {
+  width: 12px;
+  height: 12px;
+}
+
 .agent-message-user {
   margin-left: 20px;
   padding: 10px 11px;
@@ -3681,6 +3694,11 @@ html[data-theme="dark"] .ide-surface.is-preview {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.agent-run-status-detail span:last-child {
+  flex: 0 0 auto;
+  text-align: right;
 }
 
 .agent-run-status .button {

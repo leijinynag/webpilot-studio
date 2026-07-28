@@ -30,6 +30,7 @@ import type {
   ToolInvocationRecord,
   TranscriptMessage,
 } from "@/domains/agent/types";
+import { projectPendingAssistantText } from "@/domains/agent/transcript";
 import { cn } from "@/lib/utils";
 
 type AgentPanelProps = {
@@ -71,8 +72,10 @@ export function AgentPanel({
   const [loading, setLoading] = useState(true);
   const [sending, setSending] = useState(false);
   const [creatingConversation, setCreatingConversation] = useState(false);
+  const [stopping, setStopping] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [showHistory, setShowHistory] = useState(false);
+  const [streamingAssistantText, setStreamingAssistantText] = useState("");
   const streamRef = useRef<EventSource | null>(null);
   const streamRunIdRef = useRef<string | null>(null);
   const reconnectTimerRef = useRef<number | null>(null);
@@ -80,6 +83,8 @@ export function AgentPanel({
   const selectedConversationRef = useRef<string | null>(null);
   const reconnectStreamRef = useRef<(() => void) | null>(null);
   const draftRef = useRef<HTMLTextAreaElement | null>(null);
+  const transcriptRef = useRef<HTMLDivElement | null>(null);
+  const snapshotRequestRef = useRef(0);
 
   const activeRun = useMemo(
     () =>
@@ -106,18 +111,33 @@ export function AgentPanel({
   );
 
   const loadAgentSnapshot = useCallback(
-    async (conversationId?: string | null) => {
-      setLoading(true);
+    async (
+      conversationId?: string | null,
+      options: { showLoading?: boolean } = {},
+    ) => {
+      const requestId = snapshotRequestRef.current + 1;
+      snapshotRequestRef.current = requestId;
+      if (options.showLoading !== false) {
+        setLoading(true);
+      }
 
       try {
         const body = await fetchAgentSnapshot(projectId, conversationId);
-        applySnapshot(body);
+        // SSE 事件可能同时触发多个快照请求，只接受最后一次请求的结果，
+        // 避免较早的慢响应覆盖刚刚到达的最新 Transcript。
+        if (requestId === snapshotRequestRef.current) {
+          applySnapshot(body);
+        }
       } catch (error) {
-        setErrorMessage(
-          error instanceof Error ? error.message : "无法加载 Agent 会话。",
-        );
+        if (requestId === snapshotRequestRef.current) {
+          setErrorMessage(
+            error instanceof Error ? error.message : "无法加载 Agent 会话。",
+          );
+        }
       } finally {
-        setLoading(false);
+        if (requestId === snapshotRequestRef.current) {
+          setLoading(false);
+        }
       }
     },
     [projectId],
@@ -127,6 +147,13 @@ export function AgentPanel({
     setConversations(body.conversations);
     setSnapshot(body.snapshot);
     setSelectedConversationId(body.snapshot?.conversation.id ?? null);
+    const activeSnapshotRun = findActiveRun(body.snapshot?.runs ?? []);
+    setStreamingAssistantText(
+      projectPendingAssistantText(
+        body.snapshot?.events ?? [],
+        activeSnapshotRun?.id ?? null,
+      ),
+    );
     lastEventIdRef.current =
       body.snapshot?.events.reduce(
         (cursor, event) => Math.max(cursor, event.sequence),
@@ -196,9 +223,29 @@ export function AgentPanel({
         lastEventIdRef.current = sequence;
       }
 
-      // 所有业务事件都只作为“有新事实”的通知；收到后重新拉取聚合快照，
-      // 这样断线重连、乱序到达和页面刷新都不会在客户端留下半条状态。
-      void loadAgentSnapshot(selectedConversationRef.current);
+      const messageEvent = event as MessageEvent<string>;
+      const persistedEvent = parsePersistedEvent(messageEvent.data);
+
+      if (
+        persistedEvent?.runId === runId &&
+        persistedEvent.type === "assistant.delta" &&
+        typeof persistedEvent.payload.text === "string"
+      ) {
+        setStreamingAssistantText((current) => {
+          return current + persistedEvent.payload.text;
+        });
+      } else if (
+        persistedEvent?.runId === runId &&
+        persistedEvent.type === "assistant.completed"
+      ) {
+        setStreamingAssistantText("");
+      }
+
+      // 增量文本先即时投影，快照随后负责收敛 Transcript、工具和 Run 状态。
+      // 这样重连、刷新和事件乱序仍以数据库事实为准。
+      void loadAgentSnapshot(selectedConversationRef.current, {
+        showLoading: false,
+      });
     };
 
     stream.onerror = () => {
@@ -253,6 +300,15 @@ export function AgentPanel({
       }
     }
   }, [onRevisionChange, snapshot?.runs]);
+
+  useEffect(() => {
+    if (streamingAssistantText) {
+      const element = transcriptRef.current;
+      if (element) {
+        element.scrollTop = element.scrollHeight;
+      }
+    }
+  }, [streamingAssistantText, snapshot?.transcript.length]);
 
   async function createConversation() {
     setCreatingConversation(true);
@@ -334,6 +390,8 @@ export function AgentPanel({
       return;
     }
 
+    setStopping(true);
+
     try {
       const response = await fetch(`/api/agent-runs/${activeRun.id}/cancel`, {
         method: "POST",
@@ -341,11 +399,13 @@ export function AgentPanel({
       if (!response.ok) {
         throw new Error("停止 Agent Run 失败。");
       }
-      await loadAgentSnapshot(selectedConversationId);
+      await loadAgentSnapshot(selectedConversationId, { showLoading: false });
     } catch (error) {
       setErrorMessage(
         error instanceof Error ? error.message : "停止 Agent Run 失败。",
       );
+    } finally {
+      setStopping(false);
     }
   }
 
@@ -431,19 +491,24 @@ export function AgentPanel({
         ) : null}
       </div>
 
-      <div className="agent-transcript" aria-live="polite">
+      <div className="agent-transcript" aria-live="polite" ref={transcriptRef}>
         {loading ? (
           <div className="agent-empty-state">
             <LoaderCircle className="animate-spin" />
             <span>正在恢复 Agent 状态...</span>
           </div>
-        ) : transcript.length ? (
-          transcript.map((message) => (
-            <TranscriptItem
-              key={message.id ?? `${message.kind}-${message.seq}`}
-              message={message}
-            />
-          ))
+        ) : transcript.length || streamingAssistantText ? (
+          <>
+            {transcript.map((message) => (
+              <TranscriptItem
+                key={message.id ?? `${message.kind}-${message.seq}`}
+                message={message}
+              />
+            ))}
+            {streamingAssistantText ? (
+              <StreamingAssistantMessage content={streamingAssistantText} />
+            ) : null}
+          </>
         ) : (
           <div className="agent-empty-state">
             <Bot />
@@ -458,6 +523,7 @@ export function AgentPanel({
           activeTool={activeTool}
           onStop={() => void stopRun()}
           run={latestRun}
+          stopping={stopping}
         />
       ) : null}
 
@@ -565,14 +631,28 @@ function TranscriptItem({ message }: { message: TranscriptMessage }) {
   );
 }
 
+function StreamingAssistantMessage({ content }: { content: string }) {
+  return (
+    <article className="agent-message agent-message-assistant is-streaming">
+      <span className="agent-message-label">
+        <LoaderCircle className="animate-spin" />
+        Agent
+      </span>
+      <p>{content}</p>
+    </article>
+  );
+}
+
 function AgentRunStatus({
   run,
   activeTool,
   onStop,
+  stopping,
 }: {
   run: AgentRunRecord;
   activeTool: ToolInvocationRecord | null;
   onStop: () => void;
+  stopping: boolean;
 }) {
   const elapsed = formatElapsed(run);
   const status = getRunStatusCopy(run);
@@ -597,9 +677,14 @@ function AgentRunStatus({
         </span>
       </div>
       {isActive ? (
-        <Button onClick={onStop} size="sm" variant="outline">
+        <Button
+          disabled={stopping}
+          onClick={onStop}
+          size="sm"
+          variant="outline"
+        >
           <CircleStop data-icon="inline-start" />
-          Stop
+          {stopping ? "Stopping..." : "Stop"}
         </Button>
       ) : run.errorMessage ? (
         <p className="agent-run-error">{run.errorMessage}</p>
@@ -688,4 +773,45 @@ async function fetchAgentSnapshot(
   }
 
   return body;
+}
+
+function findActiveRun(runs: readonly AgentRunRecord[]): AgentRunRecord | null {
+  return (
+    runs
+      .slice()
+      .reverse()
+      .find((run) => !TERMINAL_STATUSES.has(run.status)) ?? null
+  );
+}
+
+function parsePersistedEvent(value: string): {
+  runId: string;
+  type: string;
+  payload: Record<string, unknown>;
+} | null {
+  try {
+    const parsed = JSON.parse(value) as {
+      runId?: unknown;
+      type?: unknown;
+      payload?: unknown;
+    };
+
+    if (
+      typeof parsed.runId !== "string" ||
+      typeof parsed.type !== "string" ||
+      !parsed.payload ||
+      typeof parsed.payload !== "object" ||
+      Array.isArray(parsed.payload)
+    ) {
+      return null;
+    }
+
+    return {
+      runId: parsed.runId,
+      type: parsed.type,
+      payload: parsed.payload as Record<string, unknown>,
+    };
+  } catch {
+    return null;
+  }
 }
