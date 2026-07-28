@@ -657,12 +657,25 @@ function AgentRunStatus({
   const elapsed = formatElapsed(run);
   const status = getRunStatusCopy(run);
   const isActive = !TERMINAL_STATUSES.has(run.status);
+  const isFailure = status.tone === "error";
 
   return (
-    <section className={cn("agent-run-status", isActive && "is-active")}>
+    <section
+      className={cn(
+        "agent-run-status",
+        isActive && "is-active",
+        `is-${status.tone}`,
+      )}
+    >
       <div className="agent-run-status-top">
         <span className="agent-run-status-label">
-          {isActive ? <LoaderCircle className="animate-spin" /> : <Check />}
+          {isActive ? (
+            <LoaderCircle className="animate-spin" />
+          ) : isFailure ? (
+            <TriangleAlert />
+          ) : (
+            <Check />
+          )}
           {status.title}
         </span>
         <span>{elapsed}</span>
@@ -684,11 +697,11 @@ function AgentRunStatus({
           variant="outline"
         >
           <CircleStop data-icon="inline-start" />
-          {stopping ? "Stopping..." : "Stop"}
+          {stopping ? "正在停止..." : "停止"}
         </Button>
-      ) : run.errorMessage ? (
-        <p className="agent-run-error">{run.errorMessage}</p>
-      ) : null}
+      ) : (
+        <p className="agent-run-error">{status.message}</p>
+      )}
     </section>
   );
 }
@@ -725,29 +738,122 @@ function toTimestamp(value: Date | string | null | undefined): number | null {
 function getRunStatusCopy(run: AgentRunRecord): {
   title: string;
   detail: string;
+  message: string;
+  tone: "neutral" | "success" | "warning" | "error";
 } {
   switch (run.status) {
     case "queued":
-      return { title: "Queued", detail: "等待执行器接管" };
+      return {
+        title: "排队中",
+        detail: "等待执行器接管",
+        message: "Agent 即将开始处理这条请求。",
+        tone: "neutral",
+      };
     case "running":
-      return { title: "Running", detail: "正在分析项目" };
+      return {
+        title: "执行中",
+        detail: "正在分析项目",
+        message: "Agent 正在读取项目并准备下一步操作。",
+        tone: "neutral",
+      };
     case "awaiting_client_tool":
-      return { title: "Waiting", detail: "等待浏览器工具" };
+      return {
+        title: "等待工具",
+        detail: "等待浏览器工具",
+        message: "Agent 正在等待浏览器工具返回结果。",
+        tone: "neutral",
+      };
     case "awaiting_async_job":
-      return { title: "Waiting", detail: "等待异步任务" };
+      return {
+        title: "等待任务",
+        detail: "等待异步任务",
+        message: "Agent 正在等待异步任务完成。",
+        tone: "neutral",
+      };
     case "succeeded":
-      return { title: "Completed", detail: "修改已写入 Repository" };
+      return {
+        title: "已完成",
+        detail: "修改已写入 Repository",
+        message: "代码修改已经写入 Repository。",
+        tone: "success",
+      };
     case "cancelled":
-      return { title: "Stopped", detail: "已停止，后续 mutation 已阻断" };
+      return {
+        title: "已停止",
+        detail: "后续文件修改已阻断",
+        message: "本次运行已停止，没有继续执行后续文件修改。",
+        tone: "warning",
+      };
     case "conflicted":
       return {
-        title: "Conflict",
-        detail: "检测到用户或其他执行器的新 revision",
+        title: "发生冲突",
+        detail: `Repository 已更新到 r${run.currentRevision}，已保留用户修改`,
+        message:
+          "检测到 Repository 有新版本，Agent 已停止，最新的用户修改没有被覆盖。",
+        tone: "warning",
       };
     case "budget_exhausted":
-      return { title: "Budget reached", detail: "已达到本次运行预算" };
+      return {
+        title: "达到预算上限",
+        detail: "已达到本次运行预算，未继续执行",
+        message: "本次任务使用的模型轮次已达上限，可以拆分任务后重新尝试。",
+        tone: "warning",
+      };
     case "failed":
-      return { title: "Failed", detail: "执行过程中发生错误" };
+      return getFailedRunStatusCopy(run.errorCode);
+  }
+}
+
+function getFailedRunStatusCopy(errorCode: string | null): {
+  title: string;
+  detail: string;
+  message: string;
+  tone: "error";
+} {
+  switch (errorCode) {
+    case "AGENT_PROVIDER_NOT_CONFIGURED":
+      return {
+        title: "配置缺失",
+        detail: "模型服务尚未配置",
+        message: "服务端还没有配置可用的 DeepSeek Key，请检查部署环境变量。",
+        tone: "error",
+      };
+    case "AGENT_PROVIDER_TIMEOUT":
+      return {
+        title: "模型超时",
+        detail: "模型响应时间过长",
+        message: "模型响应超时，Agent 没有继续写入文件。",
+        tone: "error",
+      };
+    case "AGENT_PROVIDER_RATE_LIMITED":
+      return {
+        title: "模型限流",
+        detail: "模型服务暂时不可用",
+        message: "模型服务暂时限制了请求，请稍后重试。",
+        tone: "error",
+      };
+    case "AGENT_PROVIDER_INVALID_STREAM":
+      return {
+        title: "模型响应异常",
+        detail: "无法解析模型返回内容",
+        message: "模型返回了无法识别的结果，Agent 没有继续写入文件。",
+        tone: "error",
+      };
+    case "AGENT_PROFILE_UNAVAILABLE":
+      return {
+        title: "运行配置失效",
+        detail: "当前 Agent 配置版本不可用",
+        message: "本次运行依赖的 Prompt 或工具配置不可用，请重新发起任务。",
+        tone: "error",
+      };
+    default:
+      return {
+        title: "执行失败",
+        detail: "Agent 未继续写入项目",
+        message:
+          "Agent 执行过程中发生错误，已停止后续文件修改。请查看运行记录后重试。",
+        tone: "error",
+      };
   }
 }
 

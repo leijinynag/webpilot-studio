@@ -3665,6 +3665,18 @@ html[data-theme="dark"] .ide-surface.is-preview {
   border-top-color: color-mix(in srgb, var(--accent) 45%, var(--border));
 }
 
+.agent-run-status.is-success {
+  border-top-color: color-mix(in srgb, var(--success) 42%, var(--border));
+}
+
+.agent-run-status.is-warning {
+  border-top-color: color-mix(in srgb, var(--warning) 48%, var(--border));
+}
+
+.agent-run-status.is-error {
+  border-top-color: color-mix(in srgb, var(--destructive) 42%, var(--border));
+}
+
 .agent-run-status-top {
   color: var(--faint-foreground);
 }
@@ -3715,6 +3727,21 @@ html[data-theme="dark"] .ide-surface.is-preview {
 
 .agent-run-error {
   padding: 5px 0 0;
+}
+
+.agent-run-status.is-success .agent-run-status-label,
+.agent-run-status.is-success .agent-run-error {
+  color: var(--success);
+}
+
+.agent-run-status.is-warning .agent-run-status-label,
+.agent-run-status.is-warning .agent-run-error {
+  color: var(--warning);
+}
+
+.agent-run-status.is-error .agent-run-status-label,
+.agent-run-status.is-error .agent-run-error {
+  color: var(--destructive);
 }
 
 .agent-inline-error {

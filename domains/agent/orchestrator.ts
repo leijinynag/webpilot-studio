@@ -227,6 +227,17 @@ export class AgentOrchestrator {
           await this.persistToolResult(run, toolCall, result);
 
           if (!result.ok && result.conflict) {
+            const actualRevision = getConflictRevision(result.error.details);
+            if (
+              actualRevision !== null &&
+              actualRevision > run.currentRevision
+            ) {
+              run = await this.store.updateRunProgress({
+                ownerId: run.ownerId,
+                runId: run.id,
+                currentRevision: actualRevision,
+              });
+            }
             await this.finishRun(
               run,
               "conflicted",
@@ -516,6 +527,15 @@ function accumulateToolCall(
   existing.name = event.toolName ?? existing.name;
   existing.argumentsText += event.argumentsDelta ?? "";
   toolCalls.set(event.index, existing);
+}
+
+function getConflictRevision(
+  details: Record<string, unknown> | undefined,
+): number | null {
+  const actualRevision = details?.actualRevision;
+  return typeof actualRevision === "number" && Number.isInteger(actualRevision)
+    ? actualRevision
+    : null;
 }
 
 function parseToolArguments(value: string): unknown {

@@ -264,6 +264,80 @@ describe("AgentOrchestrator", () => {
     }
   });
 
+  it("keeps a concurrent user mutation when the Agent reaches a stale write", async () => {
+    const fixture = await createFixture();
+    let turnCount = 0;
+    const provider: LlmProvider = {
+      async *streamTurn(input) {
+        turnCount += 1;
+
+        if (turnCount === 1) {
+          yield {
+            type: "tool_call_delta",
+            index: 0,
+            toolCallId: "call-read-before-conflict",
+            toolName: "read_file",
+            argumentsDelta: '{"path":"src/App.tsx"}',
+          };
+          yield { type: "finish", reason: "tool_calls" };
+          return;
+        }
+
+        // 模拟用户在 Agent 已经读完文件后先完成自己的保存。
+        await fixture.repository.writeFile({
+          ownerId: fixture.run.ownerId,
+          projectId: fixture.run.projectId,
+          path: "src/App.tsx",
+          content:
+            "export default function App() { return <h1>用户最新修改</h1>; }",
+          expectedRevision: 1,
+        });
+
+        yield {
+          type: "tool_call_delta",
+          index: 0,
+          toolCallId: "call-stale-write-after-user",
+          toolName: "write_file",
+          argumentsDelta:
+            '{"path":"src/App.tsx","content":"Agent 不应覆盖","expectedRevision":1}',
+        };
+        yield { type: "finish", reason: "tool_calls" };
+        void input;
+      },
+    };
+
+    try {
+      await new AgentOrchestrator(
+        fixture.store,
+        provider,
+        fixture.fileTools,
+      ).run({
+        ownerId: fixture.run.ownerId,
+        runId: fixture.run.id,
+      });
+
+      const file = await fixture.repository.readFile({
+        ownerId: fixture.run.ownerId,
+        projectId: fixture.run.projectId,
+        path: "src/App.tsx",
+      });
+      const run = await fixture.store.getRun({
+        ownerId: fixture.run.ownerId,
+        runId: fixture.run.id,
+      });
+
+      expect(run).toMatchObject({
+        status: "conflicted",
+        currentRevision: 2,
+        errorCode: AGENT_ERROR_CODES.revisionConflict,
+      });
+      expect(file.content).toContain("用户最新修改");
+      expect(file.content).not.toContain("Agent 不应覆盖");
+    } finally {
+      await fixture.testDatabase.close();
+    }
+  });
+
   it("moves to budget_exhausted when the model consumes all allowed turns", async () => {
     const fixture = await createFixture({ maxModelTurns: 1 });
     const provider = new ScriptedProvider([
