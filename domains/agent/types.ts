@@ -34,13 +34,127 @@ export type AgentRunBudget = {
   maxWallTimeSeconds: number;
   maxOutputCharacters: number;
   maxToolResultCharacters: number;
+  maxFileMutations: number;
+  maxClientResumes: number;
+  maxNoProgressRepeats: number;
 };
+
+export const DEFAULT_AGENT_RUN_ACTIVITY_LIMITS = {
+  maxFileMutations: 8,
+  maxClientResumes: 6,
+  maxNoProgressRepeats: 2,
+} as const;
 
 export type AgentRunUsage = {
   modelTurns: number;
   inputTokens: number;
   outputTokens: number;
+  fileMutations: number;
+  clientResumes: number;
+  repairRounds: number;
+  repeatedFailureCount: number;
+  firstPreviewAt: string | null;
+  firstPreviewDurationMs: number | null;
+  latestPreviewAt: string | null;
+  latestVerificationRevision: number | null;
+  latestVerificationOk: boolean | null;
+  latestFailureFingerprint: string | null;
 };
+
+export const EMPTY_AGENT_RUN_USAGE: AgentRunUsage = {
+  modelTurns: 0,
+  inputTokens: 0,
+  outputTokens: 0,
+  fileMutations: 0,
+  clientResumes: 0,
+  repairRounds: 0,
+  repeatedFailureCount: 0,
+  firstPreviewAt: null,
+  firstPreviewDurationMs: null,
+  latestPreviewAt: null,
+  latestVerificationRevision: null,
+  latestVerificationOk: null,
+  latestFailureFingerprint: null,
+};
+
+/**
+ * budget/usage 使用 JSONB 保存，旧 Run 不会自动获得新增字段。读取时集中补齐
+ * 默认值，既保持冻结配置可恢复，也避免每个调用点都处理 undefined。
+ */
+export function normalizeAgentRunBudget(
+  value: Record<string, unknown>,
+): AgentRunBudget {
+  return {
+    maxModelTurns: positiveInteger(value.maxModelTurns, 12),
+    maxWallTimeSeconds: positiveInteger(value.maxWallTimeSeconds, 300),
+    maxOutputCharacters: positiveInteger(value.maxOutputCharacters, 24_000),
+    maxToolResultCharacters: positiveInteger(
+      value.maxToolResultCharacters,
+      20_000,
+    ),
+    maxFileMutations: positiveInteger(
+      value.maxFileMutations,
+      DEFAULT_AGENT_RUN_ACTIVITY_LIMITS.maxFileMutations,
+    ),
+    maxClientResumes: positiveInteger(
+      value.maxClientResumes,
+      DEFAULT_AGENT_RUN_ACTIVITY_LIMITS.maxClientResumes,
+    ),
+    maxNoProgressRepeats: positiveInteger(
+      value.maxNoProgressRepeats,
+      DEFAULT_AGENT_RUN_ACTIVITY_LIMITS.maxNoProgressRepeats,
+    ),
+  };
+}
+
+export function normalizeAgentRunUsage(
+  value: Record<string, unknown>,
+): AgentRunUsage {
+  return {
+    modelTurns: nonnegativeInteger(value.modelTurns),
+    inputTokens: nonnegativeInteger(value.inputTokens),
+    outputTokens: nonnegativeInteger(value.outputTokens),
+    fileMutations: nonnegativeInteger(value.fileMutations),
+    clientResumes: nonnegativeInteger(value.clientResumes),
+    repairRounds: nonnegativeInteger(value.repairRounds),
+    repeatedFailureCount: nonnegativeInteger(value.repeatedFailureCount),
+    firstPreviewAt: nullableString(value.firstPreviewAt),
+    firstPreviewDurationMs: nullableNonnegativeInteger(
+      value.firstPreviewDurationMs,
+    ),
+    latestPreviewAt: nullableString(value.latestPreviewAt),
+    latestVerificationRevision: nullableNonnegativeInteger(
+      value.latestVerificationRevision,
+    ),
+    latestVerificationOk:
+      typeof value.latestVerificationOk === "boolean"
+        ? value.latestVerificationOk
+        : null,
+    latestFailureFingerprint: nullableString(value.latestFailureFingerprint),
+  };
+}
+
+function positiveInteger(value: unknown, fallback: number): number {
+  return typeof value === "number" && Number.isInteger(value) && value > 0
+    ? value
+    : fallback;
+}
+
+function nonnegativeInteger(value: unknown): number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0
+    ? value
+    : 0;
+}
+
+function nullableNonnegativeInteger(value: unknown): number | null {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0
+    ? value
+    : null;
+}
+
+function nullableString(value: unknown): string | null {
+  return typeof value === "string" ? value : null;
+}
 
 export type FrozenAgentRunProfile = {
   locale: AgentLocale;

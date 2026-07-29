@@ -8,10 +8,12 @@ import type {
   FrozenAgentRunProfile,
   RepositoryCapability,
 } from "@/domains/agent/types";
+import { DEFAULT_AGENT_RUN_ACTIVITY_LIMITS } from "@/domains/agent/types";
 
 const SYSTEM_PROMPT_PROFILE_V1_ID = "webpilot-system-v1";
+const SYSTEM_PROMPT_PROFILE_V2_ID = "webpilot-system-v2";
 const FILE_TOOLSET_PROFILE_V1_ID = "webpilot-files-v1";
-export const SYSTEM_PROMPT_PROFILE_ID = "webpilot-system-v2";
+export const SYSTEM_PROMPT_PROFILE_ID = "webpilot-system-v3";
 export const FILE_TOOLSET_PROFILE_ID = "webpilot-preview-v2";
 // 领域层只记录“编码 Agent 模型配置”这一能力，不绑定具体供应商。
 // 当前可用的 DeepSeek adapter 在 infrastructure 层完成映射，未来替换
@@ -50,7 +52,7 @@ const SYSTEM_PROMPT_PROFILES = {
       "4. Do not call tools after the task is complete.",
     ].join("\n");
   },
-  [SYSTEM_PROMPT_PROFILE_ID]: (context: SystemPromptContext) => {
+  [SYSTEM_PROMPT_PROFILE_V2_ID]: (context: SystemPromptContext) => {
     const responseLanguage =
       context.locale === "zh-CN" ? "简体中文" : "English";
 
@@ -79,6 +81,38 @@ const SYSTEM_PROMPT_PROFILES = {
       "2. Finish only after the latest revision has a successful run_preview result.",
       "3. In the final response, summarize changed files and the observed preview evidence.",
       "4. Do not call tools after the task is complete.",
+    ].join("\n");
+  },
+  [SYSTEM_PROMPT_PROFILE_ID]: (context: SystemPromptContext) => {
+    const responseLanguage =
+      context.locale === "zh-CN" ? "简体中文" : "English";
+
+    return [
+      "You are the coding agent inside WebPilot Studio.",
+      `Respond to the user in ${responseLanguage}.`,
+      `Repository storage: ${context.repositoryCapability.storageKind}.`,
+      `Project id: ${context.projectId}. Current frozen revision: ${context.revision}.`,
+      "",
+      "Repository rules:",
+      "1. Inspect the repository with list_files or search_text before choosing files.",
+      "2. Read an existing file at the current revision before mutating it.",
+      "3. Perform at most one file mutation per model turn and use the latest expectedRevision.",
+      "4. Continue from the revision returned by a successful mutation. Never guess a revision.",
+      "5. Keep changes minimal and preserve the repository's existing conventions.",
+      "",
+      "Mandatory repair loop:",
+      "1. Follow this order: evidence -> search -> read -> one mutation -> run_preview.",
+      "2. run_preview is the source of truth for install, dev-server, runtime and console evidence.",
+      "3. On failure, use the structured VerificationFailure and raw evidence to locate the cause.",
+      "4. After every repair mutation, run_preview again on the returned latest revision.",
+      "5. Repeating the same failure without a revision change is no progress and must not continue indefinitely.",
+      "",
+      "Completion gate:",
+      "1. File tool success is not runtime verification.",
+      "2. Never claim completion until the latest revision has a successful run_preview Tool Result.",
+      "3. The server enforces this gate and will reject a text-only completion without matching evidence.",
+      "4. Stop immediately on cancellation, revision conflict, invalid tool result, no-progress guard, or exhausted budget.",
+      "5. In the final response, summarize changed files and the successful evidence for the verified revision.",
     ].join("\n");
   },
 } satisfies Record<string, (context: SystemPromptContext) => string>;
@@ -158,6 +192,7 @@ export function createFrozenAgentProfile(input: {
       maxWallTimeSeconds: input.maxWallTimeSeconds,
       maxOutputCharacters: 24_000,
       maxToolResultCharacters: 20_000,
+      ...DEFAULT_AGENT_RUN_ACTIVITY_LIMITS,
     },
   };
 }

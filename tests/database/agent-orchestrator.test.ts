@@ -2,6 +2,7 @@ import { eq } from "drizzle-orm";
 import { describe, expect, it } from "vitest";
 
 import { AGENT_ERROR_CODES } from "@/domains/agent/errors";
+import type { RunPreviewResult } from "@/domains/agent/evidence";
 import { FileToolExecutor } from "@/domains/agent/file-tools";
 import { AgentOrchestrator } from "@/domains/agent/orchestrator";
 import { createFrozenAgentProfile } from "@/domains/agent/profiles";
@@ -12,6 +13,7 @@ import type {
 } from "@/domains/agent/provider";
 import { AgentStore } from "@/domains/agent/store";
 import type { FileToolResultEnvelope } from "@/domains/agent/file-tools";
+import type { AgentRunBudget } from "@/domains/agent/types";
 import { DatabaseProjectRepository } from "@/domains/project/repository";
 import { agentRuns } from "@/infrastructure/db/schema";
 import { createTestDatabase } from "@/tests/database/helpers/pglite-database";
@@ -39,6 +41,7 @@ async function createFixture(
   options: {
     maxModelTurns?: number;
     promptDigest?: string;
+    budget?: Partial<AgentRunBudget>;
   } = {},
 ) {
   const testDatabase = await createTestDatabase();
@@ -76,6 +79,7 @@ async function createFixture(
     userMessage: "请修改页面标题",
     profile: {
       ...profile,
+      budget: { ...profile.budget, ...options.budget },
       ...(options.promptDigest ? { promptDigest: options.promptDigest } : {}),
     },
   });
@@ -89,9 +93,41 @@ async function createFixture(
   };
 }
 
+function createPreviewResult(revision: number): RunPreviewResult {
+  return {
+    ok: true,
+    toolName: "run_preview",
+    revision,
+    summary: "Preview 验证通过。",
+    build: {
+      revision,
+      install: { status: "succeeded", exitCode: 0 },
+      devServer: {
+        status: "ready",
+        port: 5173,
+        url: "https://preview.example",
+      },
+      errors: [],
+      logs: [],
+    },
+    runtime: {
+      revision,
+      rendered: true,
+      events: [{ type: "RENDER_OK", timestamp: 100 }],
+      diagnostics: [],
+    },
+    console: {
+      revision,
+      entries: [],
+      totalBytes: 0,
+      truncated: false,
+    },
+  };
+}
+
 describe("AgentOrchestrator", () => {
-  it("persists streamed text and finishes a text-only turn", async () => {
-    const fixture = await createFixture();
+  it("persists streamed text but blocks completion without matching Preview evidence", async () => {
+    const fixture = await createFixture({ maxModelTurns: 1 });
     const provider = new ScriptedProvider([
       [
         { type: "text_delta", text: "已经完成修改说明。" },
@@ -129,7 +165,7 @@ describe("AgentOrchestrator", () => {
       });
 
       expect(run).toMatchObject({
-        status: "succeeded",
+        status: "budget_exhausted",
         usage: { modelTurns: 1, inputTokens: 20, outputTokens: 8 },
       });
       expect(transcript.map((message) => message.kind)).toEqual([
@@ -137,13 +173,18 @@ describe("AgentOrchestrator", () => {
         "assistant_message",
       ]);
       expect(events.map((event) => event.type)).toContain("assistant.delta");
-      expect(events.at(-1)?.payload).toMatchObject({ status: "succeeded" });
+      expect(events.map((event) => event.type)).toContain(
+        "verification.completion_blocked",
+      );
+      expect(events.at(-1)?.payload).toMatchObject({
+        status: "budget_exhausted",
+      });
     } finally {
       await fixture.testDatabase.close();
     }
   });
 
-  it("executes read then write, advances revision and continues the next model turn", async () => {
+  it("executes a mutation, suspends for Preview, then succeeds only after matching evidence", async () => {
     const fixture = await createFixture();
     const provider = new ScriptedProvider([
       [
@@ -165,12 +206,51 @@ describe("AgentOrchestrator", () => {
         { type: "finish", reason: "tool_calls" },
       ],
       [
-        { type: "text_delta", text: "标题已更新。" },
+        {
+          type: "tool_call_delta",
+          index: 0,
+          toolCallId: "call-preview",
+          toolName: "run_preview",
+          argumentsDelta: '{"revision":2,"observationMs":1500}',
+        },
+        { type: "finish", reason: "tool_calls" },
+      ],
+      [
+        { type: "text_delta", text: "标题已更新并通过 Preview 验证。" },
         { type: "finish", reason: "stop" },
       ],
     ]);
 
     try {
+      await new AgentOrchestrator(
+        fixture.store,
+        provider,
+        fixture.fileTools,
+      ).run({
+        ownerId: fixture.run.ownerId,
+        runId: fixture.run.id,
+      });
+
+      const awaitingRun = await fixture.store.getRun({
+        ownerId: fixture.run.ownerId,
+        runId: fixture.run.id,
+      });
+      expect(awaitingRun).toMatchObject({
+        status: "awaiting_client_tool",
+        currentRevision: 2,
+        usage: { modelTurns: 2, fileMutations: 1 },
+      });
+
+      await fixture.store.completeClientToolResult({
+        ownerId: fixture.run.ownerId,
+        runId: fixture.run.id,
+        projectId: fixture.run.projectId,
+        toolCallId: "call-preview",
+        toolName: "run_preview",
+        idempotencyKey: `${fixture.run.id}:call-preview`,
+        revision: 2,
+        result: createPreviewResult(2),
+      });
       await new AgentOrchestrator(
         fixture.store,
         provider,
@@ -197,11 +277,19 @@ describe("AgentOrchestrator", () => {
       expect(run).toMatchObject({
         status: "succeeded",
         currentRevision: 2,
-        usage: { modelTurns: 2 },
+        usage: {
+          modelTurns: 3,
+          fileMutations: 1,
+          clientResumes: 1,
+          latestVerificationRevision: 2,
+          latestVerificationOk: true,
+        },
       });
       expect(file.content).toContain("新标题");
       expect(transcript.map((message) => message.kind)).toEqual([
         "user_message",
+        "tool_call",
+        "tool_result",
         "tool_call",
         "tool_result",
         "tool_call",
@@ -211,6 +299,10 @@ describe("AgentOrchestrator", () => {
       expect(provider.inputs[1]?.messages.at(-1)).toMatchObject({
         role: "tool",
         toolCallId: "call-write",
+      });
+      expect(provider.inputs[2]?.messages.at(-1)).toMatchObject({
+        role: "tool",
+        toolCallId: "call-preview",
       });
     } finally {
       await fixture.testDatabase.close();
@@ -372,6 +464,82 @@ describe("AgentOrchestrator", () => {
         status: "budget_exhausted",
         errorCode: AGENT_ERROR_CODES.budgetExhausted,
       });
+    } finally {
+      await fixture.testDatabase.close();
+    }
+  });
+
+  it("stops before a file mutation that would exceed the frozen mutation budget", async () => {
+    const fixture = await createFixture({
+      budget: { maxFileMutations: 1 },
+    });
+    const provider = new ScriptedProvider([
+      [
+        {
+          type: "tool_call_delta",
+          index: 0,
+          toolCallId: "call-read-first",
+          toolName: "read_file",
+          argumentsDelta: '{"path":"src/App.tsx"}',
+        },
+        {
+          type: "tool_call_delta",
+          index: 1,
+          toolCallId: "call-write-first",
+          toolName: "write_file",
+          argumentsDelta:
+            '{"path":"src/App.tsx","content":"export default function App() { return <h1>第一次修改</h1>; }","expectedRevision":1}',
+        },
+        { type: "finish", reason: "tool_calls" },
+      ],
+      [
+        {
+          type: "tool_call_delta",
+          index: 0,
+          toolCallId: "call-read-second",
+          toolName: "read_file",
+          argumentsDelta: '{"path":"src/App.tsx"}',
+        },
+        {
+          type: "tool_call_delta",
+          index: 1,
+          toolCallId: "call-write-second",
+          toolName: "write_file",
+          argumentsDelta:
+            '{"path":"src/App.tsx","content":"export default function App() { return <h1>第二次修改</h1>; }","expectedRevision":2}',
+        },
+        { type: "finish", reason: "tool_calls" },
+      ],
+    ]);
+
+    try {
+      await new AgentOrchestrator(
+        fixture.store,
+        provider,
+        fixture.fileTools,
+      ).run({
+        ownerId: fixture.run.ownerId,
+        runId: fixture.run.id,
+      });
+
+      const run = await fixture.store.getRun({
+        ownerId: fixture.run.ownerId,
+        runId: fixture.run.id,
+      });
+      const file = await fixture.repository.readFile({
+        ownerId: fixture.run.ownerId,
+        projectId: fixture.run.projectId,
+        path: "src/App.tsx",
+      });
+
+      expect(run).toMatchObject({
+        status: "budget_exhausted",
+        currentRevision: 2,
+        errorCode: AGENT_ERROR_CODES.budgetExhausted,
+        usage: { fileMutations: 1 },
+      });
+      expect(file.content).toContain("第一次修改");
+      expect(file.content).not.toContain("第二次修改");
     } finally {
       await fixture.testDatabase.close();
     }

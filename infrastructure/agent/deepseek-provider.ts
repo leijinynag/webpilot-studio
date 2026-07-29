@@ -58,12 +58,16 @@ export type DeepSeekProviderOptions = {
   apiKey: string;
   baseUrl?: string;
   timeoutMs?: number;
+  maxAttempts?: number;
+  retryBaseDelayMs?: number;
   fetchImplementation?: FetchLike;
 };
 
 export class DeepSeekProvider implements LlmProvider {
   private readonly baseUrl: string;
   private readonly timeoutMs: number;
+  private readonly maxAttempts: number;
+  private readonly retryBaseDelayMs: number;
   private readonly fetchImplementation: FetchLike;
 
   constructor(private readonly options: DeepSeekProviderOptions) {
@@ -72,10 +76,45 @@ export class DeepSeekProvider implements LlmProvider {
       "",
     );
     this.timeoutMs = options.timeoutMs ?? 120_000;
+    this.maxAttempts = Math.max(1, options.maxAttempts ?? 3);
+    this.retryBaseDelayMs = Math.max(0, options.retryBaseDelayMs ?? 500);
     this.fetchImplementation = options.fetchImplementation ?? fetch;
   }
 
   async *streamTurn(input: ProviderTurnInput): AsyncIterable<ProviderEvent> {
+    for (let attempt = 1; attempt <= this.maxAttempts; attempt += 1) {
+      let emittedEvent = false;
+
+      try {
+        for await (const event of this.streamAttempt(input)) {
+          emittedEvent = true;
+          yield event;
+        }
+        return;
+      } catch (error) {
+        const canRetry =
+          !emittedEvent &&
+          attempt < this.maxAttempts &&
+          isRetryablePreStreamError(error) &&
+          !input.signal?.aborted;
+
+        if (!canRetry) {
+          throw error;
+        }
+
+        // 只有模型尚未返回任何事件时才能重试。流一旦开始，重放请求可能产生
+        // 重复文本或重复工具调用，因此必须把中断交给上层作为失败处理。
+        await waitForRetry(
+          this.retryBaseDelayMs * 2 ** (attempt - 1),
+          input.signal,
+        );
+      }
+    }
+  }
+
+  private async *streamAttempt(
+    input: ProviderTurnInput,
+  ): AsyncIterable<ProviderEvent> {
     const timeoutController = new AbortController();
     const timeout = setTimeout(() => timeoutController.abort(), this.timeoutMs);
     const signal = combineAbortSignals(input.signal, timeoutController.signal);
@@ -220,6 +259,47 @@ export class DeepSeekProvider implements LlmProvider {
       clearTimeout(timeout);
     }
   }
+}
+
+function isRetryablePreStreamError(error: unknown): boolean {
+  return (
+    error instanceof AgentError &&
+    error.code === AGENT_ERROR_CODES.providerInterrupted
+  );
+}
+
+async function waitForRetry(
+  delayMs: number,
+  signal?: AbortSignal,
+): Promise<void> {
+  if (delayMs <= 0) {
+    return;
+  }
+
+  await new Promise<void>((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      signal?.removeEventListener("abort", handleAbort);
+      resolve();
+    }, delayMs);
+
+    function handleAbort() {
+      clearTimeout(timeout);
+      reject(
+        new AgentError(
+          AGENT_ERROR_CODES.providerInterrupted,
+          "DeepSeek 调用已被取消。",
+          499,
+        ),
+      );
+    }
+
+    if (signal?.aborted) {
+      handleAbort();
+      return;
+    }
+
+    signal?.addEventListener("abort", handleAbort, { once: true });
+  });
 }
 
 function toDeepSeekMessage(message: ProviderMessage) {

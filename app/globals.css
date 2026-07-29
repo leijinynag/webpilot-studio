@@ -3626,6 +3626,27 @@ html[data-theme="dark"] .ide-surface.is-preview {
   white-space: nowrap;
 }
 
+.agent-preview-summary {
+  margin: 3px 0 0;
+  color: var(--muted-foreground);
+  font-size: 0.7rem;
+  line-height: 1.4;
+}
+
+.agent-preview-evidence {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+  margin-top: 5px;
+  color: var(--faint-foreground);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.64rem;
+}
+
+.agent-preview-evidence span {
+  white-space: nowrap;
+}
+
 .agent-timeline-icon {
   display: grid;
   place-items: center;
@@ -3711,6 +3732,64 @@ html[data-theme="dark"] .ide-surface.is-preview {
 .agent-run-status-detail span:last-child {
   flex: 0 0 auto;
   text-align: right;
+}
+
+.agent-run-metrics {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 5px;
+}
+
+.agent-run-metrics span {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: 4px;
+  overflow: hidden;
+  color: var(--faint-foreground);
+  font-size: 0.64rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-run-metrics svg,
+.agent-verification-state svg {
+  width: 12px;
+  height: 12px;
+  flex: 0 0 auto;
+}
+
+.agent-run-metrics b {
+  color: var(--foreground);
+  font-weight: 750;
+}
+
+.agent-verification-state {
+  display: grid;
+  grid-template-columns: 14px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  padding-top: 5px;
+  border-top: 1px solid var(--border-soft);
+  color: var(--warning);
+  font-size: 0.66rem;
+}
+
+.agent-verification-state.is-verified {
+  color: var(--success);
+}
+
+.agent-verification-state span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-verification-state small {
+  color: var(--faint-foreground);
+  font-size: 0.62rem;
+  white-space: nowrap;
 }
 
 .agent-run-status .button {

@@ -145,13 +145,14 @@ describe("DeepSeekProvider", () => {
   });
 
   it("rejects a stream that ends without [DONE]", async () => {
+    const fetchImplementation = vi.fn(async () =>
+      streamResponse([
+        'data: {"choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":null}]}\n\n',
+      ]),
+    );
     const provider = new DeepSeekProvider({
       apiKey: "test-key",
-      fetchImplementation: vi.fn(async () =>
-        streamResponse([
-          'data: {"choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":null}]}\n\n',
-        ]),
-      ),
+      fetchImplementation,
     });
 
     await expect(async () => {
@@ -167,5 +168,63 @@ describe("DeepSeekProvider", () => {
     }).rejects.toMatchObject({
       code: AGENT_ERROR_CODES.providerInterrupted,
     });
+    expect(fetchImplementation).toHaveBeenCalledOnce();
+  });
+
+  it("retries a transient connection failure before the first provider event", async () => {
+    const fetchImplementation = vi
+      .fn<typeof fetch>()
+      .mockRejectedValueOnce(new TypeError("fetch failed"))
+      .mockResolvedValueOnce(
+        streamResponse([
+          'data: {"choices":[{"index":0,"delta":{"content":"完成"},"finish_reason":"stop"}]}\n\n',
+          "data: [DONE]\n\n",
+        ]),
+      );
+    const provider = new DeepSeekProvider({
+      apiKey: "test-key",
+      fetchImplementation,
+      retryBaseDelayMs: 0,
+    });
+    const events = [];
+
+    for await (const event of provider.streamTurn({
+      model: "deepseek-v4-pro",
+      messages: [{ role: "user", content: "hello" }],
+      tools: [],
+      maxOutputTokens: 128,
+    })) {
+      events.push(event);
+    }
+
+    expect(fetchImplementation).toHaveBeenCalledTimes(2);
+    expect(events).toContainEqual({ type: "text_delta", text: "完成" });
+  });
+
+  it("does not replay a request after the provider stream has emitted data", async () => {
+    const fetchImplementation = vi.fn(async () =>
+      streamResponse([
+        'data: {"choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":null}]}\n\n',
+      ]),
+    );
+    const provider = new DeepSeekProvider({
+      apiKey: "test-key",
+      fetchImplementation,
+      retryBaseDelayMs: 0,
+    });
+
+    await expect(async () => {
+      for await (const event of provider.streamTurn({
+        model: "deepseek-v4-pro",
+        messages: [{ role: "user", content: "hello" }],
+        tools: [],
+        maxOutputTokens: 128,
+      })) {
+        void event;
+      }
+    }).rejects.toMatchObject({
+      code: AGENT_ERROR_CODES.providerInterrupted,
+    });
+    expect(fetchImplementation).toHaveBeenCalledOnce();
   });
 });

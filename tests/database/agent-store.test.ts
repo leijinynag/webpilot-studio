@@ -28,6 +28,9 @@ const profile: FrozenAgentRunProfile = {
     maxWallTimeSeconds: 300,
     maxOutputCharacters: 24_000,
     maxToolResultCharacters: 20_000,
+    maxFileMutations: 8,
+    maxClientResumes: 6,
+    maxNoProgressRepeats: 2,
   },
 };
 
@@ -52,6 +55,57 @@ function createPreviewResult(revision: number): RunPreviewResult {
       revision,
       rendered: true,
       events: [{ type: "RENDER_OK", timestamp: 100 }],
+      diagnostics: [],
+    },
+    console: {
+      revision,
+      entries: [],
+      totalBytes: 0,
+      truncated: false,
+    },
+  };
+}
+
+function createFailedPreviewResult(
+  revision: number,
+  kind: "runtime" | "install" = "runtime",
+): RunPreviewResult {
+  const installFailed = kind === "install";
+  return {
+    ok: false,
+    toolName: "run_preview",
+    revision,
+    summary: installFailed ? "依赖安装失败。" : "页面产生 1 个运行时错误。",
+    build: {
+      revision,
+      install: {
+        status: installFailed ? "failed" : "succeeded",
+        exitCode: installFailed ? 1 : 0,
+      },
+      devServer: {
+        status: installFailed ? "not_started" : "ready",
+        port: installFailed ? null : 5173,
+        url: installFailed ? null : "https://5173-webpilot.local",
+      },
+      errors: installFailed
+        ? ["npm ERR! No matching version found for missing-package@999.0.0"]
+        : [],
+      logs: installFailed ? ["[install] command failed with exit code 1"] : [],
+    },
+    runtime: {
+      revision,
+      rendered: !installFailed,
+      events: installFailed
+        ? []
+        : [
+            { type: "RENDER_OK", timestamp: 100 },
+            {
+              type: "RUNTIME_ERROR",
+              message: "Cannot read properties of undefined (reading 'label')",
+              stack: "TypeError: Cannot read properties of undefined",
+              timestamp: 101,
+            },
+          ],
       diagnostics: [],
     },
     console: {
@@ -241,6 +295,16 @@ describe("AgentStore", () => {
 
       expect(accepted.disposition).toBe("accepted");
       expect(accepted.run.status).toBe("running");
+      expect(accepted.run.usage).toMatchObject({
+        clientResumes: 1,
+        repairRounds: 0,
+        latestVerificationRevision: 1,
+        latestVerificationOk: true,
+      });
+      expect(accepted.run.usage.firstPreviewAt).toEqual(expect.any(String));
+      expect(accepted.run.usage.firstPreviewDurationMs).toEqual(
+        expect.any(Number),
+      );
       expect(duplicate.disposition).toBe("duplicate");
       expect(evidenceRows.map((row) => row.kind).sort()).toEqual([
         "build",
@@ -328,6 +392,186 @@ describe("AgentStore", () => {
       expect(events.at(-1)).toMatchObject({
         type: "client_tool.result_ignored",
         payload: { reason: "stale_revision" },
+      });
+    } finally {
+      await testDatabase.close();
+    }
+  });
+
+  it("Run 取消后忽略迟到 Preview 结果，不能恢复执行", async () => {
+    const testDatabase = await createTestDatabase();
+
+    try {
+      const projectRepository = new DatabaseProjectRepository(
+        testDatabase.database,
+      );
+      const project = await projectRepository.createProject({
+        ownerId: "owner-1",
+        name: "Cancelled Preview Project",
+        initialFiles: [{ path: "src/App.tsx", content: "export default App" }],
+      });
+      const store = new AgentStore(testDatabase.database);
+      const run = await store.createRun({
+        ownerId: "owner-1",
+        projectId: project.id,
+        conversationTitle: "取消预览",
+        userMessage: "验证页面",
+        profile,
+      });
+      await store.transitionRun({
+        ownerId: run.ownerId,
+        runId: run.id,
+        status: "running",
+      });
+      await store.registerToolInvocation({
+        runId: run.id,
+        toolCallId: "call-late-preview",
+        toolName: "run_preview",
+        executionDomain: "client",
+        argumentsJson: { revision: 1, observationMs: 1_500 },
+        idempotencyKey: `${run.id}:call-late-preview`,
+        revisionBefore: 1,
+      });
+      await store.markToolInvocationRunning({
+        runId: run.id,
+        toolCallId: "call-late-preview",
+      });
+      await store.transitionRun({
+        ownerId: run.ownerId,
+        runId: run.id,
+        status: "awaiting_client_tool",
+      });
+      await store.requestCancellation({
+        ownerId: run.ownerId,
+        runId: run.id,
+      });
+      await store.transitionRun({
+        ownerId: run.ownerId,
+        runId: run.id,
+        status: "cancelled",
+      });
+
+      const late = await store.completeClientToolResult({
+        ownerId: run.ownerId,
+        runId: run.id,
+        projectId: project.id,
+        toolCallId: "call-late-preview",
+        toolName: "run_preview",
+        idempotencyKey: `${run.id}:call-late-preview`,
+        revision: 1,
+        result: createPreviewResult(1),
+      });
+      const latest = await store.getRun({
+        ownerId: run.ownerId,
+        runId: run.id,
+      });
+
+      expect(late.disposition).toBe("ignored");
+      expect(latest.status).toBe("cancelled");
+      expect(latest.usage.clientResumes).toBe(0);
+    } finally {
+      await testDatabase.close();
+    }
+  });
+
+  it("保存结构化 install failure，并停止同 revision 的重复无进展循环", async () => {
+    const testDatabase = await createTestDatabase();
+
+    try {
+      const projectRepository = new DatabaseProjectRepository(
+        testDatabase.database,
+      );
+      const project = await projectRepository.createProject({
+        ownerId: "owner-1",
+        name: "No Progress Preview Project",
+        initialFiles: [{ path: "src/App.tsx", content: "export default App" }],
+      });
+      const store = new AgentStore(testDatabase.database);
+      const run = await store.createRun({
+        ownerId: "owner-1",
+        projectId: project.id,
+        conversationTitle: "重复失败",
+        userMessage: "修复安装错误",
+        profile,
+      });
+      await store.transitionRun({
+        ownerId: run.ownerId,
+        runId: run.id,
+        status: "running",
+      });
+
+      for (let attempt = 1; attempt <= 3; attempt += 1) {
+        const toolCallId = `call-install-${attempt}`;
+        await store.registerToolInvocation({
+          runId: run.id,
+          toolCallId,
+          toolName: "run_preview",
+          executionDomain: "client",
+          argumentsJson: { revision: 1, observationMs: 1_500 },
+          idempotencyKey: `${run.id}:${toolCallId}`,
+          revisionBefore: 1,
+        });
+        await store.markToolInvocationRunning({
+          runId: run.id,
+          toolCallId,
+        });
+        await store.transitionRun({
+          ownerId: run.ownerId,
+          runId: run.id,
+          status: "awaiting_client_tool",
+        });
+        const completion = await store.completeClientToolResult({
+          ownerId: run.ownerId,
+          runId: run.id,
+          projectId: project.id,
+          toolCallId,
+          toolName: "run_preview",
+          idempotencyKey: `${run.id}:${toolCallId}`,
+          revision: 1,
+          result: createFailedPreviewResult(1, "install"),
+        });
+
+        expect(completion.run.status).toBe(
+          attempt === 3 ? "budget_exhausted" : "running",
+        );
+      }
+
+      const latest = await store.getRun({
+        ownerId: run.ownerId,
+        runId: run.id,
+      });
+      const transcript = await store.listTranscript({
+        ownerId: run.ownerId,
+        conversationId: run.conversationId,
+      });
+      const previewResults = transcript.filter(
+        (message) =>
+          message.kind === "tool_result" && message.toolName === "run_preview",
+      );
+
+      expect(latest).toMatchObject({
+        status: "budget_exhausted",
+        errorCode: "AGENT_NO_PROGRESS",
+        usage: {
+          clientResumes: 3,
+          repairRounds: 2,
+          repeatedFailureCount: 2,
+          latestVerificationOk: false,
+        },
+      });
+      expect(previewResults[0]).toMatchObject({
+        kind: "tool_result",
+        resultJson: {
+          verificationFailure: {
+            code: "install_failed",
+            stage: "install",
+            issues: [
+              {
+                message: expect.stringContaining("No matching version"),
+              },
+            ],
+          },
+        },
       });
     } finally {
       await testDatabase.close();

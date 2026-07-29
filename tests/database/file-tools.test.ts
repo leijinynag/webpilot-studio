@@ -27,6 +27,9 @@ const profile: FrozenAgentRunProfile = {
     maxWallTimeSeconds: 300,
     maxOutputCharacters: 24_000,
     maxToolResultCharacters: 20_000,
+    maxFileMutations: 8,
+    maxClientResumes: 6,
+    maxNoProgressRepeats: 2,
   },
 };
 

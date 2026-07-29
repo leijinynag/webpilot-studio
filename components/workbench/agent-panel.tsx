@@ -16,8 +16,11 @@ import {
   FileCode2,
   LoaderCircle,
   MessageSquarePlus,
+  PlayCircle,
   RefreshCw,
+  RotateCcw,
   Send,
+  ShieldCheck,
   TriangleAlert,
   Wrench,
 } from "lucide-react";
@@ -27,6 +30,7 @@ import {
   clientToolRequestSchema,
   type ClientToolRequest,
 } from "@/domains/agent/evidence";
+import { verificationFailureSchema } from "@/domains/agent/verification";
 import type {
   AgentConversationSnapshot,
   AgentRunRecord,
@@ -289,6 +293,8 @@ export function AgentPanel({
       "client_tool.requested",
       "client_tool.completed",
       "client_tool.result_ignored",
+      "verification.completed",
+      "verification.completion_blocked",
     ]) {
       stream.addEventListener(eventType, handleEvent);
     }
@@ -656,6 +662,7 @@ function TranscriptItem({ message }: { message: TranscriptMessage }) {
 
   if (message.kind === "tool_result") {
     const ok = message.resultJson.ok === true;
+    const preview = getPreviewResultDisplay(message);
     return (
       <article className={cn("agent-timeline-item", !ok && "is-error")}>
         <span className="agent-timeline-icon">
@@ -663,11 +670,28 @@ function TranscriptItem({ message }: { message: TranscriptMessage }) {
         </span>
         <div>
           <strong>
-            {ok
-              ? `${message.toolName} completed`
-              : `${message.toolName} failed`}
+            {preview
+              ? `Preview r${preview.revision} · ${ok ? "验证通过" : "验证失败"}`
+              : ok
+                ? `${message.toolName} completed`
+                : `${message.toolName} failed`}
           </strong>
-          <code>{formatToolResult(message.resultJson)}</code>
+          {preview ? (
+            <>
+              <p className="agent-preview-summary">{preview.summary}</p>
+              <div className="agent-preview-evidence">
+                <span>install {preview.install}</span>
+                <span>server {preview.devServer}</span>
+                <span>runtime {preview.runtime}</span>
+                <span>console {preview.consoleErrors}</span>
+              </div>
+              {preview.failureMessage ? (
+                <code>{preview.failureMessage}</code>
+              ) : null}
+            </>
+          ) : (
+            <code>{formatToolResult(message.resultJson)}</code>
+          )}
         </div>
       </article>
     );
@@ -744,6 +768,41 @@ function AgentRunStatus({
           {run.currentRevision}
         </span>
       </div>
+      <div className="agent-run-metrics" aria-label="Agent 运行指标">
+        <span>
+          <PlayCircle />
+          <b>{run.usage.clientResumes}</b>/{run.budget.maxClientResumes}{" "}
+          previews
+        </span>
+        <span>
+          <RotateCcw />
+          <b>{run.usage.repairRounds}</b> repairs
+        </span>
+        <span>
+          <Wrench />
+          <b>{run.usage.fileMutations}</b>/{run.budget.maxFileMutations} writes
+        </span>
+      </div>
+      {run.usage.latestVerificationRevision !== null ? (
+        <div
+          className={cn(
+            "agent-verification-state",
+            run.usage.latestVerificationOk ? "is-verified" : "is-unverified",
+          )}
+        >
+          {run.usage.latestVerificationOk ? <ShieldCheck /> : <TriangleAlert />}
+          <span>
+            {run.usage.latestVerificationOk
+              ? `r${run.usage.latestVerificationRevision} 已通过运行验证`
+              : `r${run.usage.latestVerificationRevision} 验证失败，正在依据证据修复`}
+          </span>
+          {run.usage.firstPreviewDurationMs !== null ? (
+            <small>
+              首次预览 {formatDuration(run.usage.firstPreviewDurationMs)}
+            </small>
+          ) : null}
+        </div>
+      ) : null}
       {isActive ? (
         <Button
           disabled={stopping}
@@ -848,6 +907,15 @@ function getRunStatusCopy(run: AgentRunRecord): {
         tone: "warning",
       };
     case "budget_exhausted":
+      if (run.errorCode === "AGENT_NO_PROGRESS") {
+        return {
+          title: "无进展，已停止",
+          detail: "相同失败在同一 revision 上重复出现",
+          message:
+            "Agent 没有产生新的代码 revision，且重复得到相同 Preview 失败，已停止循环。",
+          tone: "warning",
+        };
+      }
       return {
         title: "达到预算上限",
         detail: "已达到本次运行预算，未继续执行",
@@ -857,6 +925,64 @@ function getRunStatusCopy(run: AgentRunRecord): {
     case "failed":
       return getFailedRunStatusCopy(run.errorCode);
   }
+}
+
+function getPreviewResultDisplay(
+  message: Extract<TranscriptMessage, { kind: "tool_result" }>,
+): {
+  revision: number;
+  summary: string;
+  install: string;
+  devServer: string;
+  runtime: string;
+  consoleErrors: number;
+  failureMessage: string | null;
+} | null {
+  if (message.toolName !== "run_preview") {
+    return null;
+  }
+
+  const result = message.resultJson;
+  const build = asRecord(result.build);
+  const install = asRecord(build.install);
+  const devServer = asRecord(build.devServer);
+  const runtime = asRecord(result.runtime);
+  const consoleEvidence = asRecord(result.console);
+  const consoleEntries = Array.isArray(consoleEvidence.entries)
+    ? consoleEvidence.entries
+    : [];
+  const failure = verificationFailureSchema.safeParse(
+    result.verificationFailure,
+  );
+
+  return {
+    revision: typeof result.revision === "number" ? result.revision : 0,
+    summary:
+      typeof result.summary === "string" ? result.summary : "预览结果已返回。",
+    install: typeof install.status === "string" ? install.status : "unknown",
+    devServer:
+      typeof devServer.status === "string" ? devServer.status : "unknown",
+    runtime: runtime.rendered === true ? "rendered" : "failed",
+    consoleErrors: consoleEntries.filter(
+      (entry) => asRecord(entry).level === "error",
+    ).length,
+    failureMessage: failure.success
+      ? (failure.data.issues[0]?.message ?? failure.data.summary)
+      : null,
+  };
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
+}
+
+function formatDuration(milliseconds: number): string {
+  if (milliseconds < 1_000) {
+    return `${milliseconds}ms`;
+  }
+  return `${(milliseconds / 1_000).toFixed(1)}s`;
 }
 
 function getFailedRunStatusCopy(errorCode: string | null): {

@@ -1,7 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
 
 import { WebContainerRuntimeManager } from "@/infrastructure/webcontainer/runtime-manager";
-import { FakeWebContainer } from "@/tests/helpers/fake-webcontainer";
+import {
+  FakeWebContainer,
+  FakeWebContainerProcess,
+} from "@/tests/helpers/fake-webcontainer";
 
 function createDeferred<T>() {
   let resolve!: (value: T) => void;
@@ -86,6 +89,49 @@ describe("WebContainerRuntimeManager", () => {
     expect(runtime.calls).toContain("write:src/index.tsx:revision-2");
     expect(runtime.calls).toContain("write:src/new.ts:new-file");
     expect(manager.getSnapshot().syncedRevision).toBe(2);
+  });
+
+  it("把 forwardPreviewErrors 输出记录为 revision 绑定的浏览器异常", async () => {
+    const runtime = new FakeWebContainer();
+    const originalSpawn = runtime.spawn.bind(runtime);
+    let emitDevOutput: (line: string) => void = () => {
+      throw new Error("dev output stream 尚未初始化。");
+    };
+    runtime.spawn = async (command, args) => {
+      const process = await originalSpawn(command, args);
+      if (args[0] !== "run") {
+        return process;
+      }
+
+      const controlledProcess = new FakeWebContainerProcess(0);
+      Object.defineProperty(controlledProcess, "exit", {
+        value: runtime.devExit,
+      });
+      Object.defineProperty(controlledProcess, "output", {
+        value: new ReadableStream<string>({
+          start(controller) {
+            emitDevOutput = (line) => controller.enqueue(line);
+          },
+        }),
+      });
+      return controlledProcess;
+    };
+    const manager = new WebContainerRuntimeManager({
+      boot: async () => runtime,
+      isCrossOriginIsolated: () => true,
+    });
+
+    await manager.start({}, "project-a", 7);
+    emitDevOutput("error [browser] Uncaught TypeError: button failed\n");
+
+    await vi.waitFor(() => {
+      expect(manager.getSnapshot().forwardedPreviewErrors).toEqual([
+        expect.objectContaining({
+          revision: 7,
+          message: "Uncaught TypeError: button failed",
+        }),
+      ]);
+    });
   });
 
   it("相同 revision 的不同运行镜像 key 仍会触发同步", async () => {

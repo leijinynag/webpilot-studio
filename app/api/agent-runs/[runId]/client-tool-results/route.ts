@@ -36,7 +36,10 @@ export async function POST(
       ...body,
     });
 
-    if (completion.disposition === "accepted") {
+    if (
+      completion.disposition === "accepted" &&
+      completion.run.status === "running"
+    ) {
       // 数据库已经原子地把 Run 恢复到 running；after 只负责启动下一轮，
       // 即使当前请求结束或实例回收，后续 GET 恢复也能重新接管。
       after(async () => {

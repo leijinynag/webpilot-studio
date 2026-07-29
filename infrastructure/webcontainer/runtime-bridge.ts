@@ -122,7 +122,9 @@ function injectScriptIntoHtml(html: string, scriptTag: string): string {
   return `${scriptTag}${html}`;
 }
 
-function createRuntimeBridgeScript(context: RuntimeBridgeContext): string {
+export function createRuntimeBridgeScript(
+  context: RuntimeBridgeContext,
+): string {
   const serializedContext = JSON.stringify({
     channel: RUNTIME_BRIDGE_CHANNEL,
     version: RUNTIME_BRIDGE_VERSION,

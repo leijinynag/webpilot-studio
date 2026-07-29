@@ -26,6 +26,12 @@ import type {
   TranscriptMessage,
 } from "@/domains/agent/types";
 import {
+  EMPTY_AGENT_RUN_USAGE,
+  normalizeAgentRunBudget,
+  normalizeAgentRunUsage,
+} from "@/domains/agent/types";
+import { deriveVerificationFailure } from "@/domains/agent/verification";
+import {
   agentEvidence,
   agentRunEvents,
   agentRuns,
@@ -174,9 +180,7 @@ export class AgentStore<TQueryResult extends PgQueryResultHKT> {
             repositoryCapability: input.profile.repositoryCapability,
             budget: input.profile.budget,
             usage: {
-              modelTurns: 0,
-              inputTokens: 0,
-              outputTokens: 0,
+              ...EMPTY_AGENT_RUN_USAGE,
             },
             correlationId,
           })
@@ -934,6 +938,55 @@ export class AgentStore<TQueryResult extends PgQueryResultHKT> {
       }
 
       const invocationStatus = input.result.ok ? "succeeded" : "failed";
+      const now = new Date();
+      const verificationFailure = deriveVerificationFailure(input.result);
+      const currentUsage = normalizeAgentRunUsage(runRow.usage);
+      const repeatedFailureCount =
+        verificationFailure &&
+        currentUsage.latestVerificationRevision === input.revision &&
+        currentUsage.latestFailureFingerprint ===
+          verificationFailure.fingerprint
+          ? currentUsage.repeatedFailureCount + 1
+          : 0;
+      const nextClientResumes = currentUsage.clientResumes + 1;
+      const nextUsage = {
+        ...currentUsage,
+        clientResumes: nextClientResumes,
+        repairRounds:
+          currentUsage.clientResumes > 0
+            ? currentUsage.repairRounds + 1
+            : currentUsage.repairRounds,
+        repeatedFailureCount,
+        firstPreviewAt: currentUsage.firstPreviewAt ?? now.toISOString(),
+        firstPreviewDurationMs:
+          currentUsage.firstPreviewDurationMs ??
+          (invocation.startedAt
+            ? Math.max(0, now.getTime() - invocation.startedAt.getTime())
+            : null),
+        latestPreviewAt: now.toISOString(),
+        latestVerificationRevision: input.revision,
+        latestVerificationOk: input.result.ok,
+        latestFailureFingerprint: verificationFailure?.fingerprint ?? null,
+      };
+      const budget = normalizeAgentRunBudget(runRow.budget);
+      const noProgress =
+        !input.result.ok && repeatedFailureCount >= budget.maxNoProgressRepeats;
+      const clientResumeBudgetExhausted =
+        nextClientResumes > budget.maxClientResumes;
+      const nextRunStatus =
+        noProgress || clientResumeBudgetExhausted
+          ? "budget_exhausted"
+          : "running";
+      const terminalErrorCode = noProgress
+        ? AGENT_ERROR_CODES.noProgress
+        : clientResumeBudgetExhausted
+          ? AGENT_ERROR_CODES.budgetExhausted
+          : null;
+      const terminalErrorMessage = noProgress
+        ? "同一种 Preview 失败在相同 revision 上重复出现，Agent 已停止无进展循环。"
+        : clientResumeBudgetExhausted
+          ? "Agent 已达到浏览器验证恢复次数上限。"
+          : null;
       const [completedInvocation] = await tx
         .update(toolInvocations)
         .set({
@@ -1012,15 +1065,21 @@ export class AgentStore<TQueryResult extends PgQueryResultHKT> {
         payload: {
           toolCallId: input.toolCallId,
           toolName: input.toolName,
-          resultJson: input.result,
+          resultJson: {
+            ...input.result,
+            verificationFailure,
+          },
         },
       });
 
-      const now = new Date();
       const [updatedRun] = await tx
         .update(agentRuns)
         .set({
-          status: "running",
+          status: nextRunStatus,
+          usage: nextUsage,
+          errorCode: terminalErrorCode,
+          errorMessage: terminalErrorMessage,
+          completedAt: nextRunStatus === "budget_exhausted" ? now : null,
           updatedAt: now,
         })
         .where(
@@ -1063,11 +1122,24 @@ export class AgentStore<TQueryResult extends PgQueryResultHKT> {
         },
         {
           runId: input.runId,
+          type: "verification.completed",
+          payload: {
+            ok: input.result.ok,
+            revision: input.revision,
+            clientResume: nextClientResumes,
+            repairRound: nextUsage.repairRounds,
+            repeatedFailureCount,
+            ...(verificationFailure ? { failure: verificationFailure } : {}),
+          },
+        },
+        {
+          runId: input.runId,
           type: "run.status_changed",
           payload: {
             previousStatus: "awaiting_client_tool",
-            status: "running",
+            status: nextRunStatus,
             currentRevision: input.revision,
+            ...(terminalErrorCode ? { errorCode: terminalErrorCode } : {}),
           },
         },
       ]);
@@ -1286,8 +1358,8 @@ function toAgentRunRecord(row: typeof agentRuns.$inferSelect): AgentRunRecord {
     locale: row.locale as AgentRunRecord["locale"],
     repositoryCapability:
       row.repositoryCapability as AgentRunRecord["repositoryCapability"],
-    budget: row.budget as AgentRunRecord["budget"],
-    usage: row.usage as AgentRunRecord["usage"],
+    budget: normalizeAgentRunBudget(row.budget),
+    usage: normalizeAgentRunUsage(row.usage),
   };
 }
 

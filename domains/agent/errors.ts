@@ -10,6 +10,7 @@ export const AGENT_ERROR_CODES = {
   providerInterrupted: "AGENT_PROVIDER_INTERRUPTED",
   profileUnavailable: "AGENT_PROFILE_UNAVAILABLE",
   budgetExhausted: "AGENT_BUDGET_EXHAUSTED",
+  noProgress: "AGENT_NO_PROGRESS",
   cancelled: "AGENT_CANCELLED",
   revisionConflict: "AGENT_REVISION_CONFLICT",
   toolInvalidArguments: "AGENT_TOOL_INVALID_ARGUMENTS",

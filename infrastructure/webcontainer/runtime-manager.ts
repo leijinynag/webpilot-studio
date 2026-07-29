@@ -55,6 +55,7 @@ const MAX_LOG_LINES = 160;
 const ANSI_ESCAPE_PATTERN =
   /[\u001B\u009B][[\]()#;?]*(?:(?:(?:[a-zA-Z\d]*(?:;[-a-zA-Z\d/#&.:=?%@~_]+)*)?\u0007)|(?:(?:\d{1,4}(?:[;:]\d{0,4})*)?[\dA-PR-TZcf-nq-uy=><~]))/g;
 const NPM_SPINNER_LINE_PATTERN = /^[|/\\-]$/;
+const FORWARDED_BROWSER_ERROR_PATTERN = /^\s*error\s+\[browser\]\s+(.+)$/i;
 const RUNTIME_RESTART_PATHS = new Set([
   "package.json",
   "package-lock.json",
@@ -642,6 +643,9 @@ export class WebContainerRuntimeManager {
                   value.length > 0 && !NPM_SPINNER_LINE_PATTERN.test(value),
               )) {
               this.appendLog(`[${source}] ${line}`);
+              if (source === "dev") {
+                this.captureForwardedPreviewError(line);
+              }
             }
           },
         }),
@@ -681,6 +685,25 @@ export class WebContainerRuntimeManager {
       ...this.snapshot,
       // 始终保留最近日志，既控制内存，也保留最接近失败点的上下文。
       logs: [...this.snapshot.logs, line].slice(-MAX_LOG_LINES),
+    });
+  }
+
+  private captureForwardedPreviewError(line: string): void {
+    const match = FORWARDED_BROWSER_ERROR_PATTERN.exec(line);
+    if (!match?.[1]) {
+      return;
+    }
+
+    this.setSnapshot({
+      ...this.snapshot,
+      forwardedPreviewErrors: [
+        ...this.snapshot.forwardedPreviewErrors,
+        {
+          revision: this.snapshot.syncedRevision,
+          message: match[1],
+          timestamp: Date.now(),
+        },
+      ].slice(-50),
     });
   }
 

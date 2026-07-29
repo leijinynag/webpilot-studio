@@ -14,6 +14,7 @@ import type { WebContainerRuntimeSnapshot } from "@/infrastructure/webcontainer/
 const textEncoder = new TextEncoder();
 const BUILD_ERROR_PATTERN =
   /(?:\berror\b|\bfailed\b|\bexception\b|npm err|编译失败|构建失败)/i;
+const FORWARDED_BROWSER_ERROR_PATTERN = /\[dev\]\s+error\s+\[browser\]/i;
 
 /**
  * Collector 只在一次 run_preview 的观察窗口内存活。Console 与 Runtime
@@ -23,6 +24,7 @@ export class PreviewEvidenceCollector {
   private readonly runtimeEvents: RuntimeEvidence["events"] = [];
   private readonly diagnostics: RuntimeBridgeDiagnostic[] = [];
   private readonly consoleEntries: ConsoleEvidence["entries"] = [];
+  private readonly startedAt = Date.now();
   private consoleBytes = 0;
   private consoleTruncated = false;
 
@@ -69,10 +71,16 @@ export class PreviewEvidenceCollector {
 
   finish(snapshot: WebContainerRuntimeSnapshot): RunPreviewResult {
     const build = createBuildEvidence(snapshot, this.revision);
+    const runtimeEvents = mergeForwardedPreviewErrors(
+      this.runtimeEvents,
+      snapshot,
+      this.revision,
+      this.startedAt,
+    );
     const runtime: RuntimeEvidence = {
       revision: this.revision,
-      rendered: this.runtimeEvents.some((event) => event.type === "RENDER_OK"),
-      events: this.runtimeEvents,
+      rendered: runtimeEvents.some((event) => event.type === "RENDER_OK"),
+      events: runtimeEvents,
       diagnostics: this.diagnostics,
     };
     const consoleEvidence: ConsoleEvidence = {
@@ -167,7 +175,9 @@ function createBuildEvidence(
         ]
       : []),
     ...snapshot.logs.filter((line) => BUILD_ERROR_PATTERN.test(line)),
-  ].slice(-50);
+  ]
+    .filter((line) => !FORWARDED_BROWSER_ERROR_PATTERN.test(line))
+    .slice(-50);
 
   return {
     revision,
@@ -192,6 +202,36 @@ function createBuildEvidence(
     errors,
     logs: snapshot.logs.slice(-80),
   };
+}
+
+function mergeForwardedPreviewErrors(
+  runtimeEvents: RuntimeEvidence["events"],
+  snapshot: WebContainerRuntimeSnapshot,
+  revision: number,
+  startedAt: number,
+): RuntimeEvidence["events"] {
+  const merged = [...runtimeEvents];
+
+  for (const error of snapshot.forwardedPreviewErrors) {
+    if (
+      error.revision !== revision ||
+      error.timestamp < startedAt ||
+      merged.some(
+        (event) =>
+          event.type === "RUNTIME_ERROR" && event.message === error.message,
+      )
+    ) {
+      continue;
+    }
+
+    merged.push({
+      type: "RUNTIME_ERROR",
+      message: error.message,
+      timestamp: error.timestamp,
+    });
+  }
+
+  return merged;
 }
 
 function parseExitCode(snapshot: WebContainerRuntimeSnapshot): number | null {

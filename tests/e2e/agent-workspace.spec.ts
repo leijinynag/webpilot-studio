@@ -20,6 +20,12 @@ type Run = {
   status: string;
   currentRevision: number;
   errorMessage: string | null;
+  usage?: {
+    clientResumes: number;
+    repairRounds: number;
+    latestVerificationRevision: number | null;
+    latestVerificationOk: boolean | null;
+  };
 };
 
 type ToolInvocation = {
@@ -29,8 +35,30 @@ type ToolInvocation = {
   resultJson: {
     ok?: boolean;
     build?: { errors?: string[] };
-    runtime?: { rendered?: boolean };
+    runtime?: {
+      rendered?: boolean;
+      events?: Array<{ type?: string; message?: string }>;
+    };
   } | null;
+};
+
+type AgentSnapshot = {
+  tools: ToolInvocation[];
+  events: Array<{
+    type: string;
+    payload: Record<string, unknown>;
+  }>;
+  transcript: Array<{
+    kind: string;
+    toolName?: string;
+    resultJson?: {
+      verificationFailure?: {
+        code?: string;
+        stage?: string;
+        issues?: Array<{ message?: string }>;
+      } | null;
+    };
+  }>;
 };
 
 async function createProject(page: Page, name: string): Promise<Project> {
@@ -74,6 +102,77 @@ async function waitForTerminalRun(
   }
 
   return lastRun;
+}
+
+async function writeProjectFile(
+  page: Page,
+  input: {
+    projectId: string;
+    path: string;
+    content: string;
+    expectedRevision: number;
+  },
+): Promise<number> {
+  const response = await page.request.post(
+    `/api/projects/${input.projectId}/files`,
+    {
+      data: {
+        path: input.path,
+        content: input.content,
+        expectedRevision: input.expectedRevision,
+      },
+    },
+  );
+  expect(response.ok()).toBe(true);
+  const body = (await response.json()) as { result: { revision: number } };
+  return body.result.revision;
+}
+
+async function readAgentSnapshot(
+  page: Page,
+  projectId: string,
+  conversationId: string,
+): Promise<AgentSnapshot> {
+  const response = await page.request.get(
+    `/api/projects/${projectId}/agent?conversationId=${conversationId}`,
+  );
+  expect(response.ok()).toBe(true);
+  const body = (await response.json()) as { snapshot: AgentSnapshot | null };
+  if (!body.snapshot) {
+    throw new Error("Agent Conversation 快照不存在。");
+  }
+  return body.snapshot;
+}
+
+async function waitForRunStatus(
+  page: Page,
+  runId: string,
+  status: string,
+  timeout = 180_000,
+): Promise<void> {
+  const deadline = Date.now() + timeout;
+
+  while (Date.now() < deadline) {
+    const response = await page.request.get(`/api/agent-runs/${runId}`);
+    expect(response.ok()).toBe(true);
+    const body = (await response.json()) as { run: Run };
+
+    if (body.run.status === status) {
+      return;
+    }
+
+    // 目标状态之前若已经进入其他终态，应立即暴露真实错误，避免把 Provider
+    // 或状态机失败伪装成一个耗时数分钟的等待超时。
+    if (TERMINAL_STATUSES.has(body.run.status)) {
+      throw new Error(
+        `Run 提前进入 ${body.run.status}：${body.run.errorMessage ?? "无错误详情"}`,
+      );
+    }
+
+    await page.waitForTimeout(500);
+  }
+
+  throw new Error(`等待 Run 进入 ${status} 超时。`);
 }
 
 test.describe("Agent workspace live flow", () => {
@@ -197,5 +296,260 @@ test.describe("Agent workspace live flow", () => {
         content: expect.not.stringContaining("复杂的页面重构"),
       },
     });
+  });
+
+  test("collects a button TypeError, repairs it and verifies the repaired revision", async ({
+    page,
+  }) => {
+    test.setTimeout(480_000);
+    const project = await createProject(page, "M3 TypeError repair");
+    const brokenRevision = await writeProjectFile(page, {
+      projectId: project.id,
+      path: "src/index.tsx",
+      expectedRevision: project.revision,
+      content: `import { createRoot } from "react-dom/client";
+
+function App() {
+  function handleClick() {
+    const selected = JSON.parse("null") as { label: string };
+    document.title = selected.label;
+  }
+
+  return <button onClick={handleClick}>Trigger TypeError</button>;
+}
+
+createRoot(document.getElementById("root")!).render(<App />);
+`,
+    });
+    await page.goto(`/p/${project.id}`);
+    const prompt = [
+      `当前 revision 是 ${brokenRevision}。`,
+      "这是运行时证据测试：第一步不要读取或修改文件，必须直接调用 run_preview 验证当前 revision。",
+      "等待我点击 Trigger TypeError 按钮后，根据返回的结构化 Runtime/Console 证据定位并修复 TypeError。",
+      "修复后重新 run_preview，只有最新 revision 验证成功才能结束。",
+    ].join("");
+    await page.getByLabel("给 Agent 的消息").fill(prompt);
+    await page.getByRole("button", { name: "发送消息" }).click();
+
+    const runResponse = await page.waitForResponse(
+      (response) =>
+        response.url().endsWith("/api/agent-runs") &&
+        response.request().method() === "POST",
+    );
+    const runBody = (await runResponse.json()) as { run: Run };
+    await waitForRunStatus(page, runBody.run.id, "awaiting_client_tool");
+
+    const previewFrame = page.frameLocator(
+      'iframe[title="WebContainer 项目预览"]',
+    );
+    await expect(
+      previewFrame.locator('script[src*="/__webpilot/runtime-bridge-"]'),
+    ).toHaveCount(1, { timeout: 180_000 });
+    await previewFrame
+      .getByRole("button", { name: "Trigger TypeError" })
+      .click();
+
+    await expect
+      .poll(
+        async () => {
+          const snapshot = await readAgentSnapshot(
+            page,
+            project.id,
+            runBody.run.conversationId,
+          );
+          return snapshot.tools.some(
+            (tool) =>
+              tool.runId === runBody.run.id &&
+              tool.toolName === "run_preview" &&
+              tool.resultJson?.ok === false &&
+              tool.resultJson.runtime?.events?.some(
+                (event) =>
+                  event.type === "RUNTIME_ERROR" &&
+                  event.message?.includes("label"),
+              ),
+          );
+        },
+        { timeout: 180_000, intervals: [500, 1_000, 2_000] },
+      )
+      .toBe(true);
+
+    const run = await waitForTerminalRun(page, runBody.run.id, 360_000);
+    expect(run.status, run.errorMessage ?? "TypeError 未完成自动修复。").toBe(
+      "succeeded",
+    );
+    expect(run.currentRevision).toBeGreaterThan(brokenRevision);
+    expect(run.usage).toMatchObject({
+      clientResumes: expect.any(Number),
+      repairRounds: expect.any(Number),
+      latestVerificationRevision: run.currentRevision,
+      latestVerificationOk: true,
+    });
+    expect(run.usage?.clientResumes ?? 0).toBeGreaterThanOrEqual(2);
+    expect(run.usage?.repairRounds ?? 0).toBeGreaterThanOrEqual(1);
+
+    const snapshot = await readAgentSnapshot(
+      page,
+      project.id,
+      run.conversationId,
+    );
+    const previews = snapshot.tools.filter(
+      (tool) =>
+        tool.runId === run.id &&
+        tool.toolName === "run_preview" &&
+        tool.resultJson,
+    );
+    expect(previews[0]?.resultJson).toMatchObject({
+      ok: false,
+      runtime: {
+        events: expect.arrayContaining([
+          expect.objectContaining({
+            type: "RUNTIME_ERROR",
+            message: expect.stringContaining("label"),
+          }),
+        ]),
+      },
+    });
+    expect(previews.at(-1)).toMatchObject({
+      status: "succeeded",
+      resultJson: {
+        ok: true,
+        runtime: { rendered: true },
+      },
+    });
+  });
+
+  test("returns structured install evidence instead of a generic failure", async ({
+    page,
+  }) => {
+    test.setTimeout(360_000);
+    const project = await createProject(page, "M3 install evidence");
+    const packageResponse = await page.request.get(
+      `/api/projects/${project.id}/files/package.json`,
+    );
+    expect(packageResponse.ok()).toBe(true);
+    const packageBody = (await packageResponse.json()) as {
+      file: { content: string };
+    };
+    const packageJson = JSON.parse(packageBody.file.content) as {
+      dependencies: Record<string, string>;
+    };
+    packageJson.dependencies["webpilot-missing-package-m3"] = "999.0.0";
+    const brokenRevision = await writeProjectFile(page, {
+      projectId: project.id,
+      path: "package.json",
+      expectedRevision: project.revision,
+      content: `${JSON.stringify(packageJson, null, 2)}\n`,
+    });
+    await page.goto(`/p/${project.id}`);
+    const prompt = [
+      `当前 revision 是 ${brokenRevision}。`,
+      "第一步不要读取或修改文件，直接调用 run_preview。",
+      "这是 install evidence 测试，收到安装失败结果后不要用泛化文本代替结构化证据。",
+    ].join("");
+    await page.getByLabel("给 Agent 的消息").fill(prompt);
+    await page.getByRole("button", { name: "发送消息" }).click();
+    const runResponse = await page.waitForResponse(
+      (response) =>
+        response.url().endsWith("/api/agent-runs") &&
+        response.request().method() === "POST",
+    );
+    const runBody = (await runResponse.json()) as { run: Run };
+
+    await expect
+      .poll(
+        async () => {
+          const snapshot = await readAgentSnapshot(
+            page,
+            project.id,
+            runBody.run.conversationId,
+          );
+          const result = snapshot.transcript.find(
+            (message) =>
+              message.kind === "tool_result" &&
+              message.toolName === "run_preview" &&
+              message.resultJson?.verificationFailure?.code ===
+                "install_failed",
+          );
+          const failure = result?.resultJson?.verificationFailure;
+
+          if (!failure) {
+            return null;
+          }
+
+          // 安装器会同时返回进程摘要和 npm 原始错误行；验收重点是结构完整，
+          // 且至少保留一条可定位到具体包或状态码的错误，而不是依赖数组顺序。
+          return {
+            code: failure.code,
+            stage: failure.stage,
+            hasSpecificInstallIssue:
+              Array.isArray(failure.issues) &&
+              failure.issues.some(
+                (issue) =>
+                  typeof issue === "object" &&
+                  issue !== null &&
+                  "message" in issue &&
+                  typeof issue.message === "string" &&
+                  /404|not found|matching version/i.test(issue.message),
+              ),
+          };
+        },
+        { timeout: 240_000, intervals: [1_000, 2_000] },
+      )
+      .toEqual({
+        code: "install_failed",
+        stage: "install",
+        hasSpecificInstallIssue: true,
+      });
+
+    await page.request.post(`/api/agent-runs/${runBody.run.id}/cancel`);
+    const cancelled = await waitForTerminalRun(page, runBody.run.id);
+    expect(cancelled.status).toBe("cancelled");
+  });
+
+  test("keeps a cancelled Run terminal when a late Preview result arrives", async ({
+    page,
+  }) => {
+    test.setTimeout(300_000);
+    const project = await createProject(page, "M3 late preview cancellation");
+    await page.goto(`/p/${project.id}`);
+    const prompt = [
+      `第一步直接调用 run_preview 验证 revision ${project.revision}，`,
+      "observationMs 必须设置为 10000；在结果返回前不要执行其他工具。",
+    ].join("");
+    await page.getByLabel("给 Agent 的消息").fill(prompt);
+    await page.getByRole("button", { name: "发送消息" }).click();
+    const runResponse = await page.waitForResponse(
+      (response) =>
+        response.url().endsWith("/api/agent-runs") &&
+        response.request().method() === "POST",
+    );
+    const runBody = (await runResponse.json()) as { run: Run };
+    await waitForRunStatus(page, runBody.run.id, "awaiting_client_tool");
+
+    const cancelResponse = await page.request.post(
+      `/api/agent-runs/${runBody.run.id}/cancel`,
+    );
+    expect(cancelResponse.ok()).toBe(true);
+    await expect
+      .poll(
+        async () => {
+          const snapshot = await readAgentSnapshot(
+            page,
+            project.id,
+            runBody.run.conversationId,
+          );
+          return snapshot.events.some(
+            (event) =>
+              event.type === "client_tool.result_ignored" &&
+              event.payload.reason === "run_not_awaiting_client_tool",
+          );
+        },
+        { timeout: 180_000, intervals: [500, 1_000, 2_000] },
+      )
+      .toBe(true);
+
+    const finalRun = await waitForTerminalRun(page, runBody.run.id);
+    expect(finalRun.status).toBe("cancelled");
+    expect(finalRun.currentRevision).toBe(project.revision);
   });
 });

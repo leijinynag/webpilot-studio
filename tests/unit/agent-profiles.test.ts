@@ -28,20 +28,31 @@ describe("Agent profiles", () => {
 
     expect(profile.promptDigest).toMatch(/^[a-f0-9]{64}$/);
     expect(profile.toolsetDigest).toMatch(/^[a-f0-9]{64}$/);
-    expect(
-      assertFrozenProfilesAvailable({
-        promptProfile: profile.promptProfile,
-        promptDigest: profile.promptDigest,
-        toolsetProfile: profile.toolsetProfile,
-        toolsetDigest: profile.toolsetDigest,
-        promptContext: {
-          locale: profile.locale,
-          projectId: "project-1",
-          revision: 3,
-          repositoryCapability,
-        },
-      }).prompt.content,
-    ).toContain("Current frozen revision: 3");
+    expect(profile.promptProfile).toBe("webpilot-system-v3");
+    const resolved = assertFrozenProfilesAvailable({
+      promptProfile: profile.promptProfile,
+      promptDigest: profile.promptDigest,
+      toolsetProfile: profile.toolsetProfile,
+      toolsetDigest: profile.toolsetDigest,
+      promptContext: {
+        locale: profile.locale,
+        projectId: "project-1",
+        revision: 3,
+        repositoryCapability,
+      },
+    });
+    expect(resolved.prompt.content).toContain("Current frozen revision: 3");
+    expect(resolved.prompt.content).toContain(
+      "evidence -> search -> read -> one mutation -> run_preview",
+    );
+    expect(resolved.prompt.content).toContain(
+      "Never claim completion until the latest revision",
+    );
+    expect(profile.budget).toMatchObject({
+      maxFileMutations: 8,
+      maxClientResumes: 6,
+      maxNoProgressRepeats: 2,
+    });
   });
 
   it("fails explicitly when a frozen digest is unavailable", () => {

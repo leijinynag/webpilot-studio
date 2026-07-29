@@ -27,6 +27,10 @@ import type {
   AgentRunStatus,
   TranscriptMessage,
 } from "@/domains/agent/types";
+import {
+  buildVerificationDirective,
+  getPreviewVerificationState,
+} from "@/domains/agent/verification";
 
 type AgentStorePort = Pick<
   AgentStore<PgQueryResultHKT>,
@@ -140,11 +144,15 @@ export class AgentOrchestrator {
         const turn = await this.streamModelTurn({
           run,
           transcript,
-          systemPrompt: profiles.prompt.content,
+          systemPrompt: [
+            profiles.prompt.content,
+            buildVerificationDirective(run, transcript),
+          ].join("\n\n"),
           tools: profiles.toolset.tools,
           signal: input.signal,
         });
         const nextUsage = {
+          ...run.usage,
           modelTurns: run.usage.modelTurns + 1,
           inputTokens: run.usage.inputTokens + turn.inputTokens,
           outputTokens: run.usage.outputTokens + turn.outputTokens,
@@ -195,8 +203,35 @@ export class AgentOrchestrator {
         }
 
         if (turn.toolCalls.length === 0) {
-          await this.finishRun(run, "succeeded");
-          return;
+          const latestTranscript = await this.store.listTranscript({
+            ownerId: run.ownerId,
+            conversationId: run.conversationId,
+          });
+          const verification = getPreviewVerificationState(
+            run,
+            latestTranscript,
+          );
+
+          if (verification.ok) {
+            await this.finishRun(run, "succeeded");
+            return;
+          }
+
+          // Provider 可以生成“已经完成”之类的文本，但状态机只相信同 revision
+          // 的 run_preview 成功证据。事件会让 UI 明确显示本轮被门禁拦下。
+          await this.store.appendEvent({
+            runId: run.id,
+            type: "verification.completion_blocked",
+            payload: {
+              currentRevision: run.currentRevision,
+              attempted: verification.attempted,
+              previewRevision: verification.revision,
+              ...(verification.failure
+                ? { failure: verification.failure }
+                : {}),
+            },
+          });
+          continue;
         }
 
         enforceOneMutationPerTurn(turn.toolCalls);
@@ -237,6 +272,27 @@ export class AgentOrchestrator {
               leaseId,
             });
             return;
+          }
+
+          if (isFileMutationTool(toolCall.name)) {
+            if (run.usage.fileMutations >= run.budget.maxFileMutations) {
+              throw new AgentError(
+                AGENT_ERROR_CODES.budgetExhausted,
+                "Agent 已达到文件 mutation 次数上限。",
+                409,
+              );
+            }
+
+            // mutation 预算在副作用前消费。即使参数或 Repository 操作失败，
+            // 这次有风险的写操作尝试仍属于本 Run 的资源使用。
+            run = await this.store.updateRunProgress({
+              ownerId: run.ownerId,
+              runId: run.id,
+              usage: {
+                ...run.usage,
+                fileMutations: run.usage.fileMutations + 1,
+              },
+            });
           }
 
           const result = await this.fileTools.execute({
@@ -444,6 +500,14 @@ export class AgentOrchestrator {
           requestedRevision: argumentsResult.data.revision,
           currentRevision: input.run.currentRevision,
         },
+      );
+    }
+
+    if (input.run.usage.clientResumes >= input.run.budget.maxClientResumes) {
+      throw new AgentError(
+        AGENT_ERROR_CODES.budgetExhausted,
+        "Agent 已达到浏览器验证恢复次数上限。",
+        409,
       );
     }
 
@@ -678,6 +742,14 @@ function enforceOneMutationPerTurn(
       409,
     );
   }
+}
+
+function isFileMutationTool(toolName: string): boolean {
+  return (
+    toolName === FILE_TOOL_NAMES.writeFile ||
+    toolName === FILE_TOOL_NAMES.deleteFile ||
+    toolName === FILE_TOOL_NAMES.renameFile
+  );
 }
 
 function assertWithinWallTime(run: AgentRunRecord, startedAt: number): void {
