@@ -4,6 +4,8 @@ import { AGENT_ERROR_CODES } from "@/domains/agent/errors";
 import {
   assertFrozenProfilesAvailable,
   createFrozenAgentProfile,
+  resolveSystemPromptProfile,
+  resolveToolsetProfile,
 } from "@/domains/agent/profiles";
 
 const repositoryCapability = {
@@ -28,7 +30,8 @@ describe("Agent profiles", () => {
 
     expect(profile.promptDigest).toMatch(/^[a-f0-9]{64}$/);
     expect(profile.toolsetDigest).toMatch(/^[a-f0-9]{64}$/);
-    expect(profile.promptProfile).toBe("webpilot-system-v3");
+    expect(profile.promptProfile).toBe("webpilot-system-v4");
+    expect(profile.toolsetProfile).toBe("webpilot-browser-v3");
     const resolved = assertFrozenProfilesAvailable({
       promptProfile: profile.promptProfile,
       promptDigest: profile.promptDigest,
@@ -43,16 +46,50 @@ describe("Agent profiles", () => {
     });
     expect(resolved.prompt.content).toContain("Current frozen revision: 3");
     expect(resolved.prompt.content).toContain(
-      "evidence -> search -> read -> one mutation -> run_preview",
+      "evidence -> search -> read -> one mutation -> automatic replay or browser_verify",
     );
     expect(resolved.prompt.content).toContain(
-      "Never claim completion until the latest revision",
+      "Never claim completion until the current revision",
     );
     expect(profile.budget).toMatchObject({
       maxFileMutations: 8,
       maxClientResumes: 6,
       maxNoProgressRepeats: 2,
     });
+    expect(resolved.toolset.tools.map((tool) => tool.name)).toEqual(
+      expect.arrayContaining(["run_preview", "browser_verify"]),
+    );
+  });
+
+  it("仍可解析冻结的 M3 Prompt 与 Preview Toolset", () => {
+    const prompt = resolveSystemPromptProfile("webpilot-system-v3", {
+      locale: "zh-CN",
+      projectId: "project-legacy",
+      revision: 7,
+      repositoryCapability,
+    });
+    const toolset = resolveToolsetProfile("webpilot-preview-v2");
+
+    const resolved = assertFrozenProfilesAvailable({
+      promptProfile: prompt.id,
+      promptDigest: prompt.digest,
+      toolsetProfile: toolset.id,
+      toolsetDigest: toolset.digest,
+      promptContext: {
+        locale: "zh-CN",
+        projectId: "project-legacy",
+        revision: 7,
+        repositoryCapability,
+      },
+    });
+
+    expect(resolved.prompt.content).toContain("one mutation -> run_preview");
+    expect(resolved.toolset.tools.map((tool) => tool.name)).toContain(
+      "run_preview",
+    );
+    expect(resolved.toolset.tools.map((tool) => tool.name)).not.toContain(
+      "browser_verify",
+    );
   });
 
   it("fails explicitly when a frozen digest is unavailable", () => {

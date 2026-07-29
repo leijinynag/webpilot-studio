@@ -1,10 +1,15 @@
 import { describe, expect, it } from "vitest";
 
+import {
+  browserVerifyToolArgumentsSchema,
+  type BrowserVerifyResult,
+} from "@/domains/agent/client-tools";
 import type { RunPreviewResult } from "@/domains/agent/evidence";
 import type { AgentRunRecord, TranscriptMessage } from "@/domains/agent/types";
 import {
   buildVerificationDirective,
   deriveVerificationFailure,
+  evaluateBrowserVerification,
   getPreviewVerificationState,
 } from "@/domains/agent/verification";
 
@@ -109,6 +114,102 @@ function createRuntimeFailure(revision: number): RunPreviewResult {
   };
 }
 
+function createBrowserResult(
+  revision: number,
+  overrides: Partial<BrowserVerifyResult> = {},
+): BrowserVerifyResult {
+  return {
+    ok: true,
+    toolName: "browser_verify",
+    verificationRunId: "00000000-0000-4000-8000-000000000001",
+    revision,
+    replayCount: 0,
+    summary: "客户端声称验证通过。",
+    build: {
+      revision,
+      install: { status: "succeeded", exitCode: 0 },
+      devServer: {
+        status: "ready",
+        port: 5173,
+        url: "https://preview.example",
+      },
+      errors: [],
+      logs: [],
+    },
+    runtime: {
+      revision,
+      rendered: true,
+      events: [{ type: "RENDER_OK", timestamp: 100 }],
+      diagnostics: [],
+    },
+    console: {
+      revision,
+      entries: [],
+      totalBytes: 0,
+      truncated: false,
+    },
+    browser: {
+      revision,
+      sessionId: "session-1",
+      ok: true,
+      steps: [
+        {
+          index: 0,
+          action: "click",
+          startedAt: 100,
+          durationMs: 10,
+          target: { strategy: "test_id", value: "submit" },
+          status: "passed",
+          message: "已点击提交按钮。",
+          error: null,
+        },
+        {
+          index: 1,
+          action: "assert_text",
+          startedAt: 120,
+          durationMs: 10,
+          target: null,
+          status: "passed",
+          message: "页面包含成功文本。",
+          error: null,
+        },
+      ],
+      failedStep: null,
+      domContext: null,
+    },
+    network: {
+      revision,
+      sessionId: "session-1",
+      entries: [],
+      totalBytes: 0,
+      truncated: false,
+      includesSuccessful: false,
+    },
+    acceptedNetworkFailures: [],
+    checks: {
+      build: true,
+      runtime: true,
+      console: true,
+      network: true,
+      actions: true,
+      assertions: true,
+      revision: true,
+    },
+    ...overrides,
+  };
+}
+
+const smokeSteps = [
+  {
+    action: "click" as const,
+    target: { strategy: "test_id" as const, value: "submit" },
+  },
+  {
+    action: "assert_text" as const,
+    text: "保存成功",
+  },
+];
+
 describe("Agent preview verification", () => {
   it("把 Runtime TypeError 归一为稳定的 VerificationFailure", () => {
     const first = deriveVerificationFailure(createRuntimeFailure(3));
@@ -174,5 +275,174 @@ describe("Agent preview verification", () => {
     expect(buildVerificationDirective(createRun(4), transcript)).toContain(
       "latest preview covered revision 3",
     );
+  });
+});
+
+describe("Browser verification", () => {
+  it("使用 strict schema 拒绝未知字段和缺少断言的 smoke plan", () => {
+    expect(
+      browserVerifyToolArgumentsSchema.safeParse({
+        revision: 1,
+        steps: [
+          {
+            action: "click",
+            target: { strategy: "test_id", value: "submit" },
+          },
+        ],
+      }).success,
+    ).toBe(false);
+    expect(
+      browserVerifyToolArgumentsSchema.safeParse({
+        revision: 1,
+        steps: [
+          {
+            action: "assert_text",
+            text: "保存成功",
+            unexpected: true,
+          },
+        ],
+      }).success,
+    ).toBe(false);
+  });
+
+  it("只豁免 method、origin、path 和 status 全部匹配的网络失败", () => {
+    const networkFailure = {
+      requestType: "fetch" as const,
+      method: "POST",
+      status: 500,
+      durationMs: 20,
+      timestamp: 130,
+      url: {
+        origin: "https://api.example.com",
+        path: "/health",
+        queryKeys: [],
+      },
+      failed: true,
+      error: null,
+    };
+    const result = createBrowserResult(3, {
+      network: {
+        revision: 3,
+        sessionId: "session-1",
+        entries: [networkFailure],
+        totalBytes: 128,
+        truncated: false,
+        includesSuccessful: false,
+      },
+    });
+
+    const accepted = evaluateBrowserVerification({
+      result,
+      submittedRevision: 3,
+      currentRevision: 3,
+      smokeSteps,
+      acceptedNetworkFailures: [
+        {
+          method: "POST",
+          origin: "https://api.example.com",
+          path: "/health",
+          statuses: [500],
+        },
+      ],
+    });
+    const wrongStatus = evaluateBrowserVerification({
+      result,
+      submittedRevision: 3,
+      currentRevision: 3,
+      smokeSteps,
+      acceptedNetworkFailures: [
+        {
+          method: "POST",
+          origin: "https://api.example.com",
+          path: "/health",
+          statuses: [404],
+        },
+      ],
+    });
+
+    expect(accepted.result.checks.network).toBe(true);
+    expect(accepted.result.ok).toBe(true);
+    expect(wrongStatus.result.checks.network).toBe(false);
+    expect(wrongStatus.failure).toMatchObject({
+      code: "network_failed",
+      stage: "network",
+    });
+  });
+
+  it("忽略客户端伪造的 ok/checks，并依据失败断言重新判定", () => {
+    const forged = createBrowserResult(4, {
+      browser: {
+        revision: 4,
+        sessionId: "session-1",
+        ok: false,
+        steps: [
+          {
+            index: 0,
+            action: "click",
+            startedAt: 100,
+            durationMs: 10,
+            target: { strategy: "test_id", value: "submit" },
+            status: "passed",
+            message: "已点击提交按钮。",
+            error: null,
+          },
+          {
+            index: 1,
+            action: "assert_text",
+            startedAt: 120,
+            durationMs: 500,
+            target: null,
+            status: "failed",
+            message: "页面未出现保存成功。",
+            error: {
+              code: "assertion_failed",
+              message: "页面未出现保存成功。",
+            },
+          },
+        ],
+        failedStep: 1,
+        domContext: null,
+      },
+    });
+
+    const evaluation = evaluateBrowserVerification({
+      result: forged,
+      submittedRevision: 4,
+      currentRevision: 4,
+      smokeSteps,
+      acceptedNetworkFailures: [],
+    });
+
+    expect(evaluation.result.ok).toBe(false);
+    expect(evaluation.result.checks.assertions).toBe(false);
+    expect(evaluation.failure).toMatchObject({
+      code: "browser_assertion_failed",
+      stage: "assertion",
+    });
+  });
+
+  it("任一 Evidence revision 过期时拒绝通过当前 revision 门禁", () => {
+    const stale = createBrowserResult(5, {
+      runtime: {
+        revision: 4,
+        rendered: true,
+        events: [{ type: "RENDER_OK", timestamp: 100 }],
+        diagnostics: [],
+      },
+    });
+    const evaluation = evaluateBrowserVerification({
+      result: stale,
+      submittedRevision: 5,
+      currentRevision: 5,
+      smokeSteps,
+      acceptedNetworkFailures: [],
+    });
+
+    expect(evaluation.result.checks.revision).toBe(false);
+    expect(evaluation.result.ok).toBe(false);
+    expect(evaluation.failure).toMatchObject({
+      code: "stale_revision",
+      stage: "revision",
+    });
   });
 });

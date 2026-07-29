@@ -1,7 +1,7 @@
 import { after } from "next/server";
 import { z } from "zod";
 
-import { clientToolResultRequestSchema } from "@/domains/agent/evidence";
+import { clientToolResultRequestSchema } from "@/domains/agent/client-tools";
 import { requireRequestOwner } from "@/domains/auth/request-owner";
 import { launchAgentRun } from "@/infrastructure/agent/runtime";
 import {

@@ -29,6 +29,13 @@
       "when": 1785249926403,
       "tag": "0003_fine_pepper_potts",
       "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1785330723705,
+      "tag": "0004_black_golden_guardian",
+      "breakpoints": true
     }
   ]
 }

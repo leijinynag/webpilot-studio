@@ -3792,6 +3792,228 @@ html[data-theme="dark"] .ide-surface.is-preview {
   white-space: nowrap;
 }
 
+.agent-verification-history {
+  min-width: 0;
+  border-top: 1px solid var(--border-soft);
+}
+
+.agent-verification-history summary {
+  display: flex;
+  min-height: 28px;
+  cursor: pointer;
+  list-style: none;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--muted-foreground);
+  font-size: 0.68rem;
+  font-weight: 700;
+}
+
+.agent-verification-history summary::-webkit-details-marker {
+  display: none;
+}
+
+.agent-verification-history summary::before {
+  width: 6px;
+  height: 6px;
+  flex: 0 0 auto;
+  border-right: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
+  content: "";
+  transform: rotate(-45deg);
+  transition: transform var(--motion-fast) ease;
+}
+
+.agent-verification-history[open] summary::before {
+  transform: rotate(45deg);
+}
+
+.agent-verification-history summary span {
+  margin-right: auto;
+}
+
+.agent-verification-history summary small {
+  color: var(--faint-foreground);
+  font-size: 0.62rem;
+  font-weight: 600;
+}
+
+.agent-verification-runs {
+  display: grid;
+  gap: 8px;
+  padding: 2px 0 6px 14px;
+}
+
+.agent-verification-run {
+  display: grid;
+  min-width: 0;
+  gap: 7px;
+  padding-left: 9px;
+  border-left: 2px solid var(--border);
+}
+
+.agent-verification-run.is-passed {
+  border-left-color: color-mix(in srgb, var(--success) 74%, var(--border));
+}
+
+.agent-verification-run.is-failed {
+  border-left-color: color-mix(in srgb, var(--destructive) 74%, var(--border));
+}
+
+.agent-verification-run.is-running {
+  border-left-color: color-mix(in srgb, var(--warning) 74%, var(--border));
+}
+
+.agent-verification-run header {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.agent-verification-run header span {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: 5px;
+  overflow: hidden;
+  color: var(--foreground);
+  font-size: 0.67rem;
+  font-weight: 750;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-verification-run header svg {
+  width: 12px;
+  height: 12px;
+  flex: 0 0 auto;
+}
+
+.agent-verification-run.is-passed header svg {
+  color: var(--success);
+}
+
+.agent-verification-run.is-failed header svg {
+  color: var(--destructive);
+}
+
+.agent-verification-run.is-running header svg {
+  color: var(--warning);
+}
+
+.agent-verification-run header small {
+  flex: 0 0 auto;
+  color: var(--faint-foreground);
+  font-size: 0.6rem;
+  white-space: nowrap;
+}
+
+.agent-verification-checks {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 4px 6px;
+}
+
+.agent-verification-checks > span {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: 3px;
+  color: var(--faint-foreground);
+  font-size: 0.59rem;
+  white-space: nowrap;
+}
+
+.agent-verification-checks > span svg {
+  width: 10px;
+  height: 10px;
+  flex: 0 0 auto;
+}
+
+.agent-verification-checks > span.is-passed {
+  color: var(--success);
+}
+
+.agent-verification-checks > span.is-failed {
+  color: var(--destructive);
+}
+
+.agent-verification-checks .check-pending {
+  width: 6px;
+  height: 6px;
+  flex: 0 0 auto;
+  border: 1px solid currentColor;
+  border-radius: 50%;
+}
+
+.agent-verification-steps {
+  display: grid;
+  gap: 5px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.agent-verification-steps li {
+  display: grid;
+  grid-template-columns: 17px minmax(0, 1fr);
+  gap: 6px;
+  align-items: start;
+  min-width: 0;
+}
+
+.agent-verification-steps li > span {
+  display: grid;
+  width: 17px;
+  height: 17px;
+  place-items: center;
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  color: var(--muted-foreground);
+  font-size: 0.56rem;
+  font-weight: 750;
+}
+
+.agent-verification-steps li.is-failed > span {
+  border-color: color-mix(in srgb, var(--destructive) 52%, var(--border));
+  color: var(--destructive);
+}
+
+.agent-verification-steps li div {
+  display: grid;
+  min-width: 0;
+  gap: 1px;
+}
+
+.agent-verification-steps strong {
+  color: var(--foreground);
+  font-size: 0.64rem;
+  font-weight: 700;
+}
+
+.agent-verification-steps small {
+  overflow-wrap: anywhere;
+  color: var(--faint-foreground);
+  font-size: 0.59rem;
+  line-height: 1.35;
+}
+
+.agent-verification-pending,
+.agent-verification-summary {
+  margin: 0;
+  overflow-wrap: anywhere;
+  color: var(--faint-foreground);
+  font-size: 0.61rem;
+  line-height: 1.4;
+}
+
+.agent-verification-summary {
+  color: var(--muted-foreground);
+}
+
 .agent-run-status .button {
   justify-self: start;
 }

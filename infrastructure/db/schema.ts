@@ -1,6 +1,7 @@
 import { sql } from "drizzle-orm";
 import {
   bigint,
+  boolean,
   check,
   index,
   integer,
@@ -79,6 +80,23 @@ export const agentEvidenceKind = pgEnum("agent_evidence_kind", [
   "build",
   "runtime",
   "console",
+]);
+
+export const verificationRunStatus = pgEnum("verification_run_status", [
+  "pending",
+  "running",
+  "passed",
+  "failed",
+]);
+
+export const verificationRunSource = pgEnum("verification_run_source", [
+  "agent",
+  "replay",
+]);
+
+export const verificationStepStatus = pgEnum("verification_step_status", [
+  "passed",
+  "failed",
 ]);
 
 export const projects = pgTable(
@@ -528,6 +546,120 @@ export const agentEvidence = pgTable(
   ],
 );
 
+export const verificationRuns = pgTable(
+  "verification_runs",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    runId: uuid("run_id")
+      .notNull()
+      .references(() => agentRuns.id, { onDelete: "cascade" }),
+    toolCallId: text("tool_call_id").notNull(),
+    projectId: uuid("project_id")
+      .notNull()
+      .references(() => projects.id, { onDelete: "cascade" }),
+    ownerId: text("owner_id").notNull(),
+    revision: integer("revision").notNull(),
+    status: verificationRunStatus("status").notNull().default("pending"),
+    source: verificationRunSource("source").notNull(),
+    replayCount: integer("replay_count").notNull().default(0),
+    // 原始 smoke plan 与网络白名单作为可自动重放的事实保存，不能只留在 Transcript。
+    smokeSteps: jsonb("smoke_steps")
+      .$type<Array<Record<string, unknown>>>()
+      .notNull(),
+    acceptedNetworkFailures: jsonb("accepted_network_failures")
+      .$type<Array<Record<string, unknown>>>()
+      .notNull()
+      .default([]),
+    buildEvidence: jsonb("build_evidence").$type<Record<string, unknown>>(),
+    runtimeEvidence: jsonb("runtime_evidence").$type<Record<string, unknown>>(),
+    consoleEvidence: jsonb("console_evidence").$type<Record<string, unknown>>(),
+    browserEvidence: jsonb("browser_evidence").$type<Record<string, unknown>>(),
+    networkEvidence: jsonb("network_evidence").$type<Record<string, unknown>>(),
+    buildOk: boolean("build_ok"),
+    runtimeOk: boolean("runtime_ok"),
+    consoleOk: boolean("console_ok"),
+    networkOk: boolean("network_ok"),
+    actionsOk: boolean("actions_ok"),
+    assertionsOk: boolean("assertions_ok"),
+    revisionOk: boolean("revision_ok"),
+    failedStep: integer("failed_step"),
+    summary: text("summary"),
+    startedAt: timestamp("started_at", {
+      withTimezone: true,
+      mode: "date",
+    }),
+    completedAt: timestamp("completed_at", {
+      withTimezone: true,
+      mode: "date",
+    }),
+    createdAt: timestamp("created_at", {
+      withTimezone: true,
+      mode: "date",
+    })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    uniqueIndex("verification_runs_run_call_uidx").on(
+      table.runId,
+      table.toolCallId,
+    ),
+    index("verification_runs_run_revision_idx").on(
+      table.runId,
+      table.revision,
+      table.createdAt,
+    ),
+    index("verification_runs_project_revision_idx").on(
+      table.projectId,
+      table.revision,
+      table.createdAt,
+    ),
+    check("verification_runs_revision_check", sql`${table.revision} >= 0`),
+    check(
+      "verification_runs_replay_count_check",
+      sql`${table.replayCount} >= 0`,
+    ),
+    check(
+      "verification_runs_failed_step_check",
+      sql`${table.failedStep} is null or ${table.failedStep} >= 0`,
+    ),
+  ],
+);
+
+export const verificationSteps = pgTable(
+  "verification_steps",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    verificationRunId: uuid("verification_run_id")
+      .notNull()
+      .references(() => verificationRuns.id, { onDelete: "cascade" }),
+    stepIndex: integer("step_index").notNull(),
+    action: text("action").notNull(),
+    target: jsonb("target").$type<Record<string, unknown>>(),
+    status: verificationStepStatus("status").notNull(),
+    startedAt: timestamp("started_at", {
+      withTimezone: true,
+      mode: "date",
+    }).notNull(),
+    durationMs: integer("duration_ms").notNull(),
+    message: text("message").notNull(),
+    error: jsonb("error").$type<Record<string, unknown>>(),
+  },
+  (table) => [
+    uniqueIndex("verification_steps_run_index_uidx").on(
+      table.verificationRunId,
+      table.stepIndex,
+    ),
+    index("verification_steps_run_status_idx").on(
+      table.verificationRunId,
+      table.status,
+      table.stepIndex,
+    ),
+    check("verification_steps_index_check", sql`${table.stepIndex} >= 0`),
+    check("verification_steps_duration_check", sql`${table.durationMs} >= 0`),
+  ],
+);
+
 export const databaseSchema = {
   projects,
   projectFileBlobs,
@@ -540,6 +672,8 @@ export const databaseSchema = {
   agentRunEvents,
   toolInvocations,
   agentEvidence,
+  verificationRuns,
+  verificationSteps,
 };
 
 export type ProjectRow = typeof projects.$inferSelect;

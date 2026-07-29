@@ -25,7 +25,9 @@ describe("database migration", () => {
             'project_revisions',
             'project_revision_files',
             'tool_invocations',
-            'transcript_messages'
+            'transcript_messages',
+            'verification_runs',
+            'verification_steps'
           )
         order by table_name
       `);
@@ -42,6 +44,8 @@ describe("database migration", () => {
         "projects",
         "tool_invocations",
         "transcript_messages",
+        "verification_runs",
+        "verification_steps",
       ]);
     } finally {
       await testDatabase.close();

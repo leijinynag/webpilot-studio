@@ -196,32 +196,3 @@ export const runPreviewToolArgumentsSchema = z
 export type RunPreviewToolArguments = z.infer<
   typeof runPreviewToolArgumentsSchema
 >;
-
-export const clientToolRequestSchema = z
-  .object({
-    runId: z.uuid(),
-    projectId: z.uuid(),
-    toolCallId: z.string().min(1).max(500),
-    toolName: z.literal(RUN_PREVIEW_TOOL_NAME),
-    idempotencyKey: z.string().min(1).max(1_000),
-    revision: z.number().int().nonnegative(),
-    arguments: runPreviewToolArgumentsSchema,
-  })
-  .strict();
-
-export type ClientToolRequest = z.infer<typeof clientToolRequestSchema>;
-
-export const clientToolResultRequestSchema = z
-  .object({
-    projectId: z.uuid(),
-    toolCallId: z.string().min(1).max(500),
-    toolName: z.literal(RUN_PREVIEW_TOOL_NAME),
-    idempotencyKey: z.string().min(1).max(1_000),
-    revision: z.number().int().nonnegative(),
-    result: runPreviewResultSchema,
-  })
-  .strict();
-
-export type ClientToolResultRequest = z.infer<
-  typeof clientToolResultRequestSchema
->;

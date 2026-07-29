@@ -282,6 +282,8 @@ export type AgentConversationSnapshot = {
   runs: AgentRunRecord[];
   events: AgentRunEvent[];
   tools: ToolInvocationRecord[];
+  verificationRuns: VerificationRunRecord[];
+  verificationSteps: VerificationStepRecord[];
 };
 
 export type ToolInvocationRecord = {
@@ -300,4 +302,48 @@ export type ToolInvocationRecord = {
   createdAt: Date;
   startedAt: Date | null;
   completedAt: Date | null;
+};
+
+export type VerificationRunRecord = {
+  id: string;
+  runId: string;
+  toolCallId: string;
+  projectId: string;
+  ownerId: string;
+  revision: number;
+  status: "pending" | "running" | "passed" | "failed";
+  source: "agent" | "replay";
+  replayCount: number;
+  smokeSteps: Array<Record<string, unknown>>;
+  acceptedNetworkFailures: Array<Record<string, unknown>>;
+  buildEvidence: Record<string, unknown> | null;
+  runtimeEvidence: Record<string, unknown> | null;
+  consoleEvidence: Record<string, unknown> | null;
+  browserEvidence: Record<string, unknown> | null;
+  networkEvidence: Record<string, unknown> | null;
+  buildOk: boolean | null;
+  runtimeOk: boolean | null;
+  consoleOk: boolean | null;
+  networkOk: boolean | null;
+  actionsOk: boolean | null;
+  assertionsOk: boolean | null;
+  revisionOk: boolean | null;
+  failedStep: number | null;
+  summary: string | null;
+  startedAt: Date | null;
+  completedAt: Date | null;
+  createdAt: Date;
+};
+
+export type VerificationStepRecord = {
+  id: string;
+  verificationRunId: string;
+  stepIndex: number;
+  action: string;
+  target: Record<string, unknown> | null;
+  status: "passed" | "failed";
+  startedAt: Date;
+  durationMs: number;
+  message: string;
+  error: Record<string, unknown> | null;
 };

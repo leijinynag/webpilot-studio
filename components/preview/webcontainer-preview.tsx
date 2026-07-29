@@ -27,15 +27,30 @@ import {
 import { buildProjectTemplate } from "@/domains/project/template";
 import type { ProjectFileSnapshot } from "@/domains/project/types";
 import {
-  clientToolRequestSchema,
+  type BrowserBridgeResponse,
+  type BrowserCommand,
+  type BrowserExecutionEvidence,
+  type BrowserStep,
+  type NetworkEvidence,
+} from "@/domains/agent/browser-evidence";
+import {
+  BROWSER_VERIFY_TOOL_NAME,
+  type BrowserVerifyResult,
+} from "@/domains/agent/client-tools";
+import {
   RUNTIME_BRIDGE_CHANNEL,
   RUNTIME_BRIDGE_PROBE_TYPE,
   RUNTIME_BRIDGE_VERSION,
-  type ClientToolRequest,
+  type RunPreviewResult,
   type RuntimeProbe,
   runtimeEnvelopeSchema,
-  type RunPreviewResult,
 } from "@/domains/agent/evidence";
+import {
+  clientToolRequestSchema,
+  type ClientToolRequest,
+  type ClientToolResult,
+} from "@/domains/agent/client-tools";
+import { BrowserBridgeController } from "@/infrastructure/webcontainer/browser-bridge-controller";
 import { PreviewEvidenceCollector } from "@/infrastructure/webcontainer/evidence-collector";
 import { WEB_CONTAINER_PHASE_LABELS } from "@/infrastructure/webcontainer/lifecycle";
 import { injectRuntimeBridge } from "@/infrastructure/webcontainer/runtime-bridge";
@@ -52,7 +67,7 @@ export function WebContainerPreview({
   files: readonly ProjectFileSnapshot[];
   onClientToolResult?: (
     request: ClientToolRequest,
-    result: RunPreviewResult,
+    result: ClientToolResult,
   ) => void | Promise<void>;
   projectId: string;
   revision: number;
@@ -66,6 +81,7 @@ export function WebContainerPreview({
   );
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const evidenceCollectorRef = useRef<PreviewEvidenceCollector | null>(null);
+  const browserBridgeControllerRef = useRef(new BrowserBridgeController());
   const submittedToolCallIdsRef = useRef(new Set<string>());
   const [frameRevision, setFrameRevision] = useState(0);
   const [compactViewport, setCompactViewport] = useState(false);
@@ -117,7 +133,29 @@ export function WebContainerPreview({
     let cancelled = false;
     evidenceCollectorRef.current = collector;
 
-    async function executeRunPreview() {
+    function sendBrowserCommand(input: {
+      command: BrowserCommand;
+      iframe: HTMLIFrameElement;
+      previewUrl: string;
+      sessionId: string;
+      timeoutMs?: number;
+    }) {
+      return browserBridgeControllerRef.current.request({
+        ...input,
+        revision: request.revision,
+        runId: request.runId,
+      });
+    }
+
+    async function executeClientTool() {
+      let browserResult: BrowserExecutionEvidence | null = null;
+      let networkResult: NetworkEvidence | null = null;
+      let browserSessionStarted = false;
+      const browserSessionId =
+        request.toolName === BROWSER_VERIFY_TOOL_NAME
+          ? request.verificationRunId
+          : null;
+
       try {
         await webContainerRuntimeManager.start(
           instrumentedTree,
@@ -140,29 +178,156 @@ export function WebContainerPreview({
           collector,
           request,
           iframeRef,
-          timeoutMs: 3_000,
+          reloadFrame: () => {
+            setFrameRevision((current) => current + 1);
+          },
+          timeoutMs: 15_000,
         });
-        await delay(request.arguments.observationMs);
+
+        if (request.toolName === BROWSER_VERIFY_TOOL_NAME && browserSessionId) {
+          const previewUrl =
+            webContainerRuntimeManager.getSnapshot().previewUrl;
+          if (!previewUrl || !iframeRef.current) {
+            throw new Error("Preview 尚未就绪，无法执行浏览器冒烟步骤。");
+          }
+
+          await requireSuccessfulBrowserResponse(
+            await sendBrowserCommand({
+              command: { name: "start_session" },
+              iframe: iframeRef.current,
+              previewUrl,
+              sessionId: browserSessionId,
+            }),
+          );
+          browserSessionStarted = true;
+
+          // scan_dom 会建立仅在本次 session 内有效的 scan id，同时为动作失败时
+          // 的 DOM context 提供同一套目标语义。计划若只使用 test id/CSS 也安全。
+          await requireSuccessfulBrowserResponse(
+            await sendBrowserCommand({
+              command: { name: "scan_dom" },
+              iframe: iframeRef.current,
+              previewUrl,
+              sessionId: browserSessionId,
+            }),
+          );
+          const execution = await sendBrowserCommand({
+            command: {
+              name: "execute_steps",
+              steps: request.arguments.steps,
+            },
+            iframe: iframeRef.current,
+            previewUrl,
+            sessionId: browserSessionId,
+            timeoutMs: browserCommandTimeout(request.arguments.steps),
+          });
+          requireSuccessfulBrowserResponse(execution);
+          if (execution.commandName !== "execute_steps") {
+            throw new Error("Browser Bridge 返回了错误的步骤执行响应。");
+          }
+          browserResult = execution.result;
+
+          await delay(request.arguments.observationMs);
+          const network = await sendBrowserCommand({
+            command: { name: "get_network", includeSuccessful: false },
+            iframe: iframeRef.current,
+            previewUrl,
+            sessionId: browserSessionId,
+          });
+          requireSuccessfulBrowserResponse(network);
+          if (network.commandName !== "get_network") {
+            throw new Error("Browser Bridge 返回了错误的网络证据响应。");
+          }
+          networkResult = network.result;
+        } else {
+          await delay(request.arguments.observationMs);
+        }
 
         if (cancelled) {
           return;
         }
 
-        await submitResult(
-          collector.finish(webContainerRuntimeManager.getSnapshot()),
+        const previewResult = collector.finish(
+          webContainerRuntimeManager.getSnapshot(),
         );
-      } catch {
+        await submitResult(
+          request.toolName === BROWSER_VERIFY_TOOL_NAME
+            ? createBrowserVerifyResult({
+                browser:
+                  browserResult ??
+                  createBrowserBridgeFailure(
+                    request.revision,
+                    browserSessionId ?? request.verificationRunId,
+                    request.arguments.steps[0]?.action ?? "assert_visible",
+                    "Browser Bridge 没有返回步骤执行结果。",
+                  ),
+                network:
+                  networkResult ??
+                  createEmptyNetworkEvidence(
+                    request.revision,
+                    browserSessionId ?? request.verificationRunId,
+                  ),
+                preview: previewResult,
+                request,
+              })
+            : previewResult,
+        );
+      } catch (error) {
         if (!cancelled) {
           // 安装、构建或 dev server 失败已经进入 Manager snapshot。
           // 即使没有 iframe 消息，也必须返回结构化 BuildEvidence 给 Agent。
-          await submitResult(
-            collector.finish(webContainerRuntimeManager.getSnapshot()),
+          const previewResult = collector.finish(
+            webContainerRuntimeManager.getSnapshot(),
           );
+          await submitResult(
+            request.toolName === BROWSER_VERIFY_TOOL_NAME
+              ? createBrowserVerifyResult({
+                  browser:
+                    browserResult ??
+                    createBrowserBridgeFailure(
+                      request.revision,
+                      browserSessionId ?? request.verificationRunId,
+                      request.arguments.steps[0]?.action ?? "assert_visible",
+                      error instanceof Error
+                        ? error.message
+                        : "浏览器冒烟执行失败。",
+                    ),
+                  network:
+                    networkResult ??
+                    createEmptyNetworkEvidence(
+                      request.revision,
+                      browserSessionId ?? request.verificationRunId,
+                    ),
+                  preview: previewResult,
+                  request,
+                })
+              : previewResult,
+          );
+        }
+      } finally {
+        if (
+          browserSessionStarted &&
+          browserSessionId &&
+          iframeRef.current &&
+          webContainerRuntimeManager.getSnapshot().previewUrl
+        ) {
+          try {
+            await sendBrowserCommand({
+              command: { name: "end_session" },
+              iframe: iframeRef.current,
+              previewUrl:
+                webContainerRuntimeManager.getSnapshot().previewUrl ?? "",
+              sessionId: browserSessionId,
+            });
+          } catch {
+            // 证据已经在 end_session 前读取。结束命令失败只意味着 iframe 将随
+            // 下一次重建清理，不能覆盖已经完成的验证结果。
+          }
         }
       }
     }
 
-    async function submitResult(result: RunPreviewResult) {
+    async function submitResult(result: ClientToolResult) {
       if (
         cancelled ||
         submittedToolCallIdsRef.current.has(request.toolCallId)
@@ -179,7 +344,7 @@ export function WebContainerPreview({
       }
     }
 
-    void executeRunPreview();
+    void executeClientTool();
 
     return () => {
       cancelled = true;
@@ -188,6 +353,11 @@ export function WebContainerPreview({
       }
     };
   }, [clientToolRequest, onClientToolResult, projectId, projectTree, revision]);
+
+  useEffect(() => {
+    const controller = browserBridgeControllerRef.current;
+    return () => controller.dispose();
+  }, []);
 
   useEffect(() => {
     function recordDiagnostic(
@@ -207,6 +377,10 @@ export function WebContainerPreview({
     }
 
     function handleRuntimeMessage(event: MessageEvent<unknown>) {
+      if (browserBridgeControllerRef.current.handleMessage(event)) {
+        return;
+      }
+
       const collector = evidenceCollectorRef.current;
       const requestResult =
         clientToolRequestSchema.safeParse(clientToolRequest);
@@ -460,6 +634,137 @@ export function WebContainerPreview({
   );
 }
 
+type BrowserResponsePayload = BrowserBridgeResponse["payload"];
+
+function requireSuccessfulBrowserResponse(
+  payload: BrowserResponsePayload,
+): asserts payload is Extract<BrowserResponsePayload, { ok: true }> {
+  if (!payload.ok) {
+    throw new Error(payload.error.message);
+  }
+}
+
+function browserCommandTimeout(steps: readonly BrowserStep[]): number {
+  // execute_steps 在 iframe 内串行执行。宿主 timeout 要覆盖所有步骤的独立
+  // timeout，再留出消息排队余量，否则合法的长 smoke plan 会被父页面提前中断。
+  const stepBudget = steps.reduce(
+    (total, step) => total + (step.timeoutMs ?? 2_000),
+    0,
+  );
+  return Math.min(110_000, Math.max(6_000, stepBudget + 2_000));
+}
+
+function createBrowserVerifyResult(input: {
+  browser: BrowserExecutionEvidence;
+  network: NetworkEvidence;
+  preview: RunPreviewResult;
+  request: Extract<ClientToolRequest, { toolName: "browser_verify" }>;
+}): BrowserVerifyResult {
+  const assertionActions = new Set([
+    "assert_text",
+    "assert_visible",
+    "assert_url",
+  ]);
+  const resultByIndex = new Map(
+    input.browser.steps.map((step) => [step.index, step]),
+  );
+  const actions = input.request.arguments.steps
+    .map((step, index) => ({ step, index }))
+    .filter(({ step }) => !assertionActions.has(step.action))
+    .every(({ index }) => resultByIndex.get(index)?.status === "passed");
+  const assertions = input.request.arguments.steps
+    .map((step, index) => ({ step, index }))
+    .filter(({ step }) => assertionActions.has(step.action))
+    .every(({ index }) => resultByIndex.get(index)?.status === "passed");
+  const checks = {
+    build:
+      input.preview.build.install.status === "succeeded" &&
+      input.preview.build.devServer.status === "ready" &&
+      input.preview.build.errors.length === 0,
+    runtime:
+      input.preview.runtime.rendered &&
+      !input.preview.runtime.events.some(
+        (event) =>
+          event.type === "RUNTIME_ERROR" ||
+          event.type === "UNHANDLED_REJECTION",
+      ),
+    console: !input.preview.console.entries.some(
+      (entry) => entry.level === "error",
+    ),
+    // 客户端只做即时投影；可接受网络失败匹配与 revision fence 均由服务端重算。
+    network: !input.network.entries.some((entry) => entry.failed),
+    actions,
+    assertions,
+    revision:
+      input.preview.revision === input.request.revision &&
+      input.browser.revision === input.request.revision &&
+      input.network.revision === input.request.revision,
+  };
+  const ok = Object.values(checks).every(Boolean);
+
+  return {
+    ok,
+    toolName: BROWSER_VERIFY_TOOL_NAME,
+    verificationRunId: input.request.verificationRunId,
+    revision: input.request.revision,
+    replayCount: input.request.replayCount,
+    summary: ok
+      ? "浏览器冒烟步骤已执行，原始证据等待服务端最终确认。"
+      : "浏览器冒烟步骤存在失败，原始证据等待服务端归一化。",
+    build: input.preview.build,
+    runtime: input.preview.runtime,
+    console: input.preview.console,
+    browser: input.browser,
+    network: input.network,
+    acceptedNetworkFailures: input.request.arguments.acceptedNetworkFailures,
+    checks,
+  };
+}
+
+function createBrowserBridgeFailure(
+  revision: number,
+  sessionId: string,
+  action: BrowserStep["action"],
+  message: string,
+): BrowserExecutionEvidence {
+  return {
+    revision,
+    sessionId,
+    ok: false,
+    steps: [
+      {
+        index: 0,
+        action,
+        startedAt: Date.now(),
+        durationMs: 0,
+        target: null,
+        status: "failed",
+        message,
+        error: {
+          code: "action_failed",
+          message,
+        },
+      },
+    ],
+    failedStep: 0,
+    domContext: null,
+  };
+}
+
+function createEmptyNetworkEvidence(
+  revision: number,
+  sessionId: string,
+): NetworkEvidence {
+  return {
+    revision,
+    sessionId,
+    entries: [],
+    totalBytes: 0,
+    truncated: false,
+    includesSuccessful: false,
+  };
+}
+
 function delay(milliseconds: number): Promise<void> {
   return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
 }
@@ -467,27 +772,48 @@ function delay(milliseconds: number): Promise<void> {
 async function waitForRuntimeRender({
   collector,
   iframeRef,
+  reloadFrame,
   request,
   timeoutMs,
 }: {
   collector: PreviewEvidenceCollector;
   iframeRef: React.RefObject<HTMLIFrameElement | null>;
+  reloadFrame: () => void;
   request: ClientToolRequest;
   timeoutMs: number;
 }): Promise<void> {
   const startedAt = Date.now();
+  let nextReloadAt = startedAt + 1_000;
 
-  while (
-    !collector.hasRendered() &&
-    webContainerRuntimeManager.getSnapshot().phase === "ready" &&
-    Date.now() - startedAt < timeoutMs
-  ) {
-    postRuntimeProbe(
-      iframeRef.current,
-      webContainerRuntimeManager.getSnapshot().previewUrl,
-      request,
-    );
+  while (!collector.hasRendered() && Date.now() - startedAt < timeoutMs) {
+    const snapshot = webContainerRuntimeManager.getSnapshot();
+    if (snapshot.phase !== "ready") {
+      throw new Error(
+        `Preview 在 Browser Bridge 就绪前进入 ${snapshot.phase} 状态。`,
+      );
+    }
+
+    // setFrameRevision 只负责请求 React 重建 iframe，提交到 DOM 仍是异步的。
+    // 持续向“当前” iframe 发送 probe，能跨过旧文档引用与新文档加载之间的短窗口；
+    // 收到带 Run/revision 的 RENDER_OK 后，才允许后续动作进入页面。
+    postRuntimeProbe(iframeRef.current, snapshot.previewUrl, request);
+
+    // WebContainer fs 写入完成后，Rsbuild 对 index.html 的重建仍可能晚到数百毫秒。
+    // 首次 iframe 因而可能加载到 Bridge 注入前的旧 HTML。确认窗口内按固定间隔
+    // 使用新 cache-busting URL 重建浏览上下文，直到当前 Run/revision 主动回执；
+    // 重试只发生在任何 smoke action 之前，不会重复用户交互。
+    if (Date.now() >= nextReloadAt) {
+      reloadFrame();
+      nextReloadAt = Date.now() + 1_000;
+    }
+
     await delay(100);
+  }
+
+  if (!collector.hasRendered()) {
+    throw new Error(
+      `Preview Runtime Bridge 在 ${timeoutMs}ms 内未确认首帧渲染。`,
+    );
   }
 }
 

@@ -1,7 +1,10 @@
 import { createHash } from "node:crypto";
 
 import { AGENT_ERROR_CODES, AgentError } from "@/domains/agent/errors";
-import { RUN_PREVIEW_TOOL_DEFINITION } from "@/domains/agent/client-tool-contracts";
+import {
+  BROWSER_VERIFY_TOOL_DEFINITION,
+  RUN_PREVIEW_TOOL_DEFINITION,
+} from "@/domains/agent/client-tool-contracts";
 import { FILE_TOOL_DEFINITIONS } from "@/domains/agent/tool-contracts";
 import type {
   AgentLocale,
@@ -15,6 +18,8 @@ const SYSTEM_PROMPT_PROFILE_V2_ID = "webpilot-system-v2";
 const FILE_TOOLSET_PROFILE_V1_ID = "webpilot-files-v1";
 export const SYSTEM_PROMPT_PROFILE_ID = "webpilot-system-v3";
 export const FILE_TOOLSET_PROFILE_ID = "webpilot-preview-v2";
+export const BROWSER_SYSTEM_PROMPT_PROFILE_ID = "webpilot-system-v4";
+export const BROWSER_TOOLSET_PROFILE_ID = "webpilot-browser-v3";
 // 领域层只记录“编码 Agent 模型配置”这一能力，不绑定具体供应商。
 // 当前可用的 DeepSeek adapter 在 infrastructure 层完成映射，未来替换
 // Provider 时不需要修改 Agent Run、Transcript 或 Orchestrator。
@@ -115,6 +120,38 @@ const SYSTEM_PROMPT_PROFILES = {
       "5. In the final response, summarize changed files and the successful evidence for the verified revision.",
     ].join("\n");
   },
+  [BROWSER_SYSTEM_PROMPT_PROFILE_ID]: (context: SystemPromptContext) => {
+    const responseLanguage =
+      context.locale === "zh-CN" ? "简体中文" : "English";
+
+    return [
+      "You are the coding agent inside WebPilot Studio.",
+      `Respond to the user in ${responseLanguage}.`,
+      `Repository storage: ${context.repositoryCapability.storageKind}.`,
+      `Project id: ${context.projectId}. Current frozen revision: ${context.revision}.`,
+      "",
+      "Repository rules:",
+      "1. Inspect with list_files or search_text, then read the current revision before mutating an existing file.",
+      "2. Perform at most one file mutation per model turn and use the latest expectedRevision.",
+      "3. Continue from the revision returned by a successful mutation. Never guess a revision.",
+      "4. Keep changes minimal and preserve the repository's conventions.",
+      "",
+      "Mandatory browser repair loop:",
+      "1. Follow: evidence -> search -> read -> one mutation -> automatic replay or browser_verify.",
+      "2. browser_verify must contain executable smoke steps and at least one assertion.",
+      "3. Prefer data-testid, then role+name, then stable CSS targets. Never guess an ambiguous target.",
+      "4. Treat build, runtime, console, network, action, assertion and revision checks as one verification result.",
+      "5. Network failures are blocking unless the exact method/origin/path/status is explicitly accepted.",
+      "6. After a failed browser_verify, the server automatically replays the same smoke plan on each new revision.",
+      "",
+      "Completion gate:",
+      "1. File tools and run_preview do not prove interaction behavior.",
+      "2. Never claim completion until the current revision has a passed browser_verify or automatic replay.",
+      "3. The server recomputes every check from raw evidence and rejects stale revisions.",
+      "4. Stop on cancellation, conflict, invalid evidence, no progress, or exhausted budget.",
+      "5. In the final response, summarize changed files, replay count, and the successful browser evidence.",
+    ].join("\n");
+  },
 } satisfies Record<string, (context: SystemPromptContext) => string>;
 
 const TOOLSET_PROFILES = {
@@ -122,6 +159,11 @@ const TOOLSET_PROFILES = {
   [FILE_TOOLSET_PROFILE_ID]: [
     ...FILE_TOOL_DEFINITIONS,
     RUN_PREVIEW_TOOL_DEFINITION,
+  ],
+  [BROWSER_TOOLSET_PROFILE_ID]: [
+    ...FILE_TOOL_DEFINITIONS,
+    RUN_PREVIEW_TOOL_DEFINITION,
+    BROWSER_VERIFY_TOOL_DEFINITION,
   ],
 } as const;
 
@@ -174,8 +216,11 @@ export function createFrozenAgentProfile(input: {
   maxModelTurns: number;
   maxWallTimeSeconds: number;
 }): FrozenAgentRunProfile {
-  const prompt = resolveSystemPromptProfile(SYSTEM_PROMPT_PROFILE_ID, input);
-  const toolset = resolveToolsetProfile(FILE_TOOLSET_PROFILE_ID);
+  const prompt = resolveSystemPromptProfile(
+    BROWSER_SYSTEM_PROMPT_PROFILE_ID,
+    input,
+  );
+  const toolset = resolveToolsetProfile(BROWSER_TOOLSET_PROFILE_ID);
 
   return {
     locale: input.locale,

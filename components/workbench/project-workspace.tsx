@@ -36,8 +36,8 @@ import { FileTree } from "@/components/workbench/file-tree";
 import { PROJECT_ERROR_CODES } from "@/domains/project/errors";
 import type {
   ClientToolRequest,
-  RunPreviewResult,
-} from "@/domains/agent/evidence";
+  ClientToolResult,
+} from "@/domains/agent/client-tools";
 import type {
   ProjectDescription,
   ProjectFileSnapshot,
@@ -249,7 +249,7 @@ export function ProjectWorkspace({
   );
 
   const handleClientToolResult = useCallback(
-    async (request: ClientToolRequest, result: RunPreviewResult) => {
+    async (request: ClientToolRequest, result: ClientToolResult) => {
       try {
         const response = await fetch(
           `/api/agent-runs/${request.runId}/client-tool-results`,

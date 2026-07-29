@@ -29,7 +29,7 @@ import { Button } from "@/components/ui/button";
 import {
   clientToolRequestSchema,
   type ClientToolRequest,
-} from "@/domains/agent/evidence";
+} from "@/domains/agent/client-tools";
 import { verificationFailureSchema } from "@/domains/agent/verification";
 import type {
   AgentConversationSnapshot,
@@ -37,6 +37,8 @@ import type {
   ConversationRecord,
   ToolInvocationRecord,
   TranscriptMessage,
+  VerificationRunRecord,
+  VerificationStepRecord,
 } from "@/domains/agent/types";
 import { projectPendingAssistantText } from "@/domains/agent/transcript";
 import { cn } from "@/lib/utils";
@@ -119,6 +121,25 @@ export function AgentPanel({
         : null,
     [activeRun, snapshot?.tools],
   );
+  const latestRunVerifications = useMemo(
+    () =>
+      latestRun
+        ? (snapshot?.verificationRuns.filter(
+            (verification) => verification.runId === latestRun.id,
+          ) ?? [])
+        : [],
+    [latestRun, snapshot?.verificationRuns],
+  );
+  const latestRunVerificationSteps = useMemo(() => {
+    const verificationIds = new Set(
+      latestRunVerifications.map((verification) => verification.id),
+    );
+    return (
+      snapshot?.verificationSteps.filter((step) =>
+        verificationIds.has(step.verificationRunId),
+      ) ?? []
+    );
+  }, [latestRunVerifications, snapshot?.verificationSteps]);
 
   const loadAgentSnapshot = useCallback(
     async (
@@ -345,6 +366,25 @@ export function AgentPanel({
       return;
     }
 
+    const verificationRun =
+      invocation.toolName === "browser_verify"
+        ? snapshot?.verificationRuns
+            .slice()
+            .reverse()
+            .find(
+              (verification) =>
+                verification.runId === activeRun.id &&
+                verification.toolCallId === invocation.toolCallId,
+            )
+        : null;
+
+    // browser_verify 的 verificationRunId/source/replayCount 不属于模型参数，
+    // 而是服务端在 Tool Ledger 旁创建的持久化执行上下文。刷新恢复时必须从
+    // verification_runs 重建，不能从 argumentsJson 猜测或生成新 ID。
+    if (invocation.toolName === "browser_verify" && !verificationRun) {
+      return;
+    }
+
     // SSE 可能在页面刷新期间错过；ledger 与 Run 快照共同重建同一个请求，
     // idempotencyKey 保证恢复执行和实时事件最终指向同一项客户端工作。
     const requestResult = clientToolRequestSchema.safeParse({
@@ -355,12 +395,25 @@ export function AgentPanel({
       idempotencyKey: invocation.idempotencyKey,
       revision: invocation.revisionBefore,
       arguments: invocation.argumentsJson,
+      ...(verificationRun
+        ? {
+            verificationRunId: verificationRun.id,
+            source: verificationRun.source,
+            replayCount: verificationRun.replayCount,
+          }
+        : {}),
     });
 
     if (requestResult.success) {
       onClientToolRequest?.(requestResult.data);
     }
-  }, [activeRun, onClientToolRequest, projectId, snapshot?.tools]);
+  }, [
+    activeRun,
+    onClientToolRequest,
+    projectId,
+    snapshot?.tools,
+    snapshot?.verificationRuns,
+  ]);
 
   useEffect(() => {
     if (streamingAssistantText) {
@@ -585,6 +638,8 @@ export function AgentPanel({
           onStop={() => void stopRun()}
           run={latestRun}
           stopping={stopping}
+          verificationRuns={latestRunVerifications}
+          verificationSteps={latestRunVerificationSteps}
         />
       ) : null}
 
@@ -727,11 +782,15 @@ function AgentRunStatus({
   activeTool,
   onStop,
   stopping,
+  verificationRuns,
+  verificationSteps,
 }: {
   run: AgentRunRecord;
   activeTool: ToolInvocationRecord | null;
   onStop: () => void;
   stopping: boolean;
+  verificationRuns: VerificationRunRecord[];
+  verificationSteps: VerificationStepRecord[];
 }) {
   const elapsed = formatElapsed(run);
   const status = getRunStatusCopy(run);
@@ -803,6 +862,12 @@ function AgentRunStatus({
           ) : null}
         </div>
       ) : null}
+      {verificationRuns.length ? (
+        <VerificationHistory
+          runs={verificationRuns}
+          steps={verificationSteps}
+        />
+      ) : null}
       {isActive ? (
         <Button
           disabled={stopping}
@@ -818,6 +883,167 @@ function AgentRunStatus({
       )}
     </section>
   );
+}
+
+type VerificationCheckField =
+  | "buildOk"
+  | "runtimeOk"
+  | "consoleOk"
+  | "networkOk"
+  | "actionsOk"
+  | "assertionsOk"
+  | "revisionOk";
+
+const VERIFICATION_CHECKS = [
+  ["buildOk", "Build"],
+  ["runtimeOk", "Runtime"],
+  ["consoleOk", "Console"],
+  ["networkOk", "Network"],
+  ["actionsOk", "Actions"],
+  ["assertionsOk", "Assertions"],
+  ["revisionOk", "Revision"],
+] as const satisfies ReadonlyArray<readonly [VerificationCheckField, string]>;
+
+function VerificationHistory({
+  runs,
+  steps,
+}: {
+  runs: VerificationRunRecord[];
+  steps: VerificationStepRecord[];
+}) {
+  const stepsByRun = new Map<string, VerificationStepRecord[]>();
+  for (const step of steps) {
+    const current = stepsByRun.get(step.verificationRunId) ?? [];
+    current.push(step);
+    stepsByRun.set(step.verificationRunId, current);
+  }
+
+  // 最新验证放在最上方，旧失败与自动回放仍保留为可审计记录。限制为最近
+  // 四轮，避免长修复循环挤压消息区；完整事实仍保存在数据库快照中。
+  const visibleRuns = runs.slice(-4).reverse();
+
+  return (
+    <details
+      className="agent-verification-history"
+      open={visibleRuns[0]?.status === "failed"}
+    >
+      <summary>
+        <span>Browser Verify</span>
+        <small>{runs.length} 次记录</small>
+      </summary>
+      <div className="agent-verification-runs">
+        {visibleRuns.map((verification) => {
+          const runSteps = (stepsByRun.get(verification.id) ?? [])
+            .slice()
+            .sort((left, right) => left.stepIndex - right.stepIndex);
+          const sourceLabel =
+            verification.source === "replay" ? "自动回放" : "Agent";
+
+          return (
+            <article
+              className={cn(
+                "agent-verification-run",
+                `is-${verification.status}`,
+              )}
+              key={verification.id}
+            >
+              <header>
+                <span>
+                  {verification.status === "passed" ? (
+                    <ShieldCheck />
+                  ) : verification.status === "failed" ? (
+                    <TriangleAlert />
+                  ) : (
+                    <LoaderCircle
+                      className={cn(
+                        verification.status === "running" && "animate-spin",
+                      )}
+                    />
+                  )}
+                  r{verification.revision} · {sourceLabel}
+                </span>
+                <small>
+                  replay {verification.replayCount} · {verification.status}
+                </small>
+              </header>
+
+              <div
+                aria-label={`revision ${verification.revision} 验证门禁`}
+                className="agent-verification-checks"
+              >
+                {VERIFICATION_CHECKS.map(([field, label]) => {
+                  const value = verification[field];
+                  return (
+                    <span
+                      className={cn(
+                        value === true && "is-passed",
+                        value === false && "is-failed",
+                      )}
+                      key={field}
+                    >
+                      {value === true ? (
+                        <Check />
+                      ) : value === false ? (
+                        <TriangleAlert />
+                      ) : (
+                        <span aria-hidden="true" className="check-pending" />
+                      )}
+                      {label}
+                    </span>
+                  );
+                })}
+              </div>
+
+              {runSteps.length ? (
+                <ol className="agent-verification-steps">
+                  {runSteps.map((step) => (
+                    <li
+                      className={cn(step.status === "failed" && "is-failed")}
+                      key={step.id}
+                    >
+                      <span>{step.stepIndex + 1}</span>
+                      <div>
+                        <strong>{formatBrowserAction(step.action)}</strong>
+                        <small>
+                          {step.message} · {formatDuration(step.durationMs)}
+                        </small>
+                      </div>
+                    </li>
+                  ))}
+                </ol>
+              ) : (
+                <p className="agent-verification-pending">
+                  等待浏览器返回步骤证据...
+                </p>
+              )}
+
+              {verification.summary ? (
+                <p className="agent-verification-summary">
+                  {verification.failedStep === null
+                    ? verification.summary
+                    : `失败步骤 ${verification.failedStep + 1}：${verification.summary}`}
+                </p>
+              ) : null}
+            </article>
+          );
+        })}
+      </div>
+    </details>
+  );
+}
+
+function formatBrowserAction(action: string): string {
+  const labels: Record<string, string> = {
+    click: "点击",
+    fill: "填写",
+    select: "选择",
+    press: "按键",
+    wait_for: "等待",
+    assert_text: "断言文本",
+    assert_visible: "断言可见",
+    assert_url: "断言 URL",
+  };
+  return labels[action] ?? action;
 }
 
 function formatToolArguments(value: Record<string, unknown>): string {

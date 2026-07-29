@@ -6,11 +6,14 @@ import type { PgDatabase } from "drizzle-orm/pg-core";
 import type { PgQueryResultHKT } from "drizzle-orm/pg-core/session";
 import type { ExtractTablesWithRelations } from "drizzle-orm/relations";
 
-import { AGENT_ERROR_CODES, AgentError } from "@/domains/agent/errors";
 import {
-  RUN_PREVIEW_TOOL_NAME,
-  type RunPreviewResult,
-} from "@/domains/agent/evidence";
+  BROWSER_VERIFY_TOOL_NAME,
+  browserVerifyToolArgumentsSchema,
+  type BrowserVerifyResult,
+  type ClientToolResultRequest,
+} from "@/domains/agent/client-tools";
+import { AGENT_ERROR_CODES, AgentError } from "@/domains/agent/errors";
+import { RUN_PREVIEW_TOOL_NAME } from "@/domains/agent/evidence";
 import {
   isTerminalAgentRunStatus,
   reduceAgentRunStatus,
@@ -24,13 +27,17 @@ import type {
   FrozenAgentRunProfile,
   ToolInvocationRecord,
   TranscriptMessage,
+  VerificationRunRecord,
 } from "@/domains/agent/types";
 import {
   EMPTY_AGENT_RUN_USAGE,
   normalizeAgentRunBudget,
   normalizeAgentRunUsage,
 } from "@/domains/agent/types";
-import { deriveVerificationFailure } from "@/domains/agent/verification";
+import {
+  deriveVerificationFailure,
+  evaluateBrowserVerification,
+} from "@/domains/agent/verification";
 import {
   agentEvidence,
   agentRunEvents,
@@ -40,6 +47,8 @@ import {
   projects,
   toolInvocations,
   transcriptMessages,
+  verificationRuns,
+  verificationSteps,
 } from "@/infrastructure/db/schema";
 
 type RelationalSchema = ExtractTablesWithRelations<typeof databaseSchema>;
@@ -355,7 +364,7 @@ export class AgentStore<TQueryResult extends PgQueryResultHKT> {
     ]);
 
     const runIds = runRows.map((run) => run.id);
-    const [eventRows, toolRows] = runIds.length
+    const [eventRows, toolRows, verificationRunRows] = runIds.length
       ? await Promise.all([
           this.db
             .select()
@@ -367,8 +376,26 @@ export class AgentStore<TQueryResult extends PgQueryResultHKT> {
             .from(toolInvocations)
             .where(inArray(toolInvocations.runId, runIds))
             .orderBy(asc(toolInvocations.createdAt)),
+          this.db
+            .select()
+            .from(verificationRuns)
+            .where(inArray(verificationRuns.runId, runIds))
+            .orderBy(asc(verificationRuns.createdAt)),
         ])
-      : [[], []];
+      : [[], [], []];
+    const verificationRunIds = verificationRunRows.map((run) => run.id);
+    const verificationStepRows = verificationRunIds.length
+      ? await this.db
+          .select()
+          .from(verificationSteps)
+          .where(
+            inArray(verificationSteps.verificationRunId, verificationRunIds),
+          )
+          .orderBy(
+            asc(verificationSteps.verificationRunId),
+            asc(verificationSteps.stepIndex),
+          )
+      : [];
 
     return {
       conversation: toConversationRecord(conversation),
@@ -376,6 +403,8 @@ export class AgentStore<TQueryResult extends PgQueryResultHKT> {
       runs: runRows.map(toAgentRunRecord),
       events: eventRows,
       tools: toolRows,
+      verificationRuns: verificationRunRows.map(toVerificationRunRecord),
+      verificationSteps: verificationStepRows,
     };
   }
 
@@ -825,20 +854,139 @@ export class AgentStore<TQueryResult extends PgQueryResultHKT> {
   }
 
   /**
-   * 浏览器工具结果、Evidence、Transcript 与 Run 恢复必须原子提交。
-   * 否则 Serverless 实例在任意两步之间中断时，会出现“证据已保存但 Run
-   * 仍等待”或“Run 已继续但模型看不到 Tool Result”的不可恢复状态。
+   * canonical smoke plan 在客户端执行前落库。自动重放只复制这份事实，
+   * 不从模型文本、SSE payload 或 React 临时状态反推步骤。
    */
-  async completeClientToolResult(input: {
+  async createVerificationRun(input: {
+    id?: string;
     ownerId: string;
     runId: string;
     projectId: string;
     toolCallId: string;
-    toolName: typeof RUN_PREVIEW_TOOL_NAME;
-    idempotencyKey: string;
     revision: number;
-    result: RunPreviewResult;
-  }): Promise<{
+    source: "agent" | "replay";
+    replayCount: number;
+    smokeSteps: Array<Record<string, unknown>>;
+    acceptedNetworkFailures: Array<Record<string, unknown>>;
+  }): Promise<VerificationRunRecord> {
+    const [row] = await this.db
+      .insert(verificationRuns)
+      .values({
+        ...(input.id ? { id: input.id } : {}),
+        ownerId: input.ownerId,
+        runId: input.runId,
+        projectId: input.projectId,
+        toolCallId: input.toolCallId,
+        revision: input.revision,
+        status: "running",
+        source: input.source,
+        replayCount: input.replayCount,
+        smokeSteps: input.smokeSteps,
+        acceptedNetworkFailures: input.acceptedNetworkFailures,
+        startedAt: new Date(),
+      })
+      .returning();
+
+    if (!row) {
+      throw new Error("创建 Browser Verification Run 失败。");
+    }
+
+    return toVerificationRunRecord(row);
+  }
+
+  async findReplayableSmokePlan(input: {
+    ownerId: string;
+    runId: string;
+    currentRevision: number;
+  }): Promise<VerificationRunRecord | null> {
+    const [canonicalRows, latestRows] = await Promise.all([
+      this.db
+        .select()
+        .from(verificationRuns)
+        .where(
+          and(
+            eq(verificationRuns.ownerId, input.ownerId),
+            eq(verificationRuns.runId, input.runId),
+            eq(verificationRuns.source, "agent"),
+            eq(verificationRuns.status, "failed"),
+          ),
+        )
+        .orderBy(desc(verificationRuns.createdAt))
+        .limit(1),
+      this.db
+        .select()
+        .from(verificationRuns)
+        .where(
+          and(
+            eq(verificationRuns.ownerId, input.ownerId),
+            eq(verificationRuns.runId, input.runId),
+          ),
+        )
+        .orderBy(desc(verificationRuns.createdAt))
+        .limit(1),
+    ]);
+    const canonical = canonicalRows[0];
+    const latest = latestRows[0];
+
+    if (!canonical) {
+      return null;
+    }
+
+    const [passedCurrentRevision] = await this.db
+      .select({ id: verificationRuns.id })
+      .from(verificationRuns)
+      .where(
+        and(
+          eq(verificationRuns.ownerId, input.ownerId),
+          eq(verificationRuns.runId, input.runId),
+          eq(verificationRuns.revision, input.currentRevision),
+          eq(verificationRuns.status, "passed"),
+        ),
+      )
+      .limit(1);
+
+    if (passedCurrentRevision) {
+      return null;
+    }
+
+    // 步骤和网络白名单始终取 Agent 明确提交的 canonical plan；重放次数则
+    // 延续该 Run 最新一轮验证，避免每次 mutation 后都重新显示为 replay 1。
+    return {
+      ...toVerificationRunRecord(canonical),
+      replayCount: latest?.replayCount ?? canonical.replayCount,
+    };
+  }
+
+  async getLatestVerificationRun(input: {
+    ownerId: string;
+    runId: string;
+  }): Promise<VerificationRunRecord | null> {
+    const [row] = await this.db
+      .select()
+      .from(verificationRuns)
+      .where(
+        and(
+          eq(verificationRuns.ownerId, input.ownerId),
+          eq(verificationRuns.runId, input.runId),
+        ),
+      )
+      .orderBy(desc(verificationRuns.createdAt))
+      .limit(1);
+
+    return row ? toVerificationRunRecord(row) : null;
+  }
+
+  /**
+   * 浏览器工具结果、Evidence、Transcript 与 Run 恢复必须原子提交。
+   * 否则 Serverless 实例在任意两步之间中断时，会出现“证据已保存但 Run
+   * 仍等待”或“Run 已继续但模型看不到 Tool Result”的不可恢复状态。
+   */
+  async completeClientToolResult(
+    input: {
+      ownerId: string;
+      runId: string;
+    } & ClientToolResultRequest,
+  ): Promise<{
     disposition: "accepted" | "duplicate" | "ignored";
     run: AgentRunRecord;
   }> {
@@ -858,6 +1006,25 @@ export class AgentStore<TQueryResult extends PgQueryResultHKT> {
         throw new AgentError(
           AGENT_ERROR_CODES.runNotFound,
           "Agent Run 不存在、项目不匹配或不属于当前匿名工作区。",
+          404,
+        );
+      }
+
+      const [projectRow] = await tx
+        .select({ revision: projects.revision })
+        .from(projects)
+        .where(
+          and(
+            eq(projects.id, input.projectId),
+            eq(projects.ownerId, input.ownerId),
+            isNull(projects.deletedAt),
+          ),
+        );
+
+      if (!projectRow) {
+        throw new AgentError(
+          AGENT_ERROR_CODES.runNotFound,
+          "Agent Run 对应的项目不存在、已删除或不属于当前匿名工作区。",
           404,
         );
       }
@@ -886,6 +1053,67 @@ export class AgentStore<TQueryResult extends PgQueryResultHKT> {
         );
       }
 
+      let verificationRunRow: typeof verificationRuns.$inferSelect | null =
+        null;
+      let normalizedResult = input.result;
+      let normalizedBrowserResult: BrowserVerifyResult | null = null;
+      let verificationFailure =
+        input.toolName === RUN_PREVIEW_TOOL_NAME
+          ? deriveVerificationFailure(input.result)
+          : null;
+      let verificationSource: "agent" | "replay" = "agent";
+
+      if (input.toolName === BROWSER_VERIFY_TOOL_NAME) {
+        const argumentsResult = browserVerifyToolArgumentsSchema.safeParse(
+          invocation.argumentsJson,
+        );
+
+        if (!argumentsResult.success) {
+          throw new AgentError(
+            AGENT_ERROR_CODES.toolInvalidArguments,
+            "已登记的 browser_verify 参数不符合严格协议。",
+            409,
+            { issues: argumentsResult.error.issues },
+          );
+        }
+
+        const [storedVerificationRun] = await tx
+          .select()
+          .from(verificationRuns)
+          .where(
+            and(
+              eq(verificationRuns.id, input.result.verificationRunId),
+              eq(verificationRuns.runId, input.runId),
+              eq(verificationRuns.toolCallId, input.toolCallId),
+              eq(verificationRuns.ownerId, input.ownerId),
+              eq(verificationRuns.projectId, input.projectId),
+            ),
+          );
+
+        if (!storedVerificationRun) {
+          throw new AgentError(
+            AGENT_ERROR_CODES.toolInvalidArguments,
+            "Browser Verification Run 不存在或与 invocation 不匹配。",
+            409,
+          );
+        }
+
+        const evaluation = evaluateBrowserVerification({
+          result: input.result,
+          submittedRevision: input.revision,
+          // projects.revision 是 Repository 的最终事实。Run revision 可能因为用户
+          // 在浏览器验证期间另行保存文件而暂时落后，不能据此接受旧页面证据。
+          currentRevision: projectRow.revision,
+          smokeSteps: argumentsResult.data.steps,
+          acceptedNetworkFailures: argumentsResult.data.acceptedNetworkFailures,
+        });
+        verificationRunRow = storedVerificationRun;
+        normalizedResult = evaluation.result;
+        normalizedBrowserResult = evaluation.result;
+        verificationFailure = evaluation.failure;
+        verificationSource = storedVerificationRun.source;
+      }
+
       if (
         invocation.status === "succeeded" ||
         invocation.status === "failed" ||
@@ -893,7 +1121,7 @@ export class AgentStore<TQueryResult extends PgQueryResultHKT> {
       ) {
         if (
           invocation.resultJson &&
-          isDeepStrictEqual(invocation.resultJson, input.result)
+          isDeepStrictEqual(invocation.resultJson, normalizedResult)
         ) {
           return {
             disposition: "duplicate",
@@ -914,7 +1142,8 @@ export class AgentStore<TQueryResult extends PgQueryResultHKT> {
           : invocation.status !== "running"
             ? "invocation_not_running"
             : runRow.currentRevision !== input.revision ||
-                input.result.revision !== input.revision
+                projectRow.revision !== input.revision ||
+                normalizedResult.revision !== input.revision
               ? "stale_revision"
               : null;
 
@@ -928,6 +1157,7 @@ export class AgentStore<TQueryResult extends PgQueryResultHKT> {
             reason: ignoredReason,
             submittedRevision: input.revision,
             currentRevision: runRow.currentRevision,
+            repositoryRevision: projectRow.revision,
           },
         });
 
@@ -937,9 +1167,8 @@ export class AgentStore<TQueryResult extends PgQueryResultHKT> {
         };
       }
 
-      const invocationStatus = input.result.ok ? "succeeded" : "failed";
+      const invocationStatus = normalizedResult.ok ? "succeeded" : "failed";
       const now = new Date();
-      const verificationFailure = deriveVerificationFailure(input.result);
       const currentUsage = normalizeAgentRunUsage(runRow.usage);
       const repeatedFailureCount =
         verificationFailure &&
@@ -965,12 +1194,13 @@ export class AgentStore<TQueryResult extends PgQueryResultHKT> {
             : null),
         latestPreviewAt: now.toISOString(),
         latestVerificationRevision: input.revision,
-        latestVerificationOk: input.result.ok,
+        latestVerificationOk: normalizedResult.ok,
         latestFailureFingerprint: verificationFailure?.fingerprint ?? null,
       };
       const budget = normalizeAgentRunBudget(runRow.budget);
       const noProgress =
-        !input.result.ok && repeatedFailureCount >= budget.maxNoProgressRepeats;
+        !normalizedResult.ok &&
+        repeatedFailureCount >= budget.maxNoProgressRepeats;
       const clientResumeBudgetExhausted =
         nextClientResumes > budget.maxClientResumes;
       const nextRunStatus =
@@ -991,10 +1221,14 @@ export class AgentStore<TQueryResult extends PgQueryResultHKT> {
         .update(toolInvocations)
         .set({
           status: invocationStatus,
-          resultJson: input.result,
+          resultJson: normalizedResult,
           revisionAfter: input.revision,
-          errorCode: input.result.ok ? null : "PREVIEW_VERIFICATION_FAILED",
-          completedAt: new Date(),
+          errorCode: normalizedResult.ok
+            ? null
+            : input.toolName === BROWSER_VERIFY_TOOL_NAME
+              ? "BROWSER_VERIFICATION_FAILED"
+              : "PREVIEW_VERIFICATION_FAILED",
+          completedAt: now,
         })
         .where(
           and(
@@ -1012,7 +1246,7 @@ export class AgentStore<TQueryResult extends PgQueryResultHKT> {
 
         if (
           latestInvocation?.resultJson &&
-          isDeepStrictEqual(latestInvocation.resultJson, input.result)
+          isDeepStrictEqual(latestInvocation.resultJson, normalizedResult)
         ) {
           return {
             disposition: "duplicate",
@@ -1035,7 +1269,7 @@ export class AgentStore<TQueryResult extends PgQueryResultHKT> {
           ownerId: input.ownerId,
           revision: input.revision,
           kind: "build",
-          payload: input.result.build,
+          payload: normalizedResult.build,
         },
         {
           runId: input.runId,
@@ -1044,7 +1278,7 @@ export class AgentStore<TQueryResult extends PgQueryResultHKT> {
           ownerId: input.ownerId,
           revision: input.revision,
           kind: "runtime",
-          payload: input.result.runtime,
+          payload: normalizedResult.runtime,
         },
         {
           runId: input.runId,
@@ -1053,24 +1287,80 @@ export class AgentStore<TQueryResult extends PgQueryResultHKT> {
           ownerId: input.ownerId,
           revision: input.revision,
           kind: "console",
-          payload: input.result.console,
+          payload: normalizedResult.console,
         },
       ]);
 
-      await tx.insert(transcriptMessages).values({
-        conversationId: runRow.conversationId,
-        runId: runRow.id,
-        role: "tool",
-        kind: "tool_result",
-        payload: {
-          toolCallId: input.toolCallId,
-          toolName: input.toolName,
-          resultJson: {
-            ...input.result,
-            verificationFailure,
+      if (verificationRunRow && normalizedBrowserResult) {
+        await tx
+          .update(verificationRuns)
+          .set({
+            status: normalizedBrowserResult.ok ? "passed" : "failed",
+            buildEvidence: normalizedBrowserResult.build,
+            runtimeEvidence: normalizedBrowserResult.runtime,
+            consoleEvidence: normalizedBrowserResult.console,
+            browserEvidence: normalizedBrowserResult.browser,
+            networkEvidence: normalizedBrowserResult.network,
+            buildOk: normalizedBrowserResult.checks.build,
+            runtimeOk: normalizedBrowserResult.checks.runtime,
+            consoleOk: normalizedBrowserResult.checks.console,
+            networkOk: normalizedBrowserResult.checks.network,
+            actionsOk: normalizedBrowserResult.checks.actions,
+            assertionsOk: normalizedBrowserResult.checks.assertions,
+            revisionOk: normalizedBrowserResult.checks.revision,
+            failedStep: normalizedBrowserResult.browser.failedStep,
+            summary: normalizedBrowserResult.summary,
+            completedAt: now,
+          })
+          .where(
+            and(
+              eq(verificationRuns.id, verificationRunRow.id),
+              inArray(verificationRuns.status, ["pending", "running"]),
+            ),
+          );
+
+        if (normalizedBrowserResult.browser.steps.length > 0) {
+          await tx
+            .insert(verificationSteps)
+            .values(
+              normalizedBrowserResult.browser.steps.map((step) => ({
+                verificationRunId: verificationRunRow.id,
+                stepIndex: step.index,
+                action: step.action,
+                target: step.target,
+                status: step.status,
+                startedAt: new Date(step.startedAt),
+                durationMs: step.durationMs,
+                message: step.message,
+                error: step.error,
+              })),
+            )
+            .onConflictDoNothing();
+        }
+      }
+
+      // Replay 是系统根据已保存 smoke plan 发起的，不存在新的 assistant tool_call。
+      // 因此只把 Agent 原始调用或 run_preview 写入 Transcript；重放证据由
+      // verification_runs 投影进下一轮 System Directive，避免制造孤立 tool 消息。
+      if (
+        input.toolName === RUN_PREVIEW_TOOL_NAME ||
+        verificationSource === "agent"
+      ) {
+        await tx.insert(transcriptMessages).values({
+          conversationId: runRow.conversationId,
+          runId: runRow.id,
+          role: "tool",
+          kind: "tool_result",
+          payload: {
+            toolCallId: input.toolCallId,
+            toolName: input.toolName,
+            resultJson: {
+              ...normalizedResult,
+              verificationFailure,
+            },
           },
-        },
-      });
+        });
+      }
 
       const [updatedRun] = await tx
         .update(agentRuns)
@@ -1106,7 +1396,7 @@ export class AgentStore<TQueryResult extends PgQueryResultHKT> {
           payload: {
             toolCallId: input.toolCallId,
             toolName: input.toolName,
-            ok: input.result.ok,
+            ok: normalizedResult.ok,
             revision: input.revision,
           },
         },
@@ -1116,7 +1406,7 @@ export class AgentStore<TQueryResult extends PgQueryResultHKT> {
           payload: {
             toolCallId: input.toolCallId,
             toolName: input.toolName,
-            ok: input.result.ok,
+            ok: normalizedResult.ok,
             revision: input.revision,
           },
         },
@@ -1124,11 +1414,25 @@ export class AgentStore<TQueryResult extends PgQueryResultHKT> {
           runId: input.runId,
           type: "verification.completed",
           payload: {
-            ok: input.result.ok,
+            ok: normalizedResult.ok,
             revision: input.revision,
             clientResume: nextClientResumes,
             repairRound: nextUsage.repairRounds,
             repeatedFailureCount,
+            verificationKind:
+              input.toolName === BROWSER_VERIFY_TOOL_NAME
+                ? "browser"
+                : "preview",
+            ...(verificationRunRow
+              ? {
+                  verificationRunId: verificationRunRow.id,
+                  source: verificationRunRow.source,
+                  replayCount: verificationRunRow.replayCount,
+                  checks: normalizedBrowserResult?.checks,
+                  failedStep:
+                    normalizedBrowserResult?.browser.failedStep ?? null,
+                }
+              : {}),
             ...(verificationFailure ? { failure: verificationFailure } : {}),
           },
         },
@@ -1360,6 +1664,21 @@ function toAgentRunRecord(row: typeof agentRuns.$inferSelect): AgentRunRecord {
       row.repositoryCapability as AgentRunRecord["repositoryCapability"],
     budget: normalizeAgentRunBudget(row.budget),
     usage: normalizeAgentRunUsage(row.usage),
+  };
+}
+
+function toVerificationRunRecord(
+  row: typeof verificationRuns.$inferSelect,
+): VerificationRunRecord {
+  return {
+    ...row,
+    smokeSteps: row.smokeSteps,
+    acceptedNetworkFailures: row.acceptedNetworkFailures,
+    buildEvidence: row.buildEvidence ?? null,
+    runtimeEvidence: row.runtimeEvidence ?? null,
+    consoleEvidence: row.consoleEvidence ?? null,
+    browserEvidence: row.browserEvidence ?? null,
+    networkEvidence: row.networkEvidence ?? null,
   };
 }
 

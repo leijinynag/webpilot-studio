@@ -1,14 +1,32 @@
 import { z } from "zod";
 
+import type { NetworkEntry } from "@/domains/agent/browser-evidence";
+import {
+  BROWSER_VERIFY_TOOL_NAME,
+  type AcceptedNetworkFailure,
+  type BrowserVerificationChecks,
+  type BrowserVerifyResult,
+} from "@/domains/agent/client-tools";
 import type {
   RunPreviewResult,
   RuntimeEvidence,
 } from "@/domains/agent/evidence";
 import type { AgentRunRecord, TranscriptMessage } from "@/domains/agent/types";
+import type { VerificationRunRecord } from "@/domains/agent/types";
 
 const verificationIssueSchema = z
   .object({
-    source: z.enum(["install", "dev_server", "build", "runtime", "console"]),
+    source: z.enum([
+      "install",
+      "dev_server",
+      "build",
+      "runtime",
+      "console",
+      "network",
+      "browser",
+      "assertion",
+      "revision",
+    ]),
     code: z.string().min(1).max(120),
     message: z.string().min(1).max(2_048),
     stack: z.string().max(8_192).optional(),
@@ -31,8 +49,22 @@ export const verificationFailureSchema = z
       "console_error",
       "render_failed",
       "preview_failed",
+      "network_failed",
+      "browser_action_failed",
+      "browser_assertion_failed",
+      "stale_revision",
     ]),
-    stage: z.enum(["install", "dev_server", "build", "runtime", "console"]),
+    stage: z.enum([
+      "install",
+      "dev_server",
+      "build",
+      "runtime",
+      "console",
+      "network",
+      "browser",
+      "assertion",
+      "revision",
+    ]),
     revision: z.number().int().nonnegative(),
     summary: z.string().min(1).max(2_048),
     issues: z.array(verificationIssueSchema).min(1).max(20),
@@ -48,6 +80,236 @@ export type PreviewVerificationState = {
   revision: number | null;
   failure: VerificationFailure | null;
 };
+
+export type AgentVerificationState = PreviewVerificationState & {
+  kind: "preview" | "browser";
+  replayCount: number;
+  summary: string | null;
+};
+
+const ASSERTION_ACTIONS = new Set([
+  "assert_text",
+  "assert_visible",
+  "assert_url",
+]);
+
+export type BrowserVerificationEvaluation = {
+  result: BrowserVerifyResult;
+  failure: VerificationFailure | null;
+};
+
+/**
+ * browser_verify 的可信结果只由服务端依据原始 Evidence 计算。
+ * submittedRevision 是 API 请求携带的 fence，currentRevision 是数据库事实；
+ * 两者以及每一种 Evidence 都必须指向同一个 revision。
+ */
+export function evaluateBrowserVerification(input: {
+  result: BrowserVerifyResult;
+  submittedRevision: number;
+  currentRevision: number;
+  smokeSteps: readonly { action: string }[];
+  acceptedNetworkFailures: readonly AcceptedNetworkFailure[];
+}): BrowserVerificationEvaluation {
+  const result = input.result;
+  const build =
+    result.build.install.status === "succeeded" &&
+    result.build.devServer.status === "ready" &&
+    result.build.errors.length === 0;
+  const runtime =
+    result.runtime.rendered &&
+    !result.runtime.events.some(
+      (event) =>
+        event.type === "RUNTIME_ERROR" || event.type === "UNHANDLED_REJECTION",
+    );
+  const consoleOk = !result.console.entries.some(
+    (entry) => entry.level === "error",
+  );
+  const unacceptedNetworkFailures = result.network.entries.filter(
+    (entry) =>
+      entry.failed &&
+      !input.acceptedNetworkFailures.some((accepted) =>
+        matchesAcceptedNetworkFailure(entry, accepted),
+      ),
+  );
+  const evidenceRevisions = [
+    result.revision,
+    result.build.revision,
+    result.runtime.revision,
+    result.console.revision,
+    result.browser.revision,
+    result.network.revision,
+  ];
+  const revision =
+    input.submittedRevision === input.currentRevision &&
+    evidenceRevisions.every((value) => value === input.currentRevision);
+  const resultByIndex = new Map(
+    result.browser.steps.map((step) => [step.index, step]),
+  );
+  const actionIndexes = input.smokeSteps
+    .map((step, index) => ({ action: step.action, index }))
+    .filter((step) => !ASSERTION_ACTIONS.has(step.action));
+  const assertionIndexes = input.smokeSteps
+    .map((step, index) => ({ action: step.action, index }))
+    .filter((step) => ASSERTION_ACTIONS.has(step.action));
+  const actions =
+    actionIndexes.length === 0 ||
+    actionIndexes.every(
+      ({ index }) => resultByIndex.get(index)?.status === "passed",
+    );
+  const assertions =
+    assertionIndexes.length > 0 &&
+    assertionIndexes.every(
+      ({ index }) => resultByIndex.get(index)?.status === "passed",
+    );
+  const checks: BrowserVerificationChecks = {
+    build,
+    runtime,
+    console: consoleOk,
+    network: unacceptedNetworkFailures.length === 0,
+    actions,
+    assertions,
+    revision,
+  };
+  const ok = Object.values(checks).every(Boolean);
+  const normalizedResult: BrowserVerifyResult = {
+    ...result,
+    ok,
+    toolName: BROWSER_VERIFY_TOOL_NAME,
+    acceptedNetworkFailures: [...input.acceptedNetworkFailures],
+    checks,
+    summary: createBrowserVerificationSummary({
+      ok,
+      checks,
+      failedStep: result.browser.failedStep,
+      unacceptedNetworkFailures: unacceptedNetworkFailures.length,
+    }),
+  };
+
+  return {
+    result: normalizedResult,
+    failure: ok
+      ? null
+      : deriveBrowserVerificationFailure(
+          normalizedResult,
+          unacceptedNetworkFailures,
+        ),
+  };
+}
+
+function matchesAcceptedNetworkFailure(
+  entry: NetworkEntry,
+  accepted: AcceptedNetworkFailure,
+): boolean {
+  if (
+    accepted.method &&
+    entry.method.toUpperCase() !== accepted.method.toUpperCase()
+  ) {
+    return false;
+  }
+  if (accepted.origin && entry.url.origin !== accepted.origin) {
+    return false;
+  }
+  if (entry.url.path !== accepted.path) {
+    return false;
+  }
+  return (
+    !accepted.statuses ||
+    (entry.status !== null && accepted.statuses.includes(entry.status))
+  );
+}
+
+function createBrowserVerificationSummary(input: {
+  ok: boolean;
+  checks: BrowserVerificationChecks;
+  failedStep: number | null;
+  unacceptedNetworkFailures: number;
+}): string {
+  if (input.ok) {
+    return "浏览器冒烟验证通过，构建、运行时、网络、动作和断言均与当前 revision 匹配。";
+  }
+
+  const failedChecks = Object.entries(input.checks)
+    .filter(([, ok]) => !ok)
+    .map(([name]) => name);
+  return [
+    `浏览器冒烟验证失败：${failedChecks.join(", ")}。`,
+    input.failedStep === null ? "" : `失败步骤：${input.failedStep}。`,
+    input.unacceptedNetworkFailures > 0
+      ? `未获准的失败请求：${input.unacceptedNetworkFailures} 条。`
+      : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
+}
+
+function deriveBrowserVerificationFailure(
+  result: BrowserVerifyResult,
+  networkFailures: readonly NetworkEntry[],
+): VerificationFailure {
+  if (!result.checks.revision) {
+    return createFailure({
+      code: "stale_revision",
+      stage: "revision",
+      revision: result.revision,
+      summary: result.summary,
+      issues: [
+        {
+          source: "revision",
+          code: "STALE_REVISION",
+          message: "验证结果或其中的 Evidence 未绑定当前 Run revision。",
+        },
+      ],
+    });
+  }
+
+  const previewFailure = deriveVerificationFailure({
+    ok: result.checks.build && result.checks.runtime && result.checks.console,
+    toolName: "run_preview",
+    revision: result.revision,
+    summary: result.summary,
+    build: result.build,
+    runtime: result.runtime,
+    console: result.console,
+  });
+  if (previewFailure) {
+    return previewFailure;
+  }
+
+  if (!result.checks.network) {
+    return createFailure({
+      code: "network_failed",
+      stage: "network",
+      revision: result.revision,
+      summary: result.summary,
+      issues: networkFailures.slice(0, 20).map((entry) => ({
+        source: "network" as const,
+        code: `HTTP_${entry.status ?? "ERROR"}`,
+        message: `${entry.method} ${entry.url.origin}${entry.url.path} ${entry.error ?? entry.status ?? "failed"}`,
+      })),
+    });
+  }
+
+  const failedStep = result.browser.steps.find(
+    (step) => step.status === "failed",
+  );
+  const assertionFailed =
+    failedStep && ASSERTION_ACTIONS.has(failedStep.action);
+  return createFailure({
+    code: assertionFailed
+      ? "browser_assertion_failed"
+      : "browser_action_failed",
+    stage: assertionFailed ? "assertion" : "browser",
+    revision: result.revision,
+    summary: result.summary,
+    issues: [
+      {
+        source: assertionFailed ? "assertion" : "browser",
+        code: failedStep?.error?.code ?? "BROWSER_STEP_FAILED",
+        message: failedStep?.error?.message ?? result.summary,
+      },
+    ],
+  });
+}
 
 export function deriveVerificationFailure(
   result: RunPreviewResult,
@@ -219,6 +481,119 @@ export function buildVerificationDirective(
       : "- Inspect the latest run_preview tool result for structured evidence.",
     "- Continue in this exact order: evidence -> search -> read -> one mutation -> run_preview.",
   ].join("\n");
+}
+
+/**
+ * M4 profile 只相信数据库中的 Browser Verification facts。历史 M3 profile
+ * 仍沿用 Transcript 中的 run_preview，保证冻结 digest 对应的行为不会漂移。
+ */
+export function getAgentVerificationState(input: {
+  run: Pick<AgentRunRecord, "id" | "currentRevision" | "toolsetProfile">;
+  transcript: readonly TranscriptMessage[];
+  latestVerificationRun: VerificationRunRecord | null;
+}): AgentVerificationState {
+  if (input.run.toolsetProfile !== "webpilot-browser-v3") {
+    const preview = getPreviewVerificationState(input.run, input.transcript);
+    return {
+      ...preview,
+      kind: "preview",
+      replayCount: 0,
+      summary: null,
+    };
+  }
+
+  const verification = input.latestVerificationRun;
+  if (!verification) {
+    return {
+      attempted: false,
+      ok: false,
+      revision: null,
+      failure: null,
+      kind: "browser",
+      replayCount: 0,
+      summary: null,
+    };
+  }
+
+  return {
+    attempted: true,
+    ok:
+      verification.status === "passed" &&
+      verification.revision === input.run.currentRevision &&
+      verification.revisionOk === true &&
+      verification.buildOk === true &&
+      verification.runtimeOk === true &&
+      verification.consoleOk === true &&
+      verification.networkOk === true &&
+      verification.actionsOk === true &&
+      verification.assertionsOk === true,
+    revision: verification.revision,
+    failure: null,
+    kind: "browser",
+    replayCount: verification.replayCount,
+    summary: verification.summary,
+  };
+}
+
+export function buildAgentVerificationDirective(input: {
+  run: Pick<AgentRunRecord, "id" | "currentRevision" | "toolsetProfile">;
+  transcript: readonly TranscriptMessage[];
+  latestVerificationRun: VerificationRunRecord | null;
+}): string {
+  if (input.run.toolsetProfile !== "webpilot-browser-v3") {
+    return buildVerificationDirective(input.run, input.transcript);
+  }
+
+  const state = getAgentVerificationState(input);
+  const verification = input.latestVerificationRun;
+
+  if (!state.attempted) {
+    return [
+      "Browser verification state:",
+      `- Revision ${input.run.currentRevision} has no browser_verify result.`,
+      "- Do not finish. Submit executable smoke steps with at least one assertion.",
+    ].join("\n");
+  }
+
+  if (state.ok) {
+    return [
+      "Browser verification state:",
+      `- Revision ${input.run.currentRevision} passed the complete browser verification gate.`,
+      `- Replay count: ${state.replayCount}.`,
+      `- Summary: ${state.summary ?? "All checks passed."}`,
+      "- You may finish only if the requested code change is also complete.",
+    ].join("\n");
+  }
+
+  if (state.revision !== input.run.currentRevision) {
+    return [
+      "Browser verification state:",
+      `- Latest evidence covers revision ${state.revision ?? "unknown"}, current revision is ${input.run.currentRevision}.`,
+      "- Do not finish. The canonical smoke plan must be replayed on the current revision.",
+    ].join("\n");
+  }
+
+  return [
+    "Browser verification state:",
+    `- Revision ${input.run.currentRevision} failed browser verification.`,
+    `- Replay count: ${state.replayCount}.`,
+    `- Summary: ${state.summary ?? "Browser verification failed."}`,
+    verification
+      ? `- Checks: ${JSON.stringify({
+          build: verification.buildOk,
+          runtime: verification.runtimeOk,
+          console: verification.consoleOk,
+          network: verification.networkOk,
+          actions: verification.actionsOk,
+          assertions: verification.assertionsOk,
+          revision: verification.revisionOk,
+          failedStep: verification.failedStep,
+        })}`
+      : "",
+    "- Inspect persisted browser/network evidence, apply one focused mutation, then allow automatic replay.",
+  ]
+    .filter(Boolean)
+    .join("\n");
 }
 
 function createFailure(

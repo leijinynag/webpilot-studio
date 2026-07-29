@@ -6,6 +6,10 @@ import {
   isAgentError,
 } from "@/domains/agent/errors";
 import {
+  BROWSER_VERIFY_TOOL_NAME,
+  browserVerifyToolArgumentsSchema,
+} from "@/domains/agent/client-tools";
+import {
   RUN_PREVIEW_TOOL_NAME,
   runPreviewToolArgumentsSchema,
 } from "@/domains/agent/evidence";
@@ -28,8 +32,8 @@ import type {
   TranscriptMessage,
 } from "@/domains/agent/types";
 import {
-  buildVerificationDirective,
-  getPreviewVerificationState,
+  buildAgentVerificationDirective,
+  getAgentVerificationState,
 } from "@/domains/agent/verification";
 
 type AgentStorePort = Pick<
@@ -37,6 +41,9 @@ type AgentStorePort = Pick<
   | "appendEvent"
   | "appendTranscript"
   | "claimExecution"
+  | "createVerificationRun"
+  | "findReplayableSmokePlan"
+  | "getLatestVerificationRun"
   | "registerToolInvocation"
   | "markToolInvocationRunning"
   | "getRun"
@@ -141,12 +148,22 @@ export class AgentOrchestrator {
           ownerId: run.ownerId,
           conversationId: run.conversationId,
         });
+        const latestVerificationRun = await this.store.getLatestVerificationRun(
+          {
+            ownerId: run.ownerId,
+            runId: run.id,
+          },
+        );
         const turn = await this.streamModelTurn({
           run,
           transcript,
           systemPrompt: [
             profiles.prompt.content,
-            buildVerificationDirective(run, transcript),
+            buildAgentVerificationDirective({
+              run,
+              transcript,
+              latestVerificationRun,
+            }),
           ].join("\n\n"),
           tools: profiles.toolset.tools,
           signal: input.signal,
@@ -207,10 +224,14 @@ export class AgentOrchestrator {
             ownerId: run.ownerId,
             conversationId: run.conversationId,
           });
-          const verification = getPreviewVerificationState(
+          const verification = getAgentVerificationState({
             run,
-            latestTranscript,
-          );
+            transcript: latestTranscript,
+            latestVerificationRun: await this.store.getLatestVerificationRun({
+              ownerId: run.ownerId,
+              runId: run.id,
+            }),
+          });
 
           if (verification.ok) {
             await this.finishRun(run, "succeeded");
@@ -270,6 +291,18 @@ export class AgentOrchestrator {
               toolCall,
               argumentsJson,
               leaseId,
+            });
+            return;
+          }
+
+          if (toolCall.name === BROWSER_VERIFY_TOOL_NAME) {
+            await this.suspendForBrowserVerify({
+              run,
+              toolCall,
+              argumentsJson,
+              leaseId,
+              source: "agent",
+              replayCount: 0,
             });
             return;
           }
@@ -340,6 +373,47 @@ export class AgentOrchestrator {
               runId: run.id,
               currentRevision: result.revision,
             });
+          }
+
+          if (result.ok && isFileMutationTool(toolCall.name)) {
+            const replayPlan = await this.store.findReplayableSmokePlan({
+              ownerId: run.ownerId,
+              runId: run.id,
+              currentRevision: run.currentRevision,
+            });
+
+            if (replayPlan) {
+              const replayArguments =
+                browserVerifyToolArgumentsSchema.safeParse({
+                  revision: run.currentRevision,
+                  steps: replayPlan.smokeSteps,
+                  acceptedNetworkFailures: replayPlan.acceptedNetworkFailures,
+                });
+
+              if (!replayArguments.success) {
+                throw new AgentError(
+                  AGENT_ERROR_CODES.toolInvalidArguments,
+                  "持久化的 Browser smoke plan 已失效，无法自动重放。",
+                  500,
+                  { issues: replayArguments.error.issues },
+                );
+              }
+
+              await this.suspendForBrowserVerify({
+                run,
+                toolCall: {
+                  index: toolCall.index,
+                  id: `replay:${toolCall.id}:${run.currentRevision}`,
+                  name: BROWSER_VERIFY_TOOL_NAME,
+                  argumentsText: JSON.stringify(replayArguments.data),
+                },
+                argumentsJson: replayArguments.data,
+                leaseId,
+                source: "replay",
+                replayCount: replayPlan.replayCount + 1,
+              });
+              return;
+            }
           }
         }
 
@@ -563,6 +637,112 @@ export class AgentOrchestrator {
     });
   }
 
+  private async suspendForBrowserVerify(input: {
+    run: AgentRunRecord;
+    toolCall: AccumulatedToolCall;
+    argumentsJson: unknown;
+    leaseId: string;
+    source: "agent" | "replay";
+    replayCount: number;
+  }): Promise<void> {
+    const argumentsResult = browserVerifyToolArgumentsSchema.safeParse(
+      input.argumentsJson,
+    );
+
+    if (!argumentsResult.success) {
+      throw new AgentError(
+        AGENT_ERROR_CODES.toolInvalidArguments,
+        "工具 browser_verify 的参数不合法。",
+        400,
+        { issues: argumentsResult.error.issues },
+      );
+    }
+
+    if (argumentsResult.data.revision !== input.run.currentRevision) {
+      throw new AgentError(
+        AGENT_ERROR_CODES.revisionConflict,
+        "browser_verify 必须验证 Agent 当前持有的最新 revision。",
+        409,
+        {
+          requestedRevision: argumentsResult.data.revision,
+          currentRevision: input.run.currentRevision,
+        },
+      );
+    }
+
+    if (input.run.usage.clientResumes >= input.run.budget.maxClientResumes) {
+      throw new AgentError(
+        AGENT_ERROR_CODES.budgetExhausted,
+        "Agent 已达到浏览器验证恢复次数上限。",
+        409,
+      );
+    }
+
+    const idempotencyKey = `${input.run.id}:${input.toolCall.id}`;
+    const registration = await this.store.registerToolInvocation({
+      runId: input.run.id,
+      toolCallId: input.toolCall.id,
+      toolName: BROWSER_VERIFY_TOOL_NAME,
+      executionDomain: "client",
+      argumentsJson: argumentsResult.data,
+      idempotencyKey,
+      revisionBefore: input.run.currentRevision,
+    });
+
+    if (!registration.created) {
+      throw new AgentError(
+        AGENT_ERROR_CODES.toolAlreadyExecuted,
+        "重复的 browser_verify Tool Call 不能再次下发浏览器。",
+        409,
+        { toolCallId: input.toolCall.id },
+      );
+    }
+
+    await this.store.markToolInvocationRunning({
+      runId: input.run.id,
+      toolCallId: input.toolCall.id,
+    });
+    const verification = await this.store.createVerificationRun({
+      ownerId: input.run.ownerId,
+      runId: input.run.id,
+      projectId: input.run.projectId,
+      toolCallId: input.toolCall.id,
+      revision: input.run.currentRevision,
+      source: input.source,
+      replayCount: input.replayCount,
+      smokeSteps: toJsonRecords(argumentsResult.data.steps),
+      acceptedNetworkFailures: toJsonRecords(
+        argumentsResult.data.acceptedNetworkFailures,
+      ),
+    });
+    await this.store.transitionRun({
+      ownerId: input.run.ownerId,
+      runId: input.run.id,
+      status: "awaiting_client_tool",
+    });
+    await this.store.releaseExecutionLease({
+      ownerId: input.run.ownerId,
+      runId: input.run.id,
+      leaseId: input.leaseId,
+    });
+    await this.store.appendEvent({
+      runId: input.run.id,
+      type: "client_tool.requested",
+      payload: {
+        runId: input.run.id,
+        projectId: input.run.projectId,
+        toolCallId: input.toolCall.id,
+        toolName: BROWSER_VERIFY_TOOL_NAME,
+        idempotencyKey,
+        revision: input.run.currentRevision,
+        arguments: argumentsResult.data,
+        verificationRunId: verification.id,
+        source: input.source,
+        replayCount: input.replayCount,
+      },
+    });
+  }
+
   private async assertNotCancelled(
     run: AgentRunRecord,
     signal?: AbortSignal,
@@ -721,6 +901,12 @@ function asTranscriptArguments(
   return parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
     ? (parsed as Record<string, unknown>)
     : { rawArguments: raw };
+}
+
+function toJsonRecords(
+  values: readonly object[],
+): Array<Record<string, unknown>> {
+  return values.map((value) => ({ ...value }));
 }
 
 function enforceOneMutationPerTurn(

@@ -220,6 +220,8 @@ export const networkEntrySchema = z
   })
   .strict();
 
+export type NetworkEntry = z.infer<typeof networkEntrySchema>;
+
 export const networkEvidenceSchema = z
   .object({
     revision: z.number().int().nonnegative(),
@@ -233,7 +235,7 @@ export const networkEvidenceSchema = z
 
 export type NetworkEvidence = z.infer<typeof networkEvidenceSchema>;
 
-const browserCommandSchema = z.discriminatedUnion("name", [
+export const browserCommandSchema = z.discriminatedUnion("name", [
   z.object({ name: z.literal("start_session") }).strict(),
   z.object({ name: z.literal("scan_dom") }).strict(),
   z
@@ -250,6 +252,8 @@ const browserCommandSchema = z.discriminatedUnion("name", [
     .strict(),
   z.object({ name: z.literal("end_session") }).strict(),
 ]);
+
+export type BrowserCommand = z.infer<typeof browserCommandSchema>;
 
 export const browserBridgeRequestSchema = z
   .object({

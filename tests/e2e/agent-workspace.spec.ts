@@ -39,6 +39,54 @@ type ToolInvocation = {
       rendered?: boolean;
       events?: Array<{ type?: string; message?: string }>;
     };
+    network?: {
+      entries?: Array<{
+        method?: string;
+        status?: number | null;
+        failed?: boolean;
+        url?: { path?: string };
+      }>;
+    };
+  } | null;
+};
+
+type VerificationChecks = {
+  buildOk: boolean | null;
+  runtimeOk: boolean | null;
+  consoleOk: boolean | null;
+  networkOk: boolean | null;
+  actionsOk: boolean | null;
+  assertionsOk: boolean | null;
+  revisionOk: boolean | null;
+};
+
+type VerificationRun = VerificationChecks & {
+  id: string;
+  runId: string;
+  revision: number;
+  status: "pending" | "running" | "passed" | "failed";
+  source: "agent" | "replay";
+  replayCount: number;
+  smokeSteps: Array<{ action?: string }>;
+  failedStep: number | null;
+  networkEvidence: {
+    entries?: Array<{
+      method?: string;
+      status?: number | null;
+      failed?: boolean;
+      url?: { path?: string };
+    }>;
+  } | null;
+};
+
+type VerificationStep = {
+  verificationRunId: string;
+  stepIndex: number;
+  action: string;
+  status: "passed" | "failed";
+  error: {
+    code?: string;
+    message?: string;
   } | null;
 };
 
@@ -59,6 +107,8 @@ type AgentSnapshot = {
       } | null;
     };
   }>;
+  verificationRuns: VerificationRun[];
+  verificationSteps: VerificationStep[];
 };
 
 async function createProject(page: Page, name: string): Promise<Project> {
@@ -173,6 +223,85 @@ async function waitForRunStatus(
   }
 
   throw new Error(`等待 Run 进入 ${status} 超时。`);
+}
+
+async function startAgentRunFromWorkspace(
+  page: Page,
+  prompt: string,
+): Promise<Run> {
+  await page.getByLabel("给 Agent 的消息").fill(prompt);
+  const runResponsePromise = page.waitForResponse(
+    (response) =>
+      response.url().endsWith("/api/agent-runs") &&
+      response.request().method() === "POST",
+  );
+  await page.getByRole("button", { name: "发送消息" }).click();
+  const runResponse = await runResponsePromise;
+  expect(runResponse.status()).toBe(201);
+  const body = (await runResponse.json()) as { run: Run };
+  return body.run;
+}
+
+async function waitForAgentSnapshot(
+  page: Page,
+  input: {
+    projectId: string;
+    conversationId: string;
+    predicate: (snapshot: AgentSnapshot) => boolean;
+    timeout?: number;
+  },
+): Promise<AgentSnapshot> {
+  const deadline = Date.now() + (input.timeout ?? 180_000);
+  let latestSnapshot: AgentSnapshot | null = null;
+
+  while (Date.now() < deadline) {
+    latestSnapshot = await readAgentSnapshot(
+      page,
+      input.projectId,
+      input.conversationId,
+    );
+    if (input.predicate(latestSnapshot)) {
+      return latestSnapshot;
+    }
+    await page.waitForTimeout(500);
+  }
+
+  const verificationSummary =
+    latestSnapshot?.verificationRuns.map((verification) => ({
+      revision: verification.revision,
+      status: verification.status,
+      source: verification.source,
+      replayCount: verification.replayCount,
+      failedStep: verification.failedStep,
+    })) ?? [];
+  throw new Error(
+    `等待 Agent 持久化目标证据超时。最新 Verification：${JSON.stringify(verificationSummary)}`,
+  );
+}
+
+function expectAllVerificationChecksPassed(
+  verification: VerificationRun,
+): void {
+  expect(verification).toMatchObject({
+    buildOk: true,
+    runtimeOk: true,
+    consoleOk: true,
+    networkOk: true,
+    actionsOk: true,
+    assertionsOk: true,
+    revisionOk: true,
+  });
+}
+
+function createDeferred<T = void>(): {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+} {
+  let resolvePromise!: (value: T) => void;
+  const promise = new Promise<T>((resolve) => {
+    resolvePromise = resolve;
+  });
+  return { promise, resolve: resolvePromise };
 }
 
 test.describe("Agent workspace live flow", () => {
@@ -551,5 +680,476 @@ createRoot(document.getElementById("root")!).render(<App />);
     const finalRun = await waitForTerminalRun(page, runBody.run.id);
     expect(finalRun.status).toBe("cancelled");
     expect(finalRun.currentRevision).toBe(project.revision);
+  });
+
+  test("repairs a form assertion failure and replays every original smoke step", async ({
+    page,
+  }) => {
+    test.setTimeout(540_000);
+    const project = await createProject(page, "M4 form assertion repair");
+    const brokenRevision = await writeProjectFile(page, {
+      projectId: project.id,
+      path: "src/index.tsx",
+      expectedRevision: project.revision,
+      content: `import { useState } from "react";
+import { createRoot } from "react-dom/client";
+
+function App() {
+  const [name, setName] = useState("");
+  const [message] = useState("尚未保存");
+
+  return (
+    <main>
+      <form onSubmit={(event) => event.preventDefault()}>
+        <label>
+          姓名
+          <input
+            data-testid="name-input"
+            value={name}
+            onChange={(event) => setName(event.target.value)}
+          />
+        </label>
+        <button data-testid="save-button" type="submit">
+          保存
+        </button>
+      </form>
+      <p data-testid="success-message">{message}</p>
+    </main>
+  );
+}
+
+createRoot(document.getElementById("root")!).render(<App />);
+`,
+    });
+    await page.goto(`/p/${project.id}`);
+
+    const prompt = [
+      `当前 revision 是 ${brokenRevision}。这是 M4 固定验收案例。`,
+      "第一步必须直接调用 browser_verify，不要先读文件或修改文件。",
+      "smoke steps 必须依次为：",
+      '1. fill test_id=name-input，value="Ada"；',
+      "2. click test_id=save-button；",
+      '3. assert_text test_id=success-message，text="保存成功：Ada"。',
+      "不要配置 acceptedNetworkFailures。",
+      "收到断言失败证据后，读取 src/index.tsx，只修复一次根因。",
+      "修改后等待系统自动在新 revision 重放完全相同的三步；",
+      "只有自动重放七项检查全部通过后才能结束。",
+    ].join("");
+    const createdRun = await startAgentRunFromWorkspace(page, prompt);
+    const run = await waitForTerminalRun(page, createdRun.id, 480_000);
+
+    expect(run.status, run.errorMessage ?? "表单行为错误未完成自动修复。").toBe(
+      "succeeded",
+    );
+    expect(run.currentRevision).toBeGreaterThan(brokenRevision);
+    expect(run.usage).toMatchObject({
+      repairRounds: expect.any(Number),
+      latestVerificationRevision: run.currentRevision,
+      latestVerificationOk: true,
+    });
+    expect(run.usage?.repairRounds ?? 0).toBeGreaterThanOrEqual(1);
+
+    const snapshot = await readAgentSnapshot(
+      page,
+      project.id,
+      run.conversationId,
+    );
+    const verifications = snapshot.verificationRuns.filter(
+      (verification) => verification.runId === run.id,
+    );
+    const initial = verifications.find(
+      (verification) => verification.source === "agent",
+    );
+    const replay = verifications.find(
+      (verification) =>
+        verification.source === "replay" &&
+        verification.revision === run.currentRevision &&
+        verification.status === "passed",
+    );
+
+    expect(initial).toMatchObject({
+      revision: brokenRevision,
+      status: "failed",
+      source: "agent",
+      replayCount: 0,
+      actionsOk: true,
+      assertionsOk: false,
+      failedStep: 2,
+    });
+    expect(replay).toBeDefined();
+    expect(replay!.replayCount).toBeGreaterThanOrEqual(1);
+    expect(replay!.smokeSteps).toEqual(initial!.smokeSteps);
+    expect(replay!.smokeSteps.map((step) => step.action)).toEqual([
+      "fill",
+      "click",
+      "assert_text",
+    ]);
+    expectAllVerificationChecksPassed(replay!);
+
+    const replaySteps = snapshot.verificationSteps.filter(
+      (step) => step.verificationRunId === replay!.id,
+    );
+    expect(replaySteps).toHaveLength(initial!.smokeSteps.length);
+    expect(replaySteps).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ stepIndex: 0, status: "passed" }),
+        expect.objectContaining({ stepIndex: 1, status: "passed" }),
+        expect.objectContaining({ stepIndex: 2, status: "passed" }),
+      ]),
+    );
+  });
+
+  test("captures a 500 response, repairs the API and passes browser replay", async ({
+    page,
+  }) => {
+    test.setTimeout(600_000);
+    const project = await createProject(page, "M4 API 500 repair");
+    let revision = await writeProjectFile(page, {
+      projectId: project.id,
+      path: "src/index.tsx",
+      expectedRevision: project.revision,
+      content: `import { useState } from "react";
+import { createRoot } from "react-dom/client";
+
+function App() {
+  const [title, setTitle] = useState("");
+  const [message, setMessage] = useState("尚未保存");
+
+  async function save() {
+    const response = await fetch("/api/save", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ title }),
+    });
+    setMessage(response.ok ? "保存成功" : "保存失败");
+  }
+
+  return (
+    <main>
+      <input
+        data-testid="title-input"
+        value={title}
+        onChange={(event) => setTitle(event.target.value)}
+      />
+      <button data-testid="save-button" type="button" onClick={save}>
+        保存
+      </button>
+      <p data-testid="save-status">{message}</p>
+    </main>
+  );
+}
+
+createRoot(document.getElementById("root")!).render(<App />);
+`,
+    });
+    revision = await writeProjectFile(page, {
+      projectId: project.id,
+      path: "rsbuild.config.ts",
+      expectedRevision: revision,
+      content: `import { defineConfig } from "@rsbuild/core";
+import { pluginReact } from "@rsbuild/plugin-react";
+
+export default defineConfig({
+  plugins: [pluginReact()],
+  html: {
+    template: "./index.html",
+  },
+  server: {
+    host: "0.0.0.0",
+    port: 5173,
+    strictPort: true,
+    setup({ server }) {
+      server.middlewares.use("/api/save", (_request, response) => {
+        response.statusCode = 500;
+        response.setHeader("content-type", "application/json");
+        response.end(JSON.stringify({ error: "fixed M4 failure" }));
+      });
+    },
+  },
+});
+`,
+    });
+    await page.goto(`/p/${project.id}`);
+
+    const prompt = [
+      `当前 revision 是 ${revision}。这是 M4 固定 Network evidence 验收案例。`,
+      "第一步必须直接调用 browser_verify，不要先读或改文件。",
+      "smoke steps 必须依次为：",
+      '1. fill test_id=title-input，value="M4 report"；',
+      "2. click test_id=save-button；",
+      '3. assert_text test_id=save-status，text="保存成功"。',
+      "不要接受或忽略任何网络失败。",
+      "首次验证应捕获 POST /api/save 的 500；根据该 Network evidence 定位根因。",
+      "修复后必须让系统自动重放原始三步，并且 Network 与其余六项检查全部通过。",
+    ].join("");
+    const createdRun = await startAgentRunFromWorkspace(page, prompt);
+    const run = await waitForTerminalRun(page, createdRun.id, 540_000);
+
+    expect(run.status, run.errorMessage ?? "API 500 未完成自动修复。").toBe(
+      "succeeded",
+    );
+    expect(run.currentRevision).toBeGreaterThan(revision);
+    expect(run.usage).toMatchObject({
+      latestVerificationRevision: run.currentRevision,
+      latestVerificationOk: true,
+    });
+
+    const snapshot = await readAgentSnapshot(
+      page,
+      project.id,
+      run.conversationId,
+    );
+    const verifications = snapshot.verificationRuns.filter(
+      (verification) => verification.runId === run.id,
+    );
+    const failedWith500 = verifications.find((verification) =>
+      verification.networkEvidence?.entries?.some(
+        (entry) =>
+          entry.method === "POST" &&
+          entry.url?.path === "/api/save" &&
+          entry.status === 500 &&
+          entry.failed === true,
+      ),
+    );
+    const replay = verifications.find(
+      (verification) =>
+        verification.source === "replay" &&
+        verification.revision === run.currentRevision &&
+        verification.status === "passed",
+    );
+
+    expect(failedWith500).toMatchObject({
+      status: "failed",
+      networkOk: false,
+    });
+    expect(replay).toBeDefined();
+    expect(replay!.replayCount).toBeGreaterThanOrEqual(1);
+    expect(replay!.smokeSteps).toEqual(failedWith500!.smokeSteps);
+    expectAllVerificationChecksPassed(replay!);
+  });
+
+  test("fails an ambiguous role-name target without clicking a random element", async ({
+    page,
+  }) => {
+    test.setTimeout(360_000);
+    const project = await createProject(page, "M4 ambiguous browser target");
+    const revision = await writeProjectFile(page, {
+      projectId: project.id,
+      path: "src/index.tsx",
+      expectedRevision: project.revision,
+      content: `import { useState } from "react";
+import { createRoot } from "react-dom/client";
+
+function App() {
+  const [message, setMessage] = useState("未操作");
+
+  return (
+    <main>
+      <button type="button" onClick={() => setMessage("删除了第一项")}>
+        删除
+      </button>
+      <button type="button" onClick={() => setMessage("删除了第二项")}>
+        删除
+      </button>
+      <p data-testid="delete-status">{message}</p>
+    </main>
+  );
+}
+
+createRoot(document.getElementById("root")!).render(<App />);
+`,
+    });
+    await page.goto(`/p/${project.id}`);
+
+    const prompt = [
+      `当前 revision 是 ${revision}。这是 M4 target ambiguity 验收，不需要修复代码。`,
+      "第一步必须直接调用 browser_verify。",
+      '第一步必须是 click，target 必须严格使用 {"strategy":"role_name","role":"button","name":"删除"}；',
+      '第二步使用 assert_text test_id=delete-status，text="删除了第一项"。',
+      "不要改用 test_id、CSS 或 scan_id，也不要在失败后修改文件。",
+      "目标歧义时保留结构化失败并等待，不要随机选择任一按钮。",
+    ].join("");
+    const createdRun = await startAgentRunFromWorkspace(page, prompt);
+    const snapshot = await waitForAgentSnapshot(page, {
+      projectId: project.id,
+      conversationId: createdRun.conversationId,
+      timeout: 300_000,
+      predicate: (current) =>
+        current.verificationSteps.some(
+          (step) =>
+            step.action === "click" &&
+            step.status === "failed" &&
+            step.error?.code === "target_ambiguous" &&
+            current.verificationRuns.some(
+              (verification) =>
+                verification.id === step.verificationRunId &&
+                verification.runId === createdRun.id,
+            ),
+        ),
+    });
+    const ambiguousStep = snapshot.verificationSteps.find(
+      (step) =>
+        step.action === "click" &&
+        step.status === "failed" &&
+        step.error?.code === "target_ambiguous" &&
+        snapshot.verificationRuns.some(
+          (verification) =>
+            verification.id === step.verificationRunId &&
+            verification.runId === createdRun.id,
+        ),
+    );
+    const verification = snapshot.verificationRuns.find(
+      (item) => item.id === ambiguousStep?.verificationRunId,
+    );
+
+    expect(verification).toMatchObject({
+      runId: createdRun.id,
+      revision,
+      status: "failed",
+      actionsOk: false,
+      assertionsOk: false,
+      failedStep: 0,
+    });
+    expect(ambiguousStep).toMatchObject({
+      stepIndex: 0,
+      status: "failed",
+      error: {
+        code: "target_ambiguous",
+        message: expect.stringContaining("2"),
+      },
+    });
+    expect(
+      snapshot.verificationSteps.some(
+        (step) =>
+          step.verificationRunId === verification?.id && step.stepIndex === 1,
+      ),
+    ).toBe(false);
+
+    // 此案例的通过条件就是明确失败。Run 可能已恢复给模型，因此主动取消，
+    // 避免它在下一轮违背夹具约束并尝试“修复”本来就故意重复的按钮。
+    await page.request.post(`/api/agent-runs/${createdRun.id}/cancel`);
+    const cancelled = await waitForTerminalRun(page, createdRun.id);
+    expect(cancelled.status).toBe("cancelled");
+    expect(cancelled.currentRevision).toBe(revision);
+  });
+
+  test("rejects a successful browser result after the repository advances", async ({
+    page,
+  }) => {
+    test.setTimeout(360_000);
+    const project = await createProject(page, "M4 stale browser result");
+    const revision = await writeProjectFile(page, {
+      projectId: project.id,
+      path: "src/index.tsx",
+      expectedRevision: project.revision,
+      content: `import { createRoot } from "react-dom/client";
+
+function App() {
+  return <h1 data-testid="revision-label">revision ${project.revision + 1}</h1>;
+}
+
+createRoot(document.getElementById("root")!).render(<App />);
+`,
+    });
+    await page.goto(`/p/${project.id}`);
+
+    const interceptedResult = createDeferred<string>();
+    const clientResultGate = createDeferred();
+
+    // Browser 已在旧 revision 上完成成功验证，但先不让结果到达服务端。
+    // 在请求闸门打开前推进 Repository，复现用户保存与客户端迟到结果的竞态。
+    await page.route(
+      "**/api/agent-runs/*/client-tool-results",
+      async (route) => {
+        const payload = route.request().postDataJSON() as {
+          toolName?: string;
+          revision?: number;
+          result?: { ok?: boolean; verificationRunId?: string };
+        };
+        if (
+          payload.toolName === "browser_verify" &&
+          payload.revision === revision &&
+          payload.result?.ok === true &&
+          payload.result.verificationRunId
+        ) {
+          interceptedResult.resolve(payload.result.verificationRunId);
+          await clientResultGate.promise;
+        }
+        await route.continue();
+      },
+    );
+
+    const prompt = [
+      `当前 revision 是 ${revision}。第一步直接调用 browser_verify，不要读取或修改文件。`,
+      `只执行 assert_text test_id=revision-label，text="revision ${revision}"。`,
+      "验证成功后不要调用其他工具。",
+    ].join("");
+    const createdRun = await startAgentRunFromWorkspace(page, prompt);
+    const staleVerificationRunId = await interceptedResult.promise;
+
+    const newerRevision = await writeProjectFile(page, {
+      projectId: project.id,
+      path: "src/index.tsx",
+      expectedRevision: revision,
+      content: `import { createRoot } from "react-dom/client";
+
+function App() {
+  return <h1 data-testid="revision-label">revision ${revision + 1}</h1>;
+}
+
+createRoot(document.getElementById("root")!).render(<App />);
+`,
+    });
+    expect(newerRevision).toBe(revision + 1);
+    clientResultGate.resolve();
+
+    const snapshot = await waitForAgentSnapshot(page, {
+      projectId: project.id,
+      conversationId: createdRun.conversationId,
+      predicate: (current) =>
+        current.events.some(
+          (event) =>
+            event.type === "client_tool.result_ignored" &&
+            event.payload.reason === "stale_revision" &&
+            event.payload.repositoryRevision === newerRevision,
+        ),
+    });
+    const staleVerification = snapshot.verificationRuns.find(
+      (verification) => verification.id === staleVerificationRunId,
+    );
+    const ignoredEvent = snapshot.events.find(
+      (event) =>
+        event.type === "client_tool.result_ignored" &&
+        event.payload.reason === "stale_revision",
+    );
+
+    expect(staleVerification).toMatchObject({
+      runId: createdRun.id,
+      revision,
+      status: "running",
+      revisionOk: null,
+    });
+    expect(ignoredEvent?.payload).toMatchObject({
+      submittedRevision: revision,
+      currentRevision: revision,
+      repositoryRevision: newerRevision,
+    });
+
+    const waitingRunResponse = await page.request.get(
+      `/api/agent-runs/${createdRun.id}`,
+    );
+    const waitingRunBody = (await waitingRunResponse.json()) as { run: Run };
+    expect(waitingRunBody.run).toMatchObject({
+      status: "awaiting_client_tool",
+      currentRevision: revision,
+      usage: {
+        latestVerificationRevision: null,
+        latestVerificationOk: null,
+      },
+    });
+
+    await page.request.post(`/api/agent-runs/${createdRun.id}/cancel`);
+    const cancelled = await waitForTerminalRun(page, createdRun.id);
+    expect(cancelled.status).toBe("cancelled");
   });
 });
