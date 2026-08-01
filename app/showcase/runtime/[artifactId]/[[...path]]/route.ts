@@ -4,6 +4,10 @@ import { z } from "zod";
 import { serverEnv } from "@/infrastructure/env/server";
 import { normalizeArtifactPath } from "@/infrastructure/showcase/artifact";
 import { readPublishedArtifactFile } from "@/infrastructure/showcase/repository";
+import {
+  buildShowcaseRuntimeCsp,
+  getShowcaseRuntimeCacheControl,
+} from "@/infrastructure/showcase/runtime-policy";
 
 const paramsSchema = z
   .object({
@@ -46,11 +50,11 @@ export async function GET(
 
     return new NextResponse(file.stream, {
       headers: {
-        "Cache-Control": file.isEntry
-          ? "no-store, max-age=0"
-          : "public, max-age=31536000, immutable",
+        "Cache-Control": getShowcaseRuntimeCacheControl(file.isEntry),
         "Content-Length": String(file.size),
-        "Content-Security-Policy": buildRuntimeCsp(),
+        "Content-Security-Policy": buildShowcaseRuntimeCsp(
+          serverEnv.SHOWCASE_PARENT_ORIGIN,
+        ),
         "Content-Type": file.contentType,
         "Cross-Origin-Resource-Policy": "same-origin",
         "Permissions-Policy": "camera=(), geolocation=(), microphone=()",
@@ -77,24 +81,6 @@ export async function GET(
       500,
     );
   }
-}
-
-function buildRuntimeCsp(): string {
-  const parentOrigin = serverEnv.SHOWCASE_PARENT_ORIGIN?.replace(/\/$/, "");
-
-  return [
-    "default-src 'none'",
-    "script-src 'self'",
-    "style-src 'self' 'unsafe-inline'",
-    "img-src 'self' data: blob:",
-    "font-src 'self' data:",
-    "connect-src 'none'",
-    "media-src 'self' data: blob:",
-    "object-src 'none'",
-    "base-uri 'none'",
-    "form-action 'none'",
-    `frame-ancestors 'self'${parentOrigin ? ` ${parentOrigin}` : ""}`,
-  ].join("; ");
 }
 
 function runtimeError(code: string, message: string, status: number) {
