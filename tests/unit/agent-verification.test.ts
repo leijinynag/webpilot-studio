@@ -13,7 +13,10 @@ import {
   getPreviewVerificationState,
 } from "@/domains/agent/verification";
 
-function createRun(currentRevision: number): AgentRunRecord {
+function createRun(
+  currentRevision: number,
+  options: { fileMutations?: number } = {},
+): AgentRunRecord {
   const now = new Date();
   return {
     id: "run-1",
@@ -50,10 +53,12 @@ function createRun(currentRevision: number): AgentRunRecord {
       modelTurns: 0,
       inputTokens: 0,
       outputTokens: 0,
-      fileMutations: 0,
+      fileMutations: options.fileMutations ?? 0,
       clientResumes: 0,
       repairRounds: 0,
       repeatedFailureCount: 0,
+      activeExecutionDurationMs: 0,
+      activeExecutionStartedAt: null,
       firstPreviewAt: null,
       firstPreviewDurationMs: null,
       latestPreviewAt: null,
@@ -79,6 +84,7 @@ function createRuntimeFailure(revision: number): RunPreviewResult {
     ok: false,
     toolName: "run_preview",
     revision,
+    durationMs: 2_345,
     summary: "页面产生 1 个运行时错误。",
     build: {
       revision,
@@ -124,6 +130,7 @@ function createBrowserResult(
     verificationRunId: "00000000-0000-4000-8000-000000000001",
     revision,
     replayCount: 0,
+    durationMs: 3_456,
     summary: "客户端声称验证通过。",
     build: {
       revision,
@@ -274,6 +281,22 @@ describe("Agent preview verification", () => {
     );
     expect(buildVerificationDirective(createRun(4), transcript)).toContain(
       "latest preview covered revision 3",
+    );
+  });
+
+  it("只读 Run 没有验证请求时允许模型直接结束", () => {
+    const run = createRun(1, { fileMutations: 0 });
+
+    expect(buildVerificationDirective(run, [])).toContain(
+      "may answer and finish now",
+    );
+  });
+
+  it("发生文件 mutation 后仍要求当前 revision 的 Preview", () => {
+    const run = createRun(1, { fileMutations: 1 });
+
+    expect(buildVerificationDirective(run, [])).toContain(
+      "Do not finish. Call run_preview",
     );
   });
 });

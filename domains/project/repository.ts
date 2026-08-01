@@ -151,14 +151,10 @@ export class DatabaseProjectRepository<
   }): Promise<ProjectDescription> {
     const name = normalizeProjectName(input.name);
     const storageKind = input.storageKind ?? "database";
-
-    if (input.initialFiles.length === 0) {
-      throw new ProjectError(
-        PROJECT_ERROR_CODES.invalidRequest,
-        "新项目至少需要一个初始文件。",
-        400,
-      );
-    }
+    // 空 Repository 从 revision 0 起步；显式模板仍以 revision 1 表示首次
+    // 文件快照。两种项目都创建 revision 行，Agent checkpoint 因而可以统一
+    // 引用完整历史事实，不需要为“尚无文件”增加旁路逻辑。
+    const initialRevision = input.initialFiles.length === 0 ? 0 : 1;
 
     for (const file of input.initialFiles) {
       assertValidProjectPath(file.path);
@@ -172,7 +168,7 @@ export class DatabaseProjectRepository<
           name,
           storageKind,
           status: "ready",
-          revision: 1,
+          revision: initialRevision,
         })
         .returning();
 
@@ -182,9 +178,12 @@ export class DatabaseProjectRepository<
 
       const revisionId = await insertRevision(tx, {
         projectId: project.id,
-        revision: 1,
+        revision: initialRevision,
         kind: "initial",
-        summary: "Initialize project template",
+        summary:
+          initialRevision === 0
+            ? "Initialize empty project"
+            : "Initialize project template",
       });
 
       for (const file of input.initialFiles) {
@@ -626,6 +625,9 @@ export class DatabaseProjectRepository<
 
     return {
       id: checkpoint.id,
+      projectId: project.id,
+      runId: null,
+      kind: "revision",
       revision: checkpoint.revision,
       summary: input.summary?.trim() || checkpoint.summary,
       createdAt: checkpoint.createdAt.toISOString(),

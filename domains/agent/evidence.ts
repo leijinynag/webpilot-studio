@@ -99,6 +99,8 @@ export const runtimeBridgeDiagnosticSchema = z
       "invalid_envelope",
       "unknown_run",
       "stale_revision",
+      "frame_load_timeout",
+      "bridge_unresponsive",
     ]),
     message: z.string().max(500),
     timestamp: timestampSchema,
@@ -174,6 +176,9 @@ export const runPreviewResultSchema = z
     ok: z.boolean(),
     toolName: z.literal(RUN_PREVIEW_TOOL_NAME),
     revision: z.number().int().nonnegative(),
+    // 只统计客户端真正执行 WebContainer 启动、安装、渲染观察的时间。
+    // Tool Ledger 从请求落库到页面恢复之间的等待不能混入该指标。
+    durationMs: z.number().int().nonnegative().max(300_000),
     summary: z.string().min(1).max(2_048),
     build: buildEvidenceSchema,
     runtime: runtimeEvidenceSchema,

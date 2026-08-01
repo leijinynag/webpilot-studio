@@ -13,7 +13,9 @@ export const createProjectRequestSchema = z
   .object({
     name: z.string().trim().min(1).max(120),
     storageKind: z.enum(["database", "browser_git"]).default("database"),
-    template: z.enum(["rsbuild"]).default("rsbuild"),
+    // 面向用户的新项目默认是真正的空 Repository。保留 rsbuild 选项仅用于
+    // 兼容明确选择模板的旧调用方与运行时集成测试，不能再由 UI 隐式发送。
+    template: z.enum(["empty", "rsbuild"]).default("empty"),
   })
   .strict();
 

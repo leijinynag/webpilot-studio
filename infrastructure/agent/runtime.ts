@@ -1,6 +1,10 @@
 import "server-only";
 
-import { AGENT_ERROR_CODES, isAgentError } from "@/domains/agent/errors";
+import {
+  AGENT_ERROR_CODES,
+  isAgentError,
+  serializeAgentError,
+} from "@/domains/agent/errors";
 import { AgentOrchestrator } from "@/domains/agent/orchestrator";
 import { FileToolExecutor } from "@/domains/agent/file-tools";
 import { withAgentRunController } from "@/infrastructure/agent/run-controller";
@@ -45,6 +49,12 @@ export async function launchAgentRun(input: {
       });
     }
 
-    console.error("[agent-runtime]", error);
+    console.error(
+      "[agent-runtime]",
+      JSON.stringify({
+        runId: input.runId,
+        ...serializeAgentError(error),
+      }),
+    );
   }
 }

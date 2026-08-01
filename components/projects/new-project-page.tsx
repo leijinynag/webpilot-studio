@@ -40,7 +40,7 @@ export function NewProjectPage() {
         body: JSON.stringify({
           name,
           storageKind: "database",
-          template: "rsbuild",
+          template: "empty",
         }),
       });
       const body = (await response.json()) as CreateProjectResponse;
@@ -72,8 +72,8 @@ export function NewProjectPage() {
             <br />a place to live.
           </h1>
           <p className="create-lede">
-            选择代码保存方式和起点。项目创建后，Agent、编辑器、Preview 与 Source
-            Control 会围绕同一份 Repository 工作。
+            创建一份干净的 Repository，再由你或 Agent 写入第一版代码。Preview
+            只会在需要运行时准备环境。
           </p>
         </div>
         <div className="create-steps" aria-label="创建进度">
@@ -172,6 +172,9 @@ export function NewProjectPage() {
               </button>
             ))}
           </div>
+          <p className="field-hint">
+            Blank 不会预置示例文件；第一笔保存或 Agent 修改将创建 revision 1。
+          </p>
         </div>
 
         <div className="form-section">

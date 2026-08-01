@@ -12,6 +12,7 @@ import {
   ArrowRight,
   ExternalLink,
   Monitor,
+  Play,
   RefreshCw,
   RotateCcw,
   Smartphone,
@@ -56,22 +57,34 @@ import { WEB_CONTAINER_PHASE_LABELS } from "@/infrastructure/webcontainer/lifecy
 import { injectRuntimeBridge } from "@/infrastructure/webcontainer/runtime-bridge";
 import { webContainerRuntimeManager } from "@/infrastructure/webcontainer/runtime-manager";
 
-export function WebContainerPreview({
-  clientToolRequest,
-  files,
-  onClientToolResult,
-  projectId,
-  revision,
-}: {
+type WebContainerPreviewProps = {
   clientToolRequest?: ClientToolRequest | null;
   files: readonly ProjectFileSnapshot[];
   onClientToolResult?: (
     request: ClientToolRequest,
     result: ClientToolResult,
-  ) => void | Promise<void>;
+  ) =>
+    | "accepted"
+    | "duplicate"
+    | "ignored"
+    | Promise<"accepted" | "duplicate" | "ignored">;
   projectId: string;
   revision: number;
-}) {
+};
+
+export function WebContainerPreview(props: WebContainerPreviewProps) {
+  // 一个项目拥有一份独立的预览交互状态。projectId 改变时强制重建内部实例，
+  // 这样“用户曾为旧项目点击运行”不会变成新项目或返回旧项目时的隐式安装授权。
+  return <ProjectWebContainerPreview key={props.projectId} {...props} />;
+}
+
+function ProjectWebContainerPreview({
+  clientToolRequest,
+  files,
+  onClientToolResult,
+  projectId,
+  revision,
+}: WebContainerPreviewProps) {
   // Manager 是 React 外部状态源。useSyncExternalStore 能在并发渲染下提供一致快照，
   // 也避免把 WebContainer 的进程状态复制成多份组件本地 state。
   const snapshot = useSyncExternalStore(
@@ -79,12 +92,40 @@ export function WebContainerPreview({
     webContainerRuntimeManager.getSnapshot,
     webContainerRuntimeManager.getSnapshot,
   );
+  const runtimeBelongsToProject =
+    webContainerRuntimeManager.isActiveProject(projectId);
+  // Manager 是标签页级单例，切换项目时 React 可能先渲染一帧旧项目快照。
+  // 页面只展示当前项目真正拥有的状态，避免把上一项目的 URL、日志或失败诊断带进来。
+  const visibleSnapshot = runtimeBelongsToProject
+    ? snapshot
+    : {
+        ...snapshot,
+        phase: "idle" as const,
+        previewUrl: null,
+        port: null,
+        diagnostic: null,
+        logs: [],
+        syncedRevision: null,
+      };
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const evidenceCollectorRef = useRef<PreviewEvidenceCollector | null>(null);
+  const frameLoadStateRef = useRef<{
+    executionKey: string | null;
+    loadCount: number;
+  }>({
+    executionKey: null,
+    loadCount: 0,
+  });
   const browserBridgeControllerRef = useRef(new BrowserBridgeController());
   const submittedToolCallIdsRef = useRef(new Set<string>());
+  const executingToolCallIdsRef = useRef(new Set<string>());
+  const retryTimerIdsRef = useRef(new Map<string, number>());
   const [frameRevision, setFrameRevision] = useState(0);
   const [compactViewport, setCompactViewport] = useState(false);
+  const [clientToolRetryNonce, setClientToolRetryNonce] = useState(0);
+  const [runtimeRequested, setRuntimeRequested] = useState(() =>
+    webContainerRuntimeManager.isActiveProject(projectId),
+  );
   const projectTree = useMemo(
     () =>
       buildProjectTemplate(
@@ -92,14 +133,51 @@ export function WebContainerPreview({
       ),
     [files],
   );
+  const projectTreeRef = useRef(projectTree);
+  const onClientToolResultRef = useRef(onClientToolResult);
+  const clientToolRequestRef = useRef(clientToolRequest);
+  const previewUrlRef = useRef<string | null>(snapshot.previewUrl);
+  const clientToolExecutionKey = createClientToolExecutionKey(
+    clientToolRequest,
+    projectId,
+    revision,
+  );
+  const activeClientToolExecutionKeyRef = useRef(clientToolExecutionKey);
 
   useEffect(() => {
-    if (clientToolRequest) {
+    // 这些 ref 只服务于已经启动的异步工具执行，不参与当前渲染结果。
+    // 在 commit 后同步最新值，既满足 React 的纯渲染约束，也让旧执行器能在
+    // 下一段异步步骤前识别 project/revision/toolCall 已经发生变化。
+    projectTreeRef.current = projectTree;
+    onClientToolResultRef.current = onClientToolResult;
+    clientToolRequestRef.current = clientToolRequest;
+    previewUrlRef.current = snapshot.previewUrl;
+    activeClientToolExecutionKeyRef.current = clientToolExecutionKey;
+  }, [
+    clientToolExecutionKey,
+    onClientToolResult,
+    projectTree,
+    snapshot.previewUrl,
+  ]);
+
+  useEffect(() => {
+    // 进入工作台只切换 Runtime 的项目上下文，不触发 boot/install。若当前标签页
+    // 正在持有另一个项目的容器，Manager 会先释放它，防止展示跨项目旧预览。
+    webContainerRuntimeManager.activateProject(projectId);
+  }, [projectId]);
+
+  useEffect(() => {
+    if (
+      clientToolExecutionKey ||
+      !runtimeRequested ||
+      projectTreeIsEmpty(projectTree)
+    ) {
       return;
     }
 
     evidenceCollectorRef.current = null;
-    // React Strict Mode 会重复执行开发态 effect，Manager 内部负责合并为同一次启动。
+    // 用户显式启动后，Repository revision 变化继续走增量同步；只有依赖清单或
+    // 构建配置改变时 Manager 才重建运行镜像。Strict Mode 的重复 effect 会被合并。
     void webContainerRuntimeManager
       .start(
         projectTree,
@@ -111,27 +189,71 @@ export function WebContainerPreview({
         // 错误已经写入可订阅 snapshot，由页面统一展示诊断，避免产生未处理 Promise。
       });
     // 组件卸载时不 teardown：路由切换后仍应复用同一标签页内昂贵的 WebContainer 实例。
-  }, [clientToolRequest, projectId, projectTree, revision]);
+  }, [
+    clientToolExecutionKey,
+    projectId,
+    projectTree,
+    revision,
+    runtimeRequested,
+  ]);
 
   useEffect(() => {
     const requestResult = clientToolRequestSchema.safeParse(clientToolRequest);
     if (
       !requestResult.success ||
+      !clientToolExecutionKey ||
       requestResult.data.projectId !== projectId ||
       requestResult.data.revision !== revision ||
-      submittedToolCallIdsRef.current.has(requestResult.data.toolCallId)
+      submittedToolCallIdsRef.current.has(requestResult.data.toolCallId) ||
+      executingToolCallIdsRef.current.has(clientToolExecutionKey)
     ) {
       return;
     }
 
     const request = requestResult.data;
+    const executionKey = clientToolExecutionKey;
+    executingToolCallIdsRef.current.add(executionKey);
+    // iframe load 事实必须绑定本次 Tool Call。否则上一次普通 Preview 的 load
+    // 事件会让本次 Agent 验证误以为已经加载了注入 Runtime Bridge 的文档。
+    frameLoadStateRef.current = {
+      executionKey,
+      loadCount: 0,
+    };
     const collector = new PreviewEvidenceCollector(request.revision);
-    const instrumentedTree = injectRuntimeBridge(projectTree, {
+    // 同一 revision 的 Repository 快照可能因 reconcile 产生新的对象引用。
+    // 执行开始时冻结当前文件树，后续普通 rerender 不得取消并重建同一个浏览器动作。
+    const instrumentedTree = injectRuntimeBridge(projectTreeRef.current, {
       runId: request.runId,
       revision: request.revision,
     });
-    let cancelled = false;
     evidenceCollectorRef.current = collector;
+
+    function isStaleExecution(): boolean {
+      return activeClientToolExecutionKeyRef.current !== executionKey;
+    }
+
+    function scheduleRetry() {
+      if (
+        isStaleExecution() ||
+        submittedToolCallIdsRef.current.has(request.toolCallId) ||
+        retryTimerIdsRef.current.has(executionKey)
+      ) {
+        return;
+      }
+
+      // ignored 常见于客户端结果比挂起事务更早抵达，网络失败也可能只是瞬时故障。
+      // 保持 Bridge 运行镜像不变，短暂退避后用同一幂等键重新执行并提交。
+      const timerId = window.setTimeout(() => {
+        retryTimerIdsRef.current.delete(executionKey);
+        if (
+          activeClientToolExecutionKeyRef.current === executionKey &&
+          !submittedToolCallIdsRef.current.has(request.toolCallId)
+        ) {
+          setClientToolRetryNonce((current) => current + 1);
+        }
+      }, 1_200);
+      retryTimerIdsRef.current.set(executionKey, timerId);
+    }
 
     function sendBrowserCommand(input: {
       command: BrowserCommand;
@@ -148,6 +270,9 @@ export function WebContainerPreview({
     }
 
     async function executeClientTool() {
+      // 从真正开始执行客户端副作用时计时。请求可能已经在数据库等待了很久，
+      // 但页面未打开、会话未选中等自然等待不属于安装与预览性能。
+      const executionStartedAt = Date.now();
       let browserResult: BrowserExecutionEvidence | null = null;
       let networkResult: NetworkEvidence | null = null;
       let browserSessionStarted = false;
@@ -164,7 +289,7 @@ export function WebContainerPreview({
           `agent:${request.runId}:${request.toolCallId}:${request.revision}`,
         );
 
-        if (cancelled) {
+        if (isStaleExecution()) {
           return;
         }
 
@@ -178,11 +303,18 @@ export function WebContainerPreview({
           collector,
           request,
           iframeRef,
+          hasFrameLoaded: () =>
+            frameLoadStateRef.current.executionKey === executionKey &&
+            frameLoadStateRef.current.loadCount > 0,
           reloadFrame: () => {
             setFrameRevision((current) => current + 1);
           },
           timeoutMs: 15_000,
         });
+
+        if (isStaleExecution()) {
+          return;
+        }
 
         if (request.toolName === BROWSER_VERIFY_TOOL_NAME && browserSessionId) {
           const previewUrl =
@@ -243,12 +375,13 @@ export function WebContainerPreview({
           await delay(request.arguments.observationMs);
         }
 
-        if (cancelled) {
+        if (isStaleExecution()) {
           return;
         }
 
         const previewResult = collector.finish(
           webContainerRuntimeManager.getSnapshot(),
+          Date.now() - executionStartedAt,
         );
         await submitResult(
           request.toolName === BROWSER_VERIFY_TOOL_NAME
@@ -273,11 +406,12 @@ export function WebContainerPreview({
             : previewResult,
         );
       } catch (error) {
-        if (!cancelled) {
+        if (!isStaleExecution()) {
           // 安装、构建或 dev server 失败已经进入 Manager snapshot。
           // 即使没有 iframe 消息，也必须返回结构化 BuildEvidence 给 Agent。
           const previewResult = collector.finish(
             webContainerRuntimeManager.getSnapshot(),
+            Date.now() - executionStartedAt,
           );
           await submitResult(
             request.toolName === BROWSER_VERIFY_TOOL_NAME
@@ -324,35 +458,68 @@ export function WebContainerPreview({
             // 下一次重建清理，不能覆盖已经完成的验证结果。
           }
         }
+        executingToolCallIdsRef.current.delete(executionKey);
+        if (frameLoadStateRef.current.executionKey === executionKey) {
+          frameLoadStateRef.current = {
+            executionKey: null,
+            loadCount: 0,
+          };
+        }
+        if (evidenceCollectorRef.current === collector) {
+          evidenceCollectorRef.current = null;
+        }
       }
     }
 
     async function submitResult(result: ClientToolResult) {
       if (
-        cancelled ||
+        isStaleExecution() ||
         submittedToolCallIdsRef.current.has(request.toolCallId)
       ) {
         return;
       }
 
       try {
-        await onClientToolResult?.(request, result);
-        submittedToolCallIdsRef.current.add(request.toolCallId);
+        const disposition = await onClientToolResultRef.current?.(
+          request,
+          result,
+        );
+
+        // accepted/duplicate 表示服务端已经保存这份幂等结果，后续快照重建时
+        // 不应重复执行浏览器动作。ignored 可能只是 Run 挂起事务尚未可见；
+        // 此时不能永久封存 toolCallId，恢复等待态后仍需允许同一请求重试。
+        if (disposition === "ignored") {
+          scheduleRetry();
+        } else {
+          submittedToolCallIdsRef.current.add(request.toolCallId);
+        }
       } catch {
         // 网络失败时保留请求为 pending，允许后续 effect/刷新使用相同幂等键重试。
         submittedToolCallIdsRef.current.delete(request.toolCallId);
+        scheduleRetry();
       }
     }
 
     void executeClientTool();
+  }, [
+    clientToolExecutionKey,
+    clientToolRequest,
+    clientToolRetryNonce,
+    projectId,
+    revision,
+  ]);
 
-    return () => {
-      cancelled = true;
-      if (evidenceCollectorRef.current === collector) {
-        evidenceCollectorRef.current = null;
+  useEffect(
+    () => () => {
+      // 卸载后所有在途异步步骤都应视为 stale，不能再向已离开的工作台提交证据。
+      activeClientToolExecutionKeyRef.current = null;
+      for (const timerId of retryTimerIdsRef.current.values()) {
+        window.clearTimeout(timerId);
       }
-    };
-  }, [clientToolRequest, onClientToolResult, projectId, projectTree, revision]);
+      retryTimerIdsRef.current.clear();
+    },
+    [],
+  );
 
   useEffect(() => {
     const controller = browserBridgeControllerRef.current;
@@ -366,7 +533,9 @@ export function WebContainerPreview({
         | "invalid_origin"
         | "invalid_envelope"
         | "unknown_run"
-        | "stale_revision",
+        | "stale_revision"
+        | "frame_load_timeout"
+        | "bridge_unresponsive",
       message: string,
     ) {
       evidenceCollectorRef.current?.addDiagnostic({
@@ -383,7 +552,7 @@ export function WebContainerPreview({
 
       const collector = evidenceCollectorRef.current;
       const requestResult =
-        clientToolRequestSchema.safeParse(clientToolRequest);
+        clientToolRequestSchema.safeParse(clientToolRequestRef.current);
       if (!collector || !requestResult.success) {
         return;
       }
@@ -404,8 +573,8 @@ export function WebContainerPreview({
         return;
       }
 
-      const expectedOrigin = snapshot.previewUrl
-        ? new URL(snapshot.previewUrl).origin
+      const expectedOrigin = previewUrlRef.current
+        ? new URL(previewUrlRef.current).origin
         : null;
       if (!expectedOrigin || event.origin !== expectedOrigin) {
         recordDiagnostic(
@@ -446,27 +615,32 @@ export function WebContainerPreview({
 
     window.addEventListener("message", handleRuntimeMessage);
     return () => window.removeEventListener("message", handleRuntimeMessage);
-  }, [clientToolRequest, snapshot.previewUrl]);
+  }, []);
 
   // previewUrl 只在 server-ready 后写入；二次校验 phase 可防止服务退出后继续渲染旧 iframe。
-  const isReady = snapshot.phase === "ready" && snapshot.previewUrl;
+  const isReady =
+    visibleSnapshot.phase === "ready" && visibleSnapshot.previewUrl;
   const frameUrl = useMemo(
     () =>
-      snapshot.previewUrl
+      visibleSnapshot.previewUrl
         ? createPreviewFrameUrl(
-            snapshot.previewUrl,
+            visibleSnapshot.previewUrl,
             frameRevision,
             clientToolRequest?.toolCallId ?? null,
           )
         : null,
-    [clientToolRequest?.toolCallId, frameRevision, snapshot.previewUrl],
+    [
+      clientToolRequest?.toolCallId,
+      frameRevision,
+      visibleSnapshot.previewUrl,
+    ],
   );
   // 保留足够多的上下文供用户定位安装或编译失败，容器本身负责滚动，
   // 避免只显示堆栈尾部而丢失真正的首条错误信息。
-  const visibleLogs = snapshot.logs.slice(-60);
+  const visibleLogs = visibleSnapshot.logs.slice(-60);
 
   function refreshPreview() {
-    if (!snapshot.previewUrl) {
+    if (!visibleSnapshot.previewUrl) {
       return;
     }
 
@@ -482,6 +656,18 @@ export function WebContainerPreview({
       .catch(() => undefined);
   }
 
+  function startRuntime() {
+    if (projectTreeIsEmpty(projectTree)) {
+      return;
+    }
+
+    // 启动副作用统一由 runtimeRequested effect 执行，避免点击处理器与 effect
+    // 在同一轮状态更新中各调用一次 start。Manager 虽可去重，但组件不应制造重复请求。
+    setRuntimeRequested(true);
+  }
+
+  const hasProjectFiles = !projectTreeIsEmpty(projectTree);
+
   return (
     <>
       <div className="workspace-toolbar">
@@ -494,7 +680,7 @@ export function WebContainerPreview({
             <ArrowRight />
           </ToolbarButton>
           <ToolbarButton
-            disabled={!snapshot.previewUrl}
+            disabled={!visibleSnapshot.previewUrl}
             label="刷新预览"
             onClick={refreshPreview}
           >
@@ -508,11 +694,11 @@ export function WebContainerPreview({
             aria-hidden="true"
           />
           <span>
-            {snapshot.previewUrl ??
-              `localhost:${snapshot.port ?? 5173} / waiting`}
+            {visibleSnapshot.previewUrl ??
+              `localhost:${visibleSnapshot.port ?? 5173} / waiting`}
           </span>
           <Badge variant="outline">
-            {WEB_CONTAINER_PHASE_LABELS[snapshot.phase]}
+            {WEB_CONTAINER_PHASE_LABELS[visibleSnapshot.phase]}
           </Badge>
         </div>
 
@@ -525,7 +711,7 @@ export function WebContainerPreview({
           >
             {compactViewport ? <Monitor /> : <Smartphone />}
           </ToolbarButton>
-          {snapshot.previewUrl ? (
+          {visibleSnapshot.previewUrl ? (
             <Tooltip>
               <TooltipTrigger asChild>
                 <Button
@@ -535,7 +721,7 @@ export function WebContainerPreview({
                   variant="ghost"
                 >
                   <a
-                    href={snapshot.previewUrl}
+                    href={visibleSnapshot.previewUrl}
                     rel="noreferrer"
                     target="_blank"
                   >
@@ -560,7 +746,7 @@ export function WebContainerPreview({
         data-testid="preview-stage"
       >
         {/* 移动模式只约束预览画布宽度，不修改项目代码，也不伪造浏览器 UA。 */}
-        {isReady ? (
+        {isReady && runtimeBelongsToProject ? (
           <iframe
             allow="clipboard-read; clipboard-write"
             key={frameUrl}
@@ -568,11 +754,24 @@ export function WebContainerPreview({
             className="webcontainer-frame"
             onLoad={() => {
               const requestResult =
-                clientToolRequestSchema.safeParse(clientToolRequest);
+                clientToolRequestSchema.safeParse(
+                  clientToolRequestRef.current,
+                );
               if (requestResult.success) {
+                const executionKey = createClientToolExecutionKey(
+                  requestResult.data,
+                  projectId,
+                  revision,
+                );
+                if (
+                  executionKey &&
+                  frameLoadStateRef.current.executionKey === executionKey
+                ) {
+                  frameLoadStateRef.current.loadCount += 1;
+                }
                 postRuntimeProbe(
                   iframeRef.current,
-                  snapshot.previewUrl,
+                  previewUrlRef.current,
                   requestResult.data,
                 );
               }
@@ -583,9 +782,11 @@ export function WebContainerPreview({
           />
         ) : (
           <RuntimePlaceholder
-            diagnostic={snapshot.diagnostic}
-            phase={snapshot.phase}
+            diagnostic={visibleSnapshot.diagnostic}
+            hasProjectFiles={hasProjectFiles}
+            onStart={startRuntime}
             onRetry={retryRuntime}
+            phase={visibleSnapshot.phase}
           />
         )}
       </div>
@@ -596,15 +797,15 @@ export function WebContainerPreview({
           <div className="runtime-facts" aria-label="运行时状态">
             <RuntimeFact
               label="State"
-              value={WEB_CONTAINER_PHASE_LABELS[snapshot.phase]}
+              value={WEB_CONTAINER_PHASE_LABELS[visibleSnapshot.phase]}
             />
             <RuntimeFact
               label="Port"
-              value={snapshot.port?.toString() ?? "5173"}
+              value={visibleSnapshot.port?.toString() ?? "5173"}
             />
             <RuntimeFact
               label="Revision"
-              value={snapshot.syncedRevision?.toString() ?? "Pending"}
+              value={visibleSnapshot.syncedRevision?.toString() ?? "Pending"}
             />
           </div>
         </header>
@@ -620,11 +821,11 @@ export function WebContainerPreview({
               <div className="console-line">等待运行时输出...</div>
             )}
           </div>
-          {snapshot.diagnostic ? (
+          {visibleSnapshot.diagnostic ? (
             <aside className="runtime-diagnostic">
-              <span>{snapshot.diagnostic.message}</span>
-              {snapshot.diagnostic.detail ? (
-                <small>{snapshot.diagnostic.detail}</small>
+              <span>{visibleSnapshot.diagnostic.message}</span>
+              {visibleSnapshot.diagnostic.detail ? (
+                <small>{visibleSnapshot.diagnostic.detail}</small>
               ) : null}
             </aside>
           ) : null}
@@ -635,6 +836,24 @@ export function WebContainerPreview({
 }
 
 type BrowserResponsePayload = BrowserBridgeResponse["payload"];
+
+function createClientToolExecutionKey(
+  request: ClientToolRequest | null | undefined,
+  projectId: string,
+  revision: number,
+): string | null {
+  const requestResult = clientToolRequestSchema.safeParse(request);
+  if (
+    !requestResult.success ||
+    requestResult.data.projectId !== projectId ||
+    requestResult.data.revision !== revision
+  ) {
+    return null;
+  }
+
+  const value = requestResult.data;
+  return `${value.runId}:${value.toolCallId}:${value.revision}`;
+}
 
 function requireSuccessfulBrowserResponse(
   payload: BrowserResponsePayload,
@@ -708,6 +927,7 @@ function createBrowserVerifyResult(input: {
     verificationRunId: input.request.verificationRunId,
     revision: input.request.revision,
     replayCount: input.request.replayCount,
+    durationMs: input.preview.durationMs,
     summary: ok
       ? "浏览器冒烟步骤已执行，原始证据等待服务端最终确认。"
       : "浏览器冒烟步骤存在失败，原始证据等待服务端归一化。",
@@ -769,21 +989,27 @@ function delay(milliseconds: number): Promise<void> {
   return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
 }
 
-async function waitForRuntimeRender({
+export async function waitForRuntimeRender({
   collector,
+  fallbackReloadAfterMs = 5_000,
+  hasFrameLoaded,
   iframeRef,
+  pollIntervalMs = 100,
   reloadFrame,
   request,
   timeoutMs,
 }: {
   collector: PreviewEvidenceCollector;
+  fallbackReloadAfterMs?: number;
+  hasFrameLoaded: () => boolean;
   iframeRef: React.RefObject<HTMLIFrameElement | null>;
+  pollIntervalMs?: number;
   reloadFrame: () => void;
   request: ClientToolRequest;
   timeoutMs: number;
 }): Promise<void> {
   const startedAt = Date.now();
-  let nextReloadAt = startedAt + 1_000;
+  let fallbackReloaded = false;
 
   while (!collector.hasRendered() && Date.now() - startedAt < timeoutMs) {
     const snapshot = webContainerRuntimeManager.getSnapshot();
@@ -798,21 +1024,33 @@ async function waitForRuntimeRender({
     // 收到带 Run/revision 的 RENDER_OK 后，才允许后续动作进入页面。
     postRuntimeProbe(iframeRef.current, snapshot.previewUrl, request);
 
-    // WebContainer fs 写入完成后，Rsbuild 对 index.html 的重建仍可能晚到数百毫秒。
-    // 首次 iframe 因而可能加载到 Bridge 注入前的旧 HTML。确认窗口内按固定间隔
-    // 使用新 cache-busting URL 重建浏览上下文，直到当前 Run/revision 主动回执；
-    // 重试只发生在任何 smoke action 之前，不会重复用户交互。
-    if (Date.now() >= nextReloadAt) {
+    // 首次导航需要一个连续窗口完成 HTML、模块图和 React 首帧。每秒销毁 iframe
+    // 会让较慢项目永远回到加载起点，因此只在等待中段执行一次 cache-busting
+    // 兜底刷新，兼顾旧 index.html 缓存与稳定首帧两种情况。
+    if (
+      !fallbackReloaded &&
+      Date.now() - startedAt >= fallbackReloadAfterMs
+    ) {
+      fallbackReloaded = true;
       reloadFrame();
-      nextReloadAt = Date.now() + 1_000;
     }
 
-    await delay(100);
+    await delay(pollIntervalMs);
   }
 
   if (!collector.hasRendered()) {
+    const frameLoaded = hasFrameLoaded();
+    collector.addDiagnostic({
+      code: frameLoaded ? "bridge_unresponsive" : "frame_load_timeout",
+      message: frameLoaded
+        ? "Preview iframe 已完成加载，但当前 Run/revision 的 Runtime Bridge 未返回首帧确认。"
+        : "Preview iframe 在观察窗口内没有完成加载，Runtime Bridge 尚无机会返回首帧确认。",
+      timestamp: Date.now(),
+    });
     throw new Error(
-      `Preview Runtime Bridge 在 ${timeoutMs}ms 内未确认首帧渲染。`,
+      frameLoaded
+        ? `Preview iframe 已加载，但 Runtime Bridge 在 ${timeoutMs}ms 内未确认首帧渲染。`
+        : `Preview iframe 在 ${timeoutMs}ms 内未完成加载。`,
     );
   }
 }
@@ -858,10 +1096,14 @@ function createPreviewFrameUrl(
 
 function RuntimePlaceholder({
   diagnostic,
+  hasProjectFiles,
+  onStart,
   onRetry,
   phase,
 }: {
   diagnostic: { message: string; detail?: string } | null;
+  hasProjectFiles: boolean;
+  onStart: () => void;
   onRetry: () => void;
   phase: keyof typeof WEB_CONTAINER_PHASE_LABELS;
 }) {
@@ -882,16 +1124,29 @@ function RuntimePlaceholder({
       <h2>{diagnostic?.message ?? WEB_CONTAINER_PHASE_LABELS[phase]}</h2>
       <span>
         {diagnostic?.detail ??
-          "正在浏览器内准备 Node.js 环境、项目文件和开发服务器。"}
+          (phase === "idle"
+            ? hasProjectFiles
+              ? "代码已就绪。运行时会在你启动预览后挂载文件并安装依赖。"
+              : "项目还是空的。先创建文件或告诉 Agent 要构建什么，运行环境会在需要时启动。"
+            : "正在浏览器内准备 Node.js 环境、项目文件和开发服务器。")}
       </span>
       {failed ? (
         <Button size="sm" variant="outline" onClick={onRetry}>
           <RotateCcw data-icon="inline-start" />
           重试运行时
         </Button>
+      ) : phase === "idle" && hasProjectFiles ? (
+        <Button size="sm" onClick={onStart}>
+          <Play data-icon="inline-start" />
+          运行预览
+        </Button>
       ) : null}
     </div>
   );
+}
+
+function projectTreeIsEmpty(tree: ReturnType<typeof buildProjectTemplate>) {
+  return Object.keys(tree).length === 0;
 }
 
 function RuntimeFact({ label, value }: { label: string; value: string }) {

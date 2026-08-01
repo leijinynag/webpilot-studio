@@ -36,3 +36,71 @@ export class AgentError extends Error {
 export function isAgentError(error: unknown): error is AgentError {
   return error instanceof AgentError;
 }
+
+/**
+ * Error 的 message、stack 等字段默认不可枚举，直接放进对象再交给日志器时
+ * 往往只会显示成 `{}`。这里统一提取稳定字段，同时兼容 Neon/PostgreSQL
+ * 驱动附带的 code、constraint 等诊断信息，避免线上只能看到“未知错误”。
+ */
+const MAX_SERIALIZED_ERROR_DEPTH = 3;
+const MAX_SERIALIZED_QUERY_CHARACTERS = 4_000;
+const MAX_SERIALIZED_PARAMS = 50;
+
+export function serializeAgentError(
+  error: unknown,
+  depth = 0,
+): Record<string, unknown> {
+  if (!(error instanceof Error)) {
+    return { value: error };
+  }
+
+  const databaseError = error as Error & {
+    code?: unknown;
+    constraint?: unknown;
+    cause?: unknown;
+    detail?: unknown;
+    params?: unknown;
+    query?: unknown;
+    severity?: unknown;
+  };
+
+  return {
+    name: error.name,
+    message: error.message,
+    ...(error.stack ? { stack: error.stack } : {}),
+    ...(isAgentError(error)
+      ? {
+          agentCode: error.code,
+          status: error.status,
+          ...(error.details ? { details: error.details } : {}),
+        }
+      : {}),
+    ...(typeof databaseError.code === "string"
+      ? { databaseCode: databaseError.code }
+      : {}),
+    ...(typeof databaseError.severity === "string"
+      ? { severity: databaseError.severity }
+      : {}),
+    ...(typeof databaseError.constraint === "string"
+      ? { constraint: databaseError.constraint }
+      : {}),
+    ...(typeof databaseError.detail === "string"
+      ? { detail: databaseError.detail }
+      : {}),
+    ...(typeof databaseError.query === "string"
+      ? {
+          query: databaseError.query.slice(
+            0,
+            MAX_SERIALIZED_QUERY_CHARACTERS,
+          ),
+        }
+      : {}),
+    ...(Array.isArray(databaseError.params)
+      ? { params: databaseError.params.slice(0, MAX_SERIALIZED_PARAMS) }
+      : {}),
+    ...(databaseError.cause !== undefined &&
+    depth < MAX_SERIALIZED_ERROR_DEPTH
+      ? { cause: serializeAgentError(databaseError.cause, depth + 1) }
+      : {}),
+  };
+}

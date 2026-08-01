@@ -28,6 +28,35 @@ export function describeProjectRepositoryContract(
       await fixture.close();
     });
 
+    it("creates an empty revision 0 project and advances the first write to revision 1", async () => {
+      const project = await fixture.repository.createProject({
+        ownerId: "owner-a",
+        name: "Empty project",
+        initialFiles: [],
+      });
+
+      expect(project).toMatchObject({ revision: 0, fileCount: 0 });
+      await expect(
+        fixture.repository.listFiles({
+          ownerId: "owner-a",
+          projectId: project.id,
+        }),
+      ).resolves.toEqual([]);
+
+      const firstWrite = await fixture.repository.writeFile({
+        ownerId: "owner-a",
+        projectId: project.id,
+        path: "src/App.tsx",
+        content: "export default function App() { return null; }",
+        expectedRevision: 0,
+      });
+
+      expect(firstWrite).toEqual({
+        revision: 1,
+        changedPaths: ["src/App.tsx"],
+      });
+    });
+
     it("creates, reads, searches, writes, renames and deletes files", async () => {
       const project = await createProject(fixture.repository, "owner-a");
 

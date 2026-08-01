@@ -14,6 +14,11 @@ type Project = {
   revision: number;
 };
 
+type ProjectFile = {
+  path: string;
+  content: string;
+};
+
 type Run = {
   id: string;
   conversationId: string;
@@ -111,6 +116,33 @@ type AgentSnapshot = {
   verificationSteps: VerificationStep[];
 };
 
+type ChangeSet = {
+  runId: string;
+  baseRevision: number;
+  resultRevision: number;
+  summary: string;
+  files: Array<{
+    operation: "create" | "update" | "delete" | "rename";
+    pathBefore: string | null;
+    pathAfter: string | null;
+    beforeContent: string | null;
+    afterContent: string | null;
+  }>;
+};
+
+type RestorePreview = {
+  currentRevision: number;
+  canRestore: boolean;
+  impacts: Array<{
+    path: string;
+    action: "write" | "delete" | "none";
+  }>;
+  conflicts: Array<{
+    path: string;
+    reason: "modified" | "created" | "deleted";
+  }>;
+};
+
 async function createProject(page: Page, name: string): Promise<Project> {
   // 先建立匿名 owner Cookie；项目 API 和工作台请求必须共享同一浏览器会话。
   await page.goto("/");
@@ -178,6 +210,19 @@ async function writeProjectFile(
   return body.result.revision;
 }
 
+async function readProjectFile(
+  page: Page,
+  projectId: string,
+  path: string,
+): Promise<ProjectFile> {
+  const response = await page.request.get(
+    `/api/projects/${projectId}/files/${path}`,
+  );
+  expect(response.ok()).toBe(true);
+  const body = (await response.json()) as { file: ProjectFile };
+  return body.file;
+}
+
 async function readAgentSnapshot(
   page: Page,
   projectId: string,
@@ -229,7 +274,19 @@ async function startAgentRunFromWorkspace(
   page: Page,
   prompt: string,
 ): Promise<Run> {
-  await page.getByLabel("给 Agent 的消息").fill(prompt);
+  const composer = page.getByLabel("给 Agent 的消息");
+  const sendButton = page.getByRole("button", { name: "发送消息" });
+
+  // Agent 快照恢复完成前，输入区可能因为历史 active Run 暂时禁用。
+  // 先等待组件进入可交互状态，再校验受控 textarea 已稳定接收完整 prompt，
+  // 可以把初始化竞态与真正的模型/API 失败明确区分开。
+  await expect(composer).toBeEnabled({ timeout: 15_000 });
+  await composer.fill(prompt);
+  await expect(composer).toHaveValue(prompt);
+  await expect(sendButton).toBeEnabled();
+
+  // 响应监听必须在点击前建立；本地 API 返回很快时，点击后再监听会漏掉
+  // 201 响应，并把一次成功创建的 Run 误报为超时。
   const runResponsePromise = page.waitForResponse(
     (response) =>
       response.url().endsWith("/api/agent-runs") &&
@@ -237,8 +294,21 @@ async function startAgentRunFromWorkspace(
   );
   await page.getByRole("button", { name: "发送消息" }).click();
   const runResponse = await runResponsePromise;
-  expect(runResponse.status()).toBe(201);
-  const body = (await runResponse.json()) as { run: Run };
+
+  const body = (await runResponse.json().catch(() => ({}))) as {
+    run?: Run;
+    error?: { code?: string; message?: string; correlationId?: string };
+  };
+  expect(
+    runResponse.status(),
+    body.error
+      ? `${body.error.code ?? "AGENT_ERROR"}: ${body.error.message ?? "无错误详情"} (${body.error.correlationId ?? "无 correlationId"})`
+      : "Agent Run 创建接口没有返回 201。",
+  ).toBe(201);
+  if (!body.run) {
+    throw new Error("Agent Run 创建成功，但响应缺少 run 记录。");
+  }
+
   return body.run;
 }
 
@@ -310,13 +380,18 @@ test.describe("Agent workspace live flow", () => {
     "设置 RUN_AGENT_E2E=1，并配置 LLM_PROVIDER、LLM_API_KEY、AGENT_ENABLED 后运行真实 Agent E2E。",
   );
 
-  test("completes a natural-language edit and restores the conversation after refresh", async ({
+  test("completes an edit, reviews its ChangeSet and restores without overwriting later work", async ({
     page,
   }) => {
-    // 真实链路包含 DeepSeek 多轮调用与浏览器内首次 npm install。测试预算需要
-    // 高于 Runtime 自身的 180 秒安装超时，避免网络慢时由测试先行中断。
-    test.setTimeout(360_000);
+    // 真实链路包含 DeepSeek 多轮调用、浏览器内首次 npm install 与最后一轮模型
+    // 总结。慢网络下完整闭环约需 8 分钟，因此测试与终态轮询分别保留充足余量。
+    test.setTimeout(900_000);
     const project = await createProject(page, "M2 live agent edit");
+    const initialFile = await readProjectFile(
+      page,
+      project.id,
+      "src/index.tsx",
+    );
     await page.goto(`/p/${project.id}`);
 
     await expect(
@@ -324,58 +399,58 @@ test.describe("Agent workspace live flow", () => {
     ).toBeVisible();
     const prompt =
       "读取 src/index.tsx，把页面 h1 文案改成 M2 Live Agent Verified。完成后说明修改了哪些文件。";
-    await page.getByLabel("给 Agent 的消息").fill(prompt);
-    await page.getByRole("button", { name: "发送消息" }).click();
-
-    const runResponse = await page.waitForResponse(
-      (response) =>
-        response.url().endsWith("/api/agent-runs") &&
-        response.request().method() === "POST",
-    );
-    expect(runResponse.status()).toBe(201);
-    const runBody = (await runResponse.json()) as { run: Run };
-    const run = await waitForTerminalRun(page, runBody.run.id, 300_000);
+    const createdRun = await startAgentRunFromWorkspace(page, prompt);
+    const run = await waitForTerminalRun(page, createdRun.id, 720_000);
 
     expect(run.status, run.errorMessage ?? "Agent Run 未成功完成。").toBe(
       "succeeded",
     );
     expect(run.currentRevision).toBeGreaterThan(project.revision);
 
-    const agentSnapshotResponse = await page.request.get(
-      `/api/projects/${project.id}/agent?conversationId=${run.conversationId}`,
+    const agentSnapshot = await readAgentSnapshot(
+      page,
+      project.id,
+      run.conversationId,
     );
-    expect(agentSnapshotResponse.ok()).toBe(true);
-    const agentSnapshotBody = (await agentSnapshotResponse.json()) as {
-      snapshot: { tools: ToolInvocation[] } | null;
-    };
-    const previewInvocations =
-      agentSnapshotBody.snapshot?.tools.filter(
-        (tool) => tool.runId === run.id && tool.toolName === "run_preview",
-      ) ?? [];
+    const previewInvocations = agentSnapshot.tools.filter(
+      (tool) => tool.runId === run.id && tool.toolName === "run_preview",
+    );
     const finalPreviewInvocation = previewInvocations.at(-1);
+    const finalBrowserVerification = agentSnapshot.verificationRuns
+      .filter(
+        (verification) =>
+          verification.runId === run.id &&
+          verification.revision === run.currentRevision,
+      )
+      .at(-1);
 
-    // Agent 最终 succeeded 只代表它完成了本轮决策，不能替代浏览器运行事实。
-    // Tool Ledger 按 createdAt 升序返回；模型可能根据失败证据主动重试，因此必须验证
-    // 最后一次 run_preview，而不是把已经被后续成功验证取代的首次失败当成最终结果。
-    expect(previewInvocations.length).toBeGreaterThan(0);
-    expect(finalPreviewInvocation).toMatchObject({
-      status: "succeeded",
-      resultJson: {
+    // 当前 Toolset 允许模型按任务选择 run_preview 或更强的 browser_verify。
+    // 测试只依赖“当前 revision 有可信运行证据”这一产品契约，不把某个具体工具名
+    // 当作实现细节固定下来；两类证据仍分别执行各自的严格完整性断言。
+    expect(
+      finalPreviewInvocation?.status === "succeeded" ||
+        finalBrowserVerification?.status === "passed",
+    ).toBe(true);
+    if (finalPreviewInvocation?.status === "succeeded") {
+      expect(finalPreviewInvocation.resultJson).toMatchObject({
         ok: true,
         build: { errors: [] },
         runtime: { rendered: true },
-      },
+      });
+    } else {
+      expect(finalBrowserVerification).toMatchObject({
+        status: "passed",
+        revision: run.currentRevision,
+      });
+      expectAllVerificationChecksPassed(finalBrowserVerification!);
+    }
+    expect(run.usage).toMatchObject({
+      latestVerificationRevision: run.currentRevision,
+      latestVerificationOk: true,
     });
 
-    const fileResponse = await page.request.get(
-      `/api/projects/${project.id}/files/src/index.tsx`,
-    );
-    expect(fileResponse.ok()).toBe(true);
-    await expect(fileResponse.json()).resolves.toMatchObject({
-      file: {
-        content: expect.stringContaining("M2 Live Agent Verified"),
-      },
-    });
+    const agentFile = await readProjectFile(page, project.id, "src/index.tsx");
+    expect(agentFile.content).toContain("M2 Live Agent Verified");
 
     // 页面重新加载后，Transcript 仍应来自 Conversation 聚合快照，而不是内存状态。
     await page.reload();
@@ -386,6 +461,156 @@ test.describe("Agent workspace live flow", () => {
     await expect(
       page.getByLabel(`Repository revision ${run.currentRevision}`),
     ).toBeVisible();
+
+    const changeSetResponse = await page.request.get(
+      `/api/agent-runs/${run.id}/change-set`,
+    );
+    expect(changeSetResponse.ok()).toBe(true);
+    const changeSetBody = (await changeSetResponse.json()) as {
+      changeSet: ChangeSet;
+    };
+    expect(changeSetBody.changeSet).toMatchObject({
+      runId: run.id,
+      baseRevision: project.revision,
+      resultRevision: run.currentRevision,
+    });
+    expect(changeSetBody.changeSet.files).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          operation: "update",
+          pathBefore: "src/index.tsx",
+          pathAfter: "src/index.tsx",
+          beforeContent: initialFile.content,
+          afterContent: expect.stringContaining("M2 Live Agent Verified"),
+        }),
+      ]),
+    );
+
+    const previewResponse = await page.request.get(
+      `/api/agent-runs/${run.id}/restore-preview`,
+    );
+    expect(previewResponse.ok()).toBe(true);
+    const previewBody = (await previewResponse.json()) as {
+      preview: RestorePreview;
+    };
+    expect(previewBody.preview).toMatchObject({
+      currentRevision: run.currentRevision,
+      canRestore: true,
+      conflicts: [],
+    });
+    expect(previewBody.preview.impacts).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          path: "src/index.tsx",
+          action: "write",
+        }),
+      ]),
+    );
+
+    // 恢复只操作 Repository 事实，不能覆盖 Monaco 中尚未保存的用户草稿。
+    await page.getByRole("radio", { name: "Code" }).click();
+    const editor = page.locator(".monaco-editor");
+    await expect(editor).toBeVisible({ timeout: 15_000 });
+    await editor.click();
+    await page.keyboard.press("ControlOrMeta+A");
+    await page.keyboard.insertText(
+      "export function Draft() { return <main>M5 local draft preserved</main>; }\n",
+    );
+    await expect(
+      page.getByText("1 个文件未保存", { exact: true }),
+    ).toBeVisible();
+
+    await page.getByRole("button", { name: "查看改动" }).click();
+    const reviewDialog = page.getByRole("dialog", {
+      name: "审查并恢复本次改动",
+    });
+    await expect(reviewDialog).toBeVisible();
+    await expect(
+      reviewDialog.getByText(changeSetBody.changeSet.summary),
+    ).toBeVisible();
+    await expect(
+      reviewDialog.getByText("src/index.tsx", { exact: true }).first(),
+    ).toBeVisible();
+    await expect(reviewDialog.getByText("未保存草稿")).toBeVisible();
+    await expect(reviewDialog.getByText("恢复预检")).toBeVisible();
+    await expect(
+      reviewDialog.locator(".monaco-diff-editor").first(),
+    ).toBeVisible({
+      timeout: 15_000,
+    });
+
+    const restoredRevision = run.currentRevision + 1;
+    await reviewDialog.getByRole("button", { name: "恢复 Agent 改动" }).click();
+    await expect(reviewDialog).toBeHidden();
+    await expect(
+      page.getByLabel(`Repository revision ${restoredRevision}`),
+    ).toBeVisible();
+    await expect(
+      page.getByText("1 个文件未保存", { exact: true }),
+    ).toBeVisible();
+
+    const restoredFile = await readProjectFile(
+      page,
+      project.id,
+      "src/index.tsx",
+    );
+    expect(restoredFile.content).toBe(initialFile.content);
+
+    // 新 revision 会重新同步到 WebContainer；Preview 的运行事实必须明确绑定该 revision。
+    await page.getByRole("radio", { name: "Preview" }).click();
+    await expect(
+      page.getByText("预览就绪", { exact: true }).first(),
+    ).toBeVisible({
+      timeout: 180_000,
+    });
+    await expect(
+      page
+        .getByLabel("运行时状态")
+        .getByText(restoredRevision.toString(), { exact: true }),
+    ).toBeVisible();
+    const previewFrame = page.frameLocator(
+      'iframe[title="WebContainer 项目预览"]',
+    );
+    await expect(
+      previewFrame.getByRole("heading", {
+        name: "The browser is now the development machine.",
+      }),
+    ).toBeVisible({ timeout: 30_000 });
+
+    // checkpoint 后同路径发生用户 mutation 时，旧 ChangeSet 只能报告冲突，
+    // 恢复按钮必须锁定，且服务端内容保持为用户版本。
+    const userContent =
+      "export function App() { return <main>M5 user mutation wins</main>; }\n";
+    const userRevision = await writeProjectFile(page, {
+      projectId: project.id,
+      path: "src/index.tsx",
+      content: userContent,
+      expectedRevision: restoredRevision,
+    });
+    await page.reload();
+    await expect(
+      page.getByLabel(`Repository revision ${userRevision}`),
+    ).toBeVisible();
+    await page.getByRole("button", { name: "查看改动" }).click();
+    const conflictDialog = page.getByRole("dialog", {
+      name: "审查并恢复本次改动",
+    });
+    await expect(
+      conflictDialog.getByText("检测到后续 Repository 修改，恢复已锁定"),
+    ).toBeVisible();
+    await expect(
+      conflictDialog.getByText("src/index.tsx", { exact: true }).last(),
+    ).toBeVisible();
+    await expect(
+      conflictDialog.getByRole("button", { name: "恢复 Agent 改动" }),
+    ).toBeDisabled();
+
+    const protectedFile = await readProjectFile(
+      page,
+      project.id,
+      "src/index.tsx",
+    );
+    expect(protectedFile.content).toBe(userContent);
   });
 
   test("stops a run before it can mutate the repository", async ({ page }) => {

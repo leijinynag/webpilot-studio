@@ -2,18 +2,25 @@ import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 
 import { and, asc, desc, eq, gt, inArray, isNull, lt, or } from "drizzle-orm";
-import type { PgDatabase } from "drizzle-orm/pg-core";
-import type { PgQueryResultHKT } from "drizzle-orm/pg-core/session";
+import type { PgDatabase, PgTransaction } from "drizzle-orm/pg-core";
+import type {
+  PgQueryResultHKT,
+  PgTransactionConfig,
+} from "drizzle-orm/pg-core/session";
 import type { ExtractTablesWithRelations } from "drizzle-orm/relations";
 
 import {
   BROWSER_VERIFY_TOOL_NAME,
+  type BrowserVerifyToolArguments,
   browserVerifyToolArgumentsSchema,
   type BrowserVerifyResult,
   type ClientToolResultRequest,
 } from "@/domains/agent/client-tools";
 import { AGENT_ERROR_CODES, AgentError } from "@/domains/agent/errors";
-import { RUN_PREVIEW_TOOL_NAME } from "@/domains/agent/evidence";
+import {
+  RUN_PREVIEW_TOOL_NAME,
+  type RunPreviewToolArguments,
+} from "@/domains/agent/evidence";
 import {
   isTerminalAgentRunStatus,
   reduceAgentRunStatus,
@@ -33,11 +40,17 @@ import {
   EMPTY_AGENT_RUN_USAGE,
   normalizeAgentRunBudget,
   normalizeAgentRunUsage,
+  pauseAgentExecution,
+  resumeAgentExecution,
 } from "@/domains/agent/types";
 import {
   deriveVerificationFailure,
   evaluateBrowserVerification,
 } from "@/domains/agent/verification";
+import {
+  completeSuccessfulAgentRun,
+  insertAgentStartCheckpoint,
+} from "@/domains/project/history";
 import {
   agentEvidence,
   agentRunEvents,
@@ -57,11 +70,33 @@ type DatabaseLike<TQueryResult extends PgQueryResultHKT> = PgDatabase<
   typeof databaseSchema,
   RelationalSchema
 >;
+type DatabaseTransaction<TQueryResult extends PgQueryResultHKT> = PgTransaction<
+  TQueryResult,
+  typeof databaseSchema,
+  RelationalSchema
+>;
+export type AgentTransactionRunner<
+  TQueryResult extends PgQueryResultHKT,
+> = <T>(
+  operation: (transaction: DatabaseTransaction<TQueryResult>) => Promise<T>,
+  config?: PgTransactionConfig,
+) => Promise<T>;
 
 const NON_TERMINAL_STATUSES = [
   "queued",
   "running",
   "awaiting_client_tool",
+  "awaiting_async_job",
+] as const satisfies readonly AgentRunStatus[];
+
+/**
+ * 只有这些状态允许服务端 Orchestrator 抢占执行租约。
+ * awaiting_client_tool 的推进权属于浏览器结果事务；若服务端抢占它，会在
+ * tool_result 落库前把 Run 暂时暴露为 running，形成不完整 Provider 消息链。
+ */
+const SERVER_EXECUTABLE_STATUSES = [
+  "queued",
+  "running",
   "awaiting_async_job",
 ] as const satisfies readonly AgentRunStatus[];
 
@@ -81,7 +116,29 @@ type NewTranscriptMessage = TranscriptMessage extends infer Message
   : never;
 
 export class AgentStore<TQueryResult extends PgQueryResultHKT> {
-  constructor(private readonly db: DatabaseLike<TQueryResult>) {}
+  constructor(
+    private readonly db: DatabaseLike<TQueryResult>,
+    private readonly options: {
+      transaction?: AgentTransactionRunner<TQueryResult>;
+    } = {},
+  ) {}
+
+  /**
+   * 所有需要原子性的 Agent 写入与一致性快照都从这一入口进入。
+   *
+   * PGlite 测试默认使用数据库自身事务；Neon 生产环境则注入固定 PoolClient 的
+   * runner，避免热更新导致 Drizzle 把同一事务的 SQL 分配到不同连接。
+   */
+  private runTransaction<T>(
+    operation: (
+      transaction: DatabaseTransaction<TQueryResult>,
+    ) => Promise<T>,
+    config?: PgTransactionConfig,
+  ): Promise<T> {
+    return this.options.transaction
+      ? this.options.transaction(operation, config)
+      : this.db.transaction(operation, config);
+  }
 
   /**
    * 用户消息、冻结配置、Run 与首个事件在同一事务内创建。
@@ -89,7 +146,7 @@ export class AgentStore<TQueryResult extends PgQueryResultHKT> {
    */
   async createRun(input: CreateAgentRunInput): Promise<AgentRunRecord> {
     try {
-      return await this.db.transaction(async (tx) => {
+      return await this.runTransaction(async (tx) => {
         const [project] = await tx
           .select({
             id: projects.id,
@@ -215,6 +272,11 @@ export class AgentStore<TQueryResult extends PgQueryResultHKT> {
             correlationId,
           },
         });
+        await insertAgentStartCheckpoint(tx, {
+          projectId: run.projectId,
+          runId: run.id,
+          revision: run.startRevision,
+        });
 
         return toAgentRunRecord(run);
       });
@@ -319,6 +381,43 @@ export class AgentStore<TQueryResult extends PgQueryResultHKT> {
   }
 
   /**
+   * 工作台默认恢复仍有推进价值的会话，而不是机械选择最近创建的空会话。
+   * 一个 awaiting_client_tool Run 可能正在等待浏览器接管 run_preview；
+   * 若刷新后被更新更晚的空会话遮住，客户端就收不到 Tool Ledger 中的等待项，
+   * 用户看到的便会是“代码已经写完，但预览一直没有开始”的错误状态。
+   *
+   * 显式 conversationId 不经过这里，用户主动切换历史会话始终拥有最高优先级。
+   */
+  async findActiveConversationId(input: {
+    ownerId: string;
+    projectId: string;
+  }): Promise<string | null> {
+    const [row] = await this.db
+      .select({ conversationId: agentRuns.conversationId })
+      .from(agentRuns)
+      .innerJoin(
+        conversations,
+        and(
+          eq(conversations.id, agentRuns.conversationId),
+          eq(conversations.ownerId, input.ownerId),
+          eq(conversations.projectId, input.projectId),
+          isNull(conversations.deletedAt),
+        ),
+      )
+      .where(
+        and(
+          eq(agentRuns.ownerId, input.ownerId),
+          eq(agentRuns.projectId, input.projectId),
+          inArray(agentRuns.status, [...NON_TERMINAL_STATUSES]),
+        ),
+      )
+      .orderBy(desc(agentRuns.updatedAt), desc(agentRuns.createdAt))
+      .limit(1);
+
+    return row?.conversationId ?? null;
+  }
+
+  /**
    * 工作台刷新时一次性读取会话事实。客户端只把它当作投影，
    * 不在本地拼接 transcript、Run 或工具结果，避免 SSE 乱序造成脏状态。
    */
@@ -326,86 +425,100 @@ export class AgentStore<TQueryResult extends PgQueryResultHKT> {
     ownerId: string;
     conversationId: string;
   }): Promise<AgentConversationSnapshot> {
-    const [conversation] = await this.db
-      .select()
-      .from(conversations)
-      .where(
-        and(
-          eq(conversations.id, input.conversationId),
-          eq(conversations.ownerId, input.ownerId),
-          isNull(conversations.deletedAt),
-        ),
-      );
-
-    if (!conversation) {
-      throw new AgentError(
-        AGENT_ERROR_CODES.runNotFound,
-        "Conversation 不存在或不属于当前匿名工作区。",
-        404,
-      );
-    }
-
-    const [transcriptRows, runRows] = await Promise.all([
-      this.db
-        .select()
-        .from(transcriptMessages)
-        .where(eq(transcriptMessages.conversationId, input.conversationId))
-        .orderBy(asc(transcriptMessages.seq)),
-      this.db
-        .select()
-        .from(agentRuns)
-        .where(
-          and(
-            eq(agentRuns.conversationId, input.conversationId),
-            eq(agentRuns.ownerId, input.ownerId),
-          ),
-        )
-        .orderBy(asc(agentRuns.createdAt)),
-    ]);
-
-    const runIds = runRows.map((run) => run.id);
-    const [eventRows, toolRows, verificationRunRows] = runIds.length
-      ? await Promise.all([
-          this.db
-            .select()
-            .from(agentRunEvents)
-            .where(inArray(agentRunEvents.runId, runIds))
-            .orderBy(asc(agentRunEvents.sequence)),
-          this.db
-            .select()
-            .from(toolInvocations)
-            .where(inArray(toolInvocations.runId, runIds))
-            .orderBy(asc(toolInvocations.createdAt)),
-          this.db
-            .select()
-            .from(verificationRuns)
-            .where(inArray(verificationRuns.runId, runIds))
-            .orderBy(asc(verificationRuns.createdAt)),
-        ])
-      : [[], [], []];
-    const verificationRunIds = verificationRunRows.map((run) => run.id);
-    const verificationStepRows = verificationRunIds.length
-      ? await this.db
+    // 聚合快照包含 Conversation、Run、事件、Tool Ledger 与验证记录。所有读取
+    // 必须共享同一个 PostgreSQL MVCC snapshot，否则可能拼出“旧 running Run +
+    // 新 succeeded 事件”的不可能状态，并让刷新后的 UI 永久停在执行中。
+    //
+    // 生产环境注入的 runner 会显式固定 Neon PoolClient，避免 Turbopack 多模块
+    // 实例下 Drizzle 的 Pool 身份判断失效。数据库测试不注入 runner，继续使用
+    // PGlite 自身的事务实现，领域层因此不依赖具体数据库驱动。
+    return this.runTransaction(async (tx) => {
+        const [conversation] = await tx
           .select()
-          .from(verificationSteps)
+          .from(conversations)
           .where(
-            inArray(verificationSteps.verificationRunId, verificationRunIds),
-          )
-          .orderBy(
-            asc(verificationSteps.verificationRunId),
-            asc(verificationSteps.stepIndex),
-          )
-      : [];
+            and(
+              eq(conversations.id, input.conversationId),
+              eq(conversations.ownerId, input.ownerId),
+              isNull(conversations.deletedAt),
+            ),
+          );
 
-    return {
-      conversation: toConversationRecord(conversation),
-      transcript: transcriptRows.map(toTranscriptMessage),
-      runs: runRows.map(toAgentRunRecord),
-      events: eventRows,
-      tools: toolRows,
-      verificationRuns: verificationRunRows.map(toVerificationRunRecord),
-      verificationSteps: verificationStepRows,
-    };
+        if (!conversation) {
+          throw new AgentError(
+            AGENT_ERROR_CODES.runNotFound,
+            "Conversation 不存在或不属于当前匿名工作区。",
+            404,
+          );
+        }
+
+        const [transcriptRows, runRows] = await Promise.all([
+          tx
+            .select()
+            .from(transcriptMessages)
+            .where(eq(transcriptMessages.conversationId, input.conversationId))
+            .orderBy(asc(transcriptMessages.seq)),
+          tx
+            .select()
+            .from(agentRuns)
+            .where(
+              and(
+                eq(agentRuns.conversationId, input.conversationId),
+                eq(agentRuns.ownerId, input.ownerId),
+              ),
+            )
+            .orderBy(asc(agentRuns.createdAt)),
+        ]);
+
+        const runIds = runRows.map((run) => run.id);
+        const [eventRows, toolRows, verificationRunRows] = runIds.length
+          ? await Promise.all([
+              tx
+                .select()
+                .from(agentRunEvents)
+                .where(inArray(agentRunEvents.runId, runIds))
+                .orderBy(asc(agentRunEvents.sequence)),
+              tx
+                .select()
+                .from(toolInvocations)
+                .where(inArray(toolInvocations.runId, runIds))
+                .orderBy(asc(toolInvocations.createdAt)),
+              tx
+                .select()
+                .from(verificationRuns)
+                .where(inArray(verificationRuns.runId, runIds))
+                .orderBy(asc(verificationRuns.createdAt)),
+            ])
+          : [[], [], []];
+        const verificationRunIds = verificationRunRows.map((run) => run.id);
+        const verificationStepRows = verificationRunIds.length
+          ? await tx
+              .select()
+              .from(verificationSteps)
+              .where(
+                inArray(
+                  verificationSteps.verificationRunId,
+                  verificationRunIds,
+                ),
+              )
+              .orderBy(
+                asc(verificationSteps.verificationRunId),
+                asc(verificationSteps.stepIndex),
+              )
+          : [];
+
+        return {
+          conversation: toConversationRecord(conversation),
+          transcript: transcriptRows.map(toTranscriptMessage),
+          runs: runRows.map(toAgentRunRecord),
+          events: eventRows,
+          tools: toolRows,
+          verificationRuns: verificationRunRows.map(toVerificationRunRecord),
+          verificationSteps: verificationStepRows,
+        };
+      }, {
+        isolationLevel: "repeatable read",
+      });
   }
 
   async countActiveRuns(input: {
@@ -536,11 +649,18 @@ export class AgentStore<TQueryResult extends PgQueryResultHKT> {
     const current = await this.getRun(input);
     const nextStatus = reduceAgentRunStatus(current.status, input.status);
     const now = new Date();
+    const nextUsage =
+      nextStatus === "running"
+        ? resumeAgentExecution(current.usage, now)
+        : current.status === "running"
+          ? pauseAgentExecution(current.usage, now)
+          : current.usage;
     const [updated] = await this.db
       .update(agentRuns)
       .set({
         status: nextStatus,
         currentRevision: input.currentRevision ?? current.currentRevision,
+        usage: nextUsage,
         errorCode: input.errorCode,
         errorMessage: input.errorMessage,
         startedAt:
@@ -579,6 +699,17 @@ export class AgentStore<TQueryResult extends PgQueryResultHKT> {
     });
 
     return toAgentRunRecord(updated);
+  }
+
+  async completeSuccessfulRun(input: {
+    ownerId: string;
+    runId: string;
+  }): Promise<AgentRunRecord> {
+    const row = await this.runTransaction((tx) =>
+      completeSuccessfulAgentRun(tx, input),
+    );
+
+    return toAgentRunRecord(row);
   }
 
   async requestCancellation(input: {
@@ -640,7 +771,7 @@ export class AgentStore<TQueryResult extends PgQueryResultHKT> {
         and(
           eq(agentRuns.id, input.runId),
           eq(agentRuns.ownerId, input.ownerId),
-          inArray(agentRuns.status, [...NON_TERMINAL_STATUSES]),
+          inArray(agentRuns.status, [...SERVER_EXECUTABLE_STATUSES]),
           or(
             isNull(agentRuns.executionLeaseId),
             isNull(agentRuns.executionLeaseExpiresAt),
@@ -651,6 +782,201 @@ export class AgentStore<TQueryResult extends PgQueryResultHKT> {
       .returning({ id: agentRuns.id });
 
     return updated ? leaseId : null;
+  }
+
+  /**
+   * 修复历史竞态留下的 running 脏状态。
+   *
+   * 正常客户端工具挂起会原子写入 running Ledger，并把 Run 切到
+   * awaiting_client_tool。若旧执行路径曾在结果回传前错误抢占 Run，本方法会在
+   * Provider 调用前识别“最后一条 Transcript 是尚未完成的客户端 tool_call”，
+   * 再通过租约 CAS 把等待权交还浏览器。这里不补写 tool_result，因为工具尚未
+   * 真正完成，持久化 Ledger 才是客户端恢复请求的事实来源。
+   */
+  async recoverPendingClientToolWait(input: {
+    ownerId: string;
+    runId: string;
+    leaseId: string;
+  }): Promise<boolean> {
+    return this.runTransaction(async (tx) => {
+      const [runRow] = await tx
+        .select({
+          id: agentRuns.id,
+          conversationId: agentRuns.conversationId,
+          status: agentRuns.status,
+          currentRevision: agentRuns.currentRevision,
+          executionLeaseId: agentRuns.executionLeaseId,
+          usage: agentRuns.usage,
+        })
+        .from(agentRuns)
+        .where(
+          and(
+            eq(agentRuns.id, input.runId),
+            eq(agentRuns.ownerId, input.ownerId),
+          ),
+        );
+
+      if (
+        !runRow ||
+        runRow.status !== "running" ||
+        runRow.executionLeaseId !== input.leaseId
+      ) {
+        return false;
+      }
+
+      const pendingInvocations = await tx
+        .select({
+          toolCallId: toolInvocations.toolCallId,
+          toolName: toolInvocations.toolName,
+        })
+        .from(toolInvocations)
+        .where(
+          and(
+            eq(toolInvocations.runId, input.runId),
+            eq(toolInvocations.executionDomain, "client"),
+            eq(toolInvocations.status, "running"),
+          ),
+        )
+        .orderBy(desc(toolInvocations.createdAt))
+        .limit(2);
+
+      // 同一 Run 正常只允许等待一个客户端工具。多条 running Ledger 表示更深层
+      // 的一致性损坏，不能猜测应恢复哪一条，留给显式诊断处理。
+      if (pendingInvocations.length !== 1) {
+        return false;
+      }
+
+      const pendingInvocation = pendingInvocations[0];
+      const [latestTranscriptRow] = await tx
+        .select({
+          kind: transcriptMessages.kind,
+          payload: transcriptMessages.payload,
+        })
+        .from(transcriptMessages)
+        .where(
+          and(
+            eq(transcriptMessages.conversationId, runRow.conversationId),
+            eq(transcriptMessages.runId, input.runId),
+          ),
+        )
+        .orderBy(desc(transcriptMessages.seq))
+        .limit(1);
+
+      const latestToolCallId =
+        latestTranscriptRow?.kind === "tool_call"
+          ? String(latestTranscriptRow.payload.toolCallId ?? "")
+          : null;
+      const isReplayInvocation =
+        pendingInvocation.toolCallId.startsWith("replay:");
+
+      // 自动 replay 不会制造 assistant tool_call；除此之外必须要求 Transcript
+      // 最后一项与 Ledger 精确匹配，避免把普通 running Run 误判为等待态。
+      if (
+        !isReplayInvocation &&
+        latestToolCallId !== pendingInvocation.toolCallId
+      ) {
+        return false;
+      }
+
+      const now = new Date();
+      const pausedUsage = pauseAgentExecution(
+        normalizeAgentRunUsage(runRow.usage),
+        now,
+      );
+      const [updatedRun] = await tx
+        .update(agentRuns)
+        .set({
+          status: "awaiting_client_tool",
+          usage: pausedUsage,
+          executionLeaseId: null,
+          executionLeaseExpiresAt: null,
+          updatedAt: now,
+        })
+        .where(
+          and(
+            eq(agentRuns.id, input.runId),
+            eq(agentRuns.ownerId, input.ownerId),
+            eq(agentRuns.status, "running"),
+            eq(agentRuns.executionLeaseId, input.leaseId),
+          ),
+        )
+        .returning({ id: agentRuns.id });
+
+      if (!updatedRun) {
+        return false;
+      }
+
+      await tx.insert(agentRunEvents).values([
+        {
+          runId: input.runId,
+          type: "client_tool.wait_recovered",
+          payload: {
+            toolCallId: pendingInvocation.toolCallId,
+            toolName: pendingInvocation.toolName,
+            currentRevision: runRow.currentRevision,
+          },
+        },
+        {
+          runId: input.runId,
+          type: "run.status_changed",
+          payload: {
+            previousStatus: "running",
+            status: "awaiting_client_tool",
+            currentRevision: runRow.currentRevision,
+            reason: "pending_client_tool_recovered",
+          },
+        },
+      ]);
+
+      return true;
+    });
+  }
+
+  /**
+   * 判断当前等待态是否由一条真实、尚未完成的客户端 Tool Ledger 支撑。
+   *
+   * 本方法只用于旧 Orchestrator 的错误收口：当它因租约竞争收到 runConflict，
+   * 若数据库已经由新执行器建立健康等待态，就不应再把 Run 终止为 failed。
+   */
+  async hasPendingClientToolWait(input: {
+    ownerId: string;
+    runId: string;
+  }): Promise<boolean> {
+    const [runRow, pendingInvocations] = await Promise.all([
+      this.db
+        .select({
+          status: agentRuns.status,
+          currentRevision: agentRuns.currentRevision,
+        })
+        .from(agentRuns)
+        .where(
+          and(
+            eq(agentRuns.id, input.runId),
+            eq(agentRuns.ownerId, input.ownerId),
+          ),
+        )
+        .limit(1),
+      this.db
+        .select({
+          revisionBefore: toolInvocations.revisionBefore,
+        })
+        .from(toolInvocations)
+        .where(
+          and(
+            eq(toolInvocations.runId, input.runId),
+            eq(toolInvocations.executionDomain, "client"),
+            eq(toolInvocations.status, "running"),
+          ),
+        )
+        .limit(2),
+    ]);
+    const run = runRow[0];
+
+    return (
+      run?.status === "awaiting_client_tool" &&
+      pendingInvocations.length === 1 &&
+      pendingInvocations[0]?.revisionBefore === run.currentRevision
+    );
   }
 
   async renewExecutionLease(input: {
@@ -741,6 +1067,283 @@ export class AgentStore<TQueryResult extends PgQueryResultHKT> {
     }
 
     return toAgentRunRecord(updated);
+  }
+
+  /**
+   * 客户端工具的 Ledger、Verification、Run 状态、租约释放和 SSE 事件必须
+   * 同时落库。任何一步失败都会回滚，避免刷新后出现“Run 正在等待，但没有
+   * running Tool Invocation 可恢复”的永久悬空状态。
+   */
+  async suspendForClientTool(
+    input:
+      | {
+          ownerId: string;
+          runId: string;
+          projectId: string;
+          toolCallId: string;
+          toolName: typeof RUN_PREVIEW_TOOL_NAME;
+          argumentsJson: RunPreviewToolArguments;
+          idempotencyKey: string;
+          revision: number;
+          leaseId: string;
+        }
+      | {
+          ownerId: string;
+          runId: string;
+          projectId: string;
+          toolCallId: string;
+          toolName: typeof BROWSER_VERIFY_TOOL_NAME;
+          argumentsJson: BrowserVerifyToolArguments;
+          idempotencyKey: string;
+          revision: number;
+          leaseId: string;
+          source: "agent" | "replay";
+          replayCount: number;
+        },
+  ): Promise<void> {
+    await this.runTransaction(async (tx) => {
+      const [lockedRun] = await tx
+        .select({
+          id: agentRuns.id,
+          status: agentRuns.status,
+          currentRevision: agentRuns.currentRevision,
+          executionLeaseId: agentRuns.executionLeaseId,
+          usage: agentRuns.usage,
+        })
+        .from(agentRuns)
+        .where(
+          and(
+            eq(agentRuns.id, input.runId),
+            eq(agentRuns.ownerId, input.ownerId),
+            eq(agentRuns.projectId, input.projectId),
+          ),
+        )
+        .for("update");
+
+      if (!lockedRun) {
+        throw new AgentError(
+          AGENT_ERROR_CODES.runNotFound,
+          "Agent Run 不存在、项目不匹配或不属于当前匿名工作区。",
+          404,
+        );
+      }
+
+      const [existingInvocation] = await tx
+        .select()
+        .from(toolInvocations)
+        .where(
+          and(
+            eq(toolInvocations.runId, input.runId),
+            eq(toolInvocations.toolCallId, input.toolCallId),
+          ),
+        );
+
+      if (existingInvocation) {
+        const isIdenticalPendingSuspend =
+          lockedRun.status === "awaiting_client_tool" &&
+          lockedRun.currentRevision === input.revision &&
+          existingInvocation.toolName === input.toolName &&
+          existingInvocation.executionDomain === "client" &&
+          existingInvocation.status === "running" &&
+          existingInvocation.idempotencyKey === input.idempotencyKey &&
+          existingInvocation.revisionBefore === input.revision &&
+          isDeepStrictEqual(
+            existingInvocation.argumentsJson,
+            input.argumentsJson,
+          );
+
+        if (isIdenticalPendingSuspend) {
+          // Neon 上一个执行器可能已把同一 Tool Call 完整挂起，但旧执行器只收到
+          // 连接中断或迟到的 CAS 结果。数据库中的等待态与 Ledger 已经构成事实，
+          // 此处按幂等成功返回，且绝不能再次发布 requested/status 事件。
+          return;
+        }
+
+        throw new AgentError(
+          AGENT_ERROR_CODES.toolAlreadyExecuted,
+          `重复的 ${input.toolName} Tool Call 不能再次下发浏览器。`,
+          409,
+          { toolCallId: input.toolCallId },
+        );
+      }
+
+      // 在创建任何 Ledger 前先确认当前执行器仍拥有 Run。模型流可能持续较久，
+      // 若租约已过期并被其他实例接管，必须在副作用前失败，不能留下半成品记录。
+      if (
+        lockedRun.status !== "running" ||
+        lockedRun.currentRevision !== input.revision ||
+        lockedRun.executionLeaseId !== input.leaseId
+      ) {
+        throw new AgentError(
+          AGENT_ERROR_CODES.runConflict,
+          "Agent Run 状态、revision 或执行租约已发生变化。",
+          409,
+        );
+      }
+
+      // 挂起事务和结果事务都先锁定同一条 Run。浏览器通常会在 SSE 到达后
+      // 立即提交结果；若结果事务与本事务交叠，行锁会让它等到 awaiting 状态
+      // 和 Tool Ledger 一起提交，再读取完整一致的数据库快照。
+      const now = new Date();
+      const pausedUsage = pauseAgentExecution(
+        normalizeAgentRunUsage(lockedRun.usage),
+        now,
+      );
+      const [invocation] = await tx
+        .insert(toolInvocations)
+        .values({
+          runId: input.runId,
+          toolCallId: input.toolCallId,
+          toolName: input.toolName,
+          executionDomain: "client",
+          status: "running",
+          argumentsJson: input.argumentsJson,
+          idempotencyKey: input.idempotencyKey,
+          revisionBefore: input.revision,
+          startedAt: now,
+        })
+        .onConflictDoNothing({
+          target: [toolInvocations.runId, toolInvocations.toolCallId],
+        })
+        .returning({ id: toolInvocations.id });
+
+      if (!invocation) {
+        throw new AgentError(
+          AGENT_ERROR_CODES.toolAlreadyExecuted,
+          `重复的 ${input.toolName} Tool Call 不能再次下发浏览器。`,
+          409,
+          { toolCallId: input.toolCallId },
+        );
+      }
+
+      let verificationRunId: string | null = null;
+      if (input.toolName === BROWSER_VERIFY_TOOL_NAME) {
+        const [verification] = await tx
+          .insert(verificationRuns)
+          .values({
+            ownerId: input.ownerId,
+            runId: input.runId,
+            projectId: input.projectId,
+            toolCallId: input.toolCallId,
+            revision: input.revision,
+            status: "running",
+            source: input.source,
+            replayCount: input.replayCount,
+            smokeSteps: input.argumentsJson.steps,
+            acceptedNetworkFailures:
+              input.argumentsJson.acceptedNetworkFailures,
+            startedAt: now,
+          })
+          .returning({ id: verificationRuns.id });
+
+        if (!verification) {
+          throw new Error("创建 Browser Verification Run 失败。");
+        }
+        verificationRunId = verification.id;
+      }
+
+      const [updatedRun] = await tx
+        .update(agentRuns)
+        .set({
+          status: "awaiting_client_tool",
+          usage: pausedUsage,
+          executionLeaseId: null,
+          executionLeaseExpiresAt: null,
+          updatedAt: now,
+        })
+        .where(
+          and(
+            eq(agentRuns.id, input.runId),
+            eq(agentRuns.ownerId, input.ownerId),
+            eq(agentRuns.projectId, input.projectId),
+            eq(agentRuns.status, "running"),
+            eq(agentRuns.currentRevision, input.revision),
+            eq(agentRuns.executionLeaseId, input.leaseId),
+          ),
+        )
+        .returning({ currentRevision: agentRuns.currentRevision });
+
+      if (!updatedRun) {
+        const [latestRun] = await tx
+          .select({
+            status: agentRuns.status,
+            currentRevision: agentRuns.currentRevision,
+          })
+          .from(agentRuns)
+          .where(
+            and(
+              eq(agentRuns.id, input.runId),
+              eq(agentRuns.ownerId, input.ownerId),
+              eq(agentRuns.projectId, input.projectId),
+            ),
+          );
+        const [latestInvocation] = await tx
+          .select()
+          .from(toolInvocations)
+          .where(
+            and(
+              eq(toolInvocations.runId, input.runId),
+              eq(toolInvocations.toolCallId, input.toolCallId),
+            ),
+          );
+        const isIdenticalPendingSuspend =
+          latestRun?.status === "awaiting_client_tool" &&
+          latestRun.currentRevision === input.revision &&
+          latestInvocation?.toolName === input.toolName &&
+          latestInvocation.executionDomain === "client" &&
+          latestInvocation.status === "running" &&
+          latestInvocation.idempotencyKey === input.idempotencyKey &&
+          latestInvocation.revisionBefore === input.revision &&
+          isDeepStrictEqual(
+            latestInvocation.argumentsJson,
+            input.argumentsJson,
+          );
+
+        if (isIdenticalPendingSuspend) {
+          // 这是对 Neon 跨实例竞争的最后一道防线：若另一路径已经建立完全相同
+          // 的等待事实，本次调用仍视为成功。事件由真正完成状态切换的一方发布。
+          return;
+        }
+
+        throw new AgentError(
+          AGENT_ERROR_CODES.runConflict,
+          "Agent Run 状态、revision 或执行租约已发生变化。",
+          409,
+        );
+      }
+
+      await tx.insert(agentRunEvents).values([
+        {
+          runId: input.runId,
+          type: "run.status_changed",
+          payload: {
+            previousStatus: "running",
+            status: "awaiting_client_tool",
+            currentRevision: updatedRun.currentRevision,
+          },
+        },
+        {
+          runId: input.runId,
+          type: "client_tool.requested",
+          payload: {
+            runId: input.runId,
+            projectId: input.projectId,
+            toolCallId: input.toolCallId,
+            toolName: input.toolName,
+            idempotencyKey: input.idempotencyKey,
+            revision: input.revision,
+            arguments: input.argumentsJson,
+            ...(input.toolName === BROWSER_VERIFY_TOOL_NAME
+              ? {
+                  verificationRunId,
+                  source: input.source,
+                  replayCount: input.replayCount,
+                }
+              : {}),
+          },
+        },
+      ]);
+    });
   }
 
   /**
@@ -990,7 +1593,7 @@ export class AgentStore<TQueryResult extends PgQueryResultHKT> {
     disposition: "accepted" | "duplicate" | "ignored";
     run: AgentRunRecord;
   }> {
-    return this.db.transaction(async (tx) => {
+    return this.runTransaction(async (tx) => {
       const [runRow] = await tx
         .select()
         .from(agentRuns)
@@ -1000,7 +1603,8 @@ export class AgentStore<TQueryResult extends PgQueryResultHKT> {
             eq(agentRuns.ownerId, input.ownerId),
             eq(agentRuns.projectId, input.projectId),
           ),
-        );
+        )
+        .for("update");
 
       if (!runRow) {
         throw new AgentError(
@@ -1009,6 +1613,10 @@ export class AgentStore<TQueryResult extends PgQueryResultHKT> {
           404,
         );
       }
+
+      // 必须先锁 Run 再读取 Ledger。否则结果事务可能先读到 running，随后等待
+      // 尚未提交的 invocation；等待结束后仍沿用旧 Run 快照，便会把一份合法
+      // 结果误记为 run_not_awaiting_client_tool。
 
       const [projectRow] = await tx
         .select({ revision: projects.revision })
@@ -1188,10 +1796,7 @@ export class AgentStore<TQueryResult extends PgQueryResultHKT> {
         repeatedFailureCount,
         firstPreviewAt: currentUsage.firstPreviewAt ?? now.toISOString(),
         firstPreviewDurationMs:
-          currentUsage.firstPreviewDurationMs ??
-          (invocation.startedAt
-            ? Math.max(0, now.getTime() - invocation.startedAt.getTime())
-            : null),
+          currentUsage.firstPreviewDurationMs ?? normalizedResult.durationMs,
         latestPreviewAt: now.toISOString(),
         latestVerificationRevision: input.revision,
         latestVerificationOk: normalizedResult.ok,
@@ -1207,6 +1812,10 @@ export class AgentStore<TQueryResult extends PgQueryResultHKT> {
         noProgress || clientResumeBudgetExhausted
           ? "budget_exhausted"
           : "running";
+      const persistedUsage =
+        nextRunStatus === "running"
+          ? resumeAgentExecution(nextUsage, now)
+          : nextUsage;
       const terminalErrorCode = noProgress
         ? AGENT_ERROR_CODES.noProgress
         : clientResumeBudgetExhausted
@@ -1366,7 +1975,7 @@ export class AgentStore<TQueryResult extends PgQueryResultHKT> {
         .update(agentRuns)
         .set({
           status: nextRunStatus,
-          usage: nextUsage,
+          usage: persistedUsage,
           errorCode: terminalErrorCode,
           errorMessage: terminalErrorMessage,
           completedAt: nextRunStatus === "budget_exhausted" ? now : null,

@@ -8,6 +8,8 @@ import { AgentStore } from "@/domains/agent/store";
 import type { FrozenAgentRunProfile } from "@/domains/agent/types";
 import { DatabaseProjectRepository } from "@/domains/project/repository";
 import {
+  agentRuns,
+  agentRunEvents,
   agentEvidence,
   toolInvocations,
   verificationRuns,
@@ -46,6 +48,7 @@ function createPreviewResult(revision: number): RunPreviewResult {
     ok: true,
     toolName: "run_preview",
     revision,
+    durationMs: 1_234,
     summary: "Preview 验证通过。",
     build: {
       revision,
@@ -82,6 +85,7 @@ function createFailedPreviewResult(
     ok: false,
     toolName: "run_preview",
     revision,
+    durationMs: 2_345,
     summary: installFailed ? "依赖安装失败。" : "页面产生 1 个运行时错误。",
     build: {
       revision,
@@ -152,6 +156,7 @@ function createBrowserResult(
     verificationRunId,
     revision,
     replayCount: options.replayCount ?? 0,
+    durationMs: 3_456,
     summary: "客户端声称浏览器验证通过。",
     build: {
       revision,
@@ -382,6 +387,352 @@ describe("AgentStore", () => {
     }
   });
 
+  it("客户端工具挂起后续写入失败时整笔回滚，不留下孤立 Ledger 或等待状态", async () => {
+    const testDatabase = await createTestDatabase();
+
+    try {
+      const projectRepository = new DatabaseProjectRepository(
+        testDatabase.database,
+      );
+      const project = await projectRepository.createProject({
+        ownerId: "owner-1",
+        name: "Atomic Client Tool",
+        initialFiles: [{ path: "src/App.tsx", content: "export default App" }],
+      });
+      const store = new AgentStore(testDatabase.database);
+      const run = await store.createRun({
+        ownerId: "owner-1",
+        projectId: project.id,
+        conversationTitle: "验证原子挂起",
+        userMessage: "验证页面",
+        profile,
+      });
+      await store.transitionRun({
+        ownerId: run.ownerId,
+        runId: run.id,
+        status: "running",
+      });
+      const leaseId = await store.claimExecution({
+        ownerId: run.ownerId,
+        runId: run.id,
+      });
+      expect(leaseId).not.toBeNull();
+
+      // 预先制造同一 Run/toolCall 的 Verification 唯一键冲突，模拟挂起事务在
+      // Verification 阶段失败。Tool Invocation、状态切换和请求事件必须全部回滚。
+      await store.createVerificationRun({
+        ownerId: run.ownerId,
+        runId: run.id,
+        projectId: project.id,
+        toolCallId: "call-atomic-browser",
+        revision: 1,
+        source: "agent",
+        replayCount: 0,
+        smokeSteps: browserSmokeSteps,
+        acceptedNetworkFailures: [],
+      });
+
+      await expect(
+        store.suspendForClientTool({
+          ownerId: run.ownerId,
+          runId: run.id,
+          projectId: project.id,
+          toolCallId: "call-atomic-browser",
+          toolName: "browser_verify",
+          argumentsJson: {
+            revision: 1,
+            steps: browserSmokeSteps,
+            acceptedNetworkFailures: [],
+            observationMs: 1_500,
+          },
+          idempotencyKey: `${run.id}:call-atomic-browser`,
+          revision: 1,
+          leaseId: leaseId!,
+          source: "agent",
+          replayCount: 0,
+        }),
+      ).rejects.toThrow();
+
+      const [persistedRun, ledgerRows, requestedEvents] = await Promise.all([
+        store.getRun({ ownerId: run.ownerId, runId: run.id }),
+        testDatabase.database
+          .select()
+          .from(toolInvocations)
+          .where(eq(toolInvocations.runId, run.id)),
+        testDatabase.database
+          .select()
+          .from(agentRunEvents)
+          .where(eq(agentRunEvents.runId, run.id)),
+      ]);
+
+      expect(persistedRun).toMatchObject({
+        status: "running",
+        executionLeaseId: leaseId,
+      });
+      expect(ledgerRows).toEqual([]);
+      expect(
+        requestedEvents.filter(
+          (event) => event.type === "client_tool.requested",
+        ),
+      ).toEqual([]);
+    } finally {
+      await testDatabase.close();
+    }
+  });
+
+  it("等待客户端工具时禁止服务端重新抢占执行租约", async () => {
+    const testDatabase = await createTestDatabase();
+
+    try {
+      const projectRepository = new DatabaseProjectRepository(
+        testDatabase.database,
+      );
+      const project = await projectRepository.createProject({
+        ownerId: "owner-1",
+        name: "Client Tool Lease Boundary",
+        initialFiles: [{ path: "src/App.tsx", content: "export default App" }],
+      });
+      const store = new AgentStore(testDatabase.database);
+      const run = await store.createRun({
+        ownerId: "owner-1",
+        projectId: project.id,
+        conversationTitle: "等待 Preview",
+        userMessage: "验证页面",
+        profile,
+      });
+      const leaseId = await store.claimExecution({
+        ownerId: run.ownerId,
+        runId: run.id,
+      });
+      expect(leaseId).not.toBeNull();
+      await store.transitionRun({
+        ownerId: run.ownerId,
+        runId: run.id,
+        status: "running",
+      });
+      await store.appendTranscript({
+        conversationId: run.conversationId,
+        runId: run.id,
+        role: "assistant",
+        kind: "tool_call",
+        toolCallId: "call-preview-lease",
+        toolName: "run_preview",
+        argumentsJson: { revision: 1, observationMs: 1_500 },
+      });
+      await store.suspendForClientTool({
+        ownerId: run.ownerId,
+        runId: run.id,
+        projectId: project.id,
+        toolCallId: "call-preview-lease",
+        toolName: "run_preview",
+        argumentsJson: { revision: 1, observationMs: 1_500 },
+        idempotencyKey: `${run.id}:call-preview-lease`,
+        revision: 1,
+        leaseId: leaseId!,
+      });
+
+      const reclaimedLease = await store.claimExecution({
+        ownerId: run.ownerId,
+        runId: run.id,
+      });
+
+      expect(reclaimedLease).toBeNull();
+      await expect(
+        store.getRun({ ownerId: run.ownerId, runId: run.id }),
+      ).resolves.toMatchObject({
+        status: "awaiting_client_tool",
+        executionLeaseId: null,
+      });
+    } finally {
+      await testDatabase.close();
+    }
+  });
+
+  it("同一客户端 Tool Call 已建立等待态时按幂等成功处理且不重复发事件", async () => {
+    const testDatabase = await createTestDatabase();
+
+    try {
+      const projectRepository = new DatabaseProjectRepository(
+        testDatabase.database,
+      );
+      const project = await projectRepository.createProject({
+        ownerId: "owner-1",
+        name: "Idempotent Client Suspend",
+        initialFiles: [{ path: "src/App.tsx", content: "export default App" }],
+      });
+      const store = new AgentStore(testDatabase.database);
+      const run = await store.createRun({
+        ownerId: "owner-1",
+        projectId: project.id,
+        conversationTitle: "幂等挂起",
+        userMessage: "验证页面",
+        profile,
+      });
+      const leaseId = await store.claimExecution({
+        ownerId: run.ownerId,
+        runId: run.id,
+      });
+      expect(leaseId).not.toBeNull();
+      await store.transitionRun({
+        ownerId: run.ownerId,
+        runId: run.id,
+        status: "running",
+      });
+      const suspendInput = {
+        ownerId: run.ownerId,
+        runId: run.id,
+        projectId: project.id,
+        toolCallId: "call-preview-idempotent",
+        toolName: "run_preview" as const,
+        argumentsJson: { revision: 1, observationMs: 1_500 },
+        idempotencyKey: `${run.id}:call-preview-idempotent`,
+        revision: 1,
+        leaseId: leaseId!,
+      };
+
+      await store.suspendForClientTool(suspendInput);
+      const firstEvents = await store.listEventsAfter({
+        ownerId: run.ownerId,
+        runId: run.id,
+      });
+
+      // 模拟旧执行器迟到重入。租约已由首个挂起事务释放，但数据库事实与
+      // Tool Call 完全一致，因此应视为同一次操作成功，不制造重复 SSE。
+      await expect(
+        store.suspendForClientTool(suspendInput),
+      ).resolves.toBeUndefined();
+
+      const [latest, ledgerRows, latestEvents, hasPendingWait] =
+        await Promise.all([
+          store.getRun({ ownerId: run.ownerId, runId: run.id }),
+          testDatabase.database
+            .select()
+            .from(toolInvocations)
+            .where(eq(toolInvocations.runId, run.id)),
+          store.listEventsAfter({ ownerId: run.ownerId, runId: run.id }),
+          store.hasPendingClientToolWait({
+            ownerId: run.ownerId,
+            runId: run.id,
+          }),
+        ]);
+
+      expect(latest).toMatchObject({
+        status: "awaiting_client_tool",
+        executionLeaseId: null,
+      });
+      expect(ledgerRows).toHaveLength(1);
+      expect(hasPendingWait).toBe(true);
+      expect(latestEvents).toHaveLength(firstEvents.length);
+      expect(
+        latestEvents.filter((event) => event.type === "client_tool.requested"),
+      ).toHaveLength(1);
+    } finally {
+      await testDatabase.close();
+    }
+  });
+
+  it("将 running 加未完成客户端 Ledger 的脏状态原子恢复为等待态", async () => {
+    const testDatabase = await createTestDatabase();
+
+    try {
+      const projectRepository = new DatabaseProjectRepository(
+        testDatabase.database,
+      );
+      const project = await projectRepository.createProject({
+        ownerId: "owner-1",
+        name: "Recover Client Tool Wait",
+        initialFiles: [{ path: "src/App.tsx", content: "export default App" }],
+      });
+      const store = new AgentStore(testDatabase.database);
+      const run = await store.createRun({
+        ownerId: "owner-1",
+        projectId: project.id,
+        conversationTitle: "恢复浏览器等待",
+        userMessage: "验证页面",
+        profile,
+      });
+      const initialLeaseId = await store.claimExecution({
+        ownerId: run.ownerId,
+        runId: run.id,
+      });
+      expect(initialLeaseId).not.toBeNull();
+      await store.transitionRun({
+        ownerId: run.ownerId,
+        runId: run.id,
+        status: "running",
+      });
+      await store.appendTranscript({
+        conversationId: run.conversationId,
+        runId: run.id,
+        role: "assistant",
+        kind: "tool_call",
+        toolCallId: "call-preview-recover",
+        toolName: "run_preview",
+        argumentsJson: { revision: 1, observationMs: 1_500 },
+      });
+      await store.suspendForClientTool({
+        ownerId: run.ownerId,
+        runId: run.id,
+        projectId: project.id,
+        toolCallId: "call-preview-recover",
+        toolName: "run_preview",
+        argumentsJson: { revision: 1, observationMs: 1_500 },
+        idempotencyKey: `${run.id}:call-preview-recover`,
+        revision: 1,
+        leaseId: initialLeaseId!,
+      });
+
+      // 直接构造旧版本竞态可能留下的数据库形状：Run 已被错误推进为 running，
+      // 但客户端 Ledger 仍在执行，Transcript 也尚无对应 tool_result。
+      const staleLeaseId = "00000000-0000-4000-8000-000000000001";
+      await testDatabase.database
+        .update(agentRuns)
+        .set({
+          status: "running",
+          executionLeaseId: staleLeaseId,
+          executionLeaseExpiresAt: new Date(Date.now() + 60_000),
+        })
+        .where(eq(agentRuns.id, run.id));
+
+      const recovered = await store.recoverPendingClientToolWait({
+        ownerId: run.ownerId,
+        runId: run.id,
+        leaseId: staleLeaseId,
+      });
+      const [latest, ledgerRows, events] = await Promise.all([
+        store.getRun({ ownerId: run.ownerId, runId: run.id }),
+        testDatabase.database
+          .select()
+          .from(toolInvocations)
+          .where(eq(toolInvocations.runId, run.id)),
+        store.listEventsAfter({ ownerId: run.ownerId, runId: run.id }),
+      ]);
+
+      expect(recovered).toBe(true);
+      expect(latest).toMatchObject({
+        status: "awaiting_client_tool",
+        executionLeaseId: null,
+        executionLeaseExpiresAt: null,
+      });
+      expect(ledgerRows).toHaveLength(1);
+      expect(ledgerRows[0]).toMatchObject({
+        executionDomain: "client",
+        status: "running",
+        resultJson: null,
+      });
+      expect(events.map((event) => event.type)).toContain(
+        "client_tool.wait_recovered",
+      );
+      expect(events.at(-1)?.payload).toMatchObject({
+        previousStatus: "running",
+        status: "awaiting_client_tool",
+        reason: "pending_client_tool_recovered",
+      });
+    } finally {
+      await testDatabase.close();
+    }
+  });
+
   it("原子保存 Client Tool Evidence，并以幂等结果恢复 Run", async () => {
     const testDatabase = await createTestDatabase();
 
@@ -425,6 +776,12 @@ describe("AgentStore", () => {
         runId: run.id,
         status: "awaiting_client_tool",
       });
+      // Tool Ledger 的 startedAt 表示请求何时开始等待客户端，可能包含用户离开
+      // 页面等很长空档；首次预览指标只能使用客户端上报的实际执行耗时。
+      await testDatabase.database
+        .update(toolInvocations)
+        .set({ startedAt: new Date(Date.now() - 10 * 60_000) })
+        .where(eq(toolInvocations.runId, run.id));
       const result = createPreviewResult(1);
 
       const accepted = await store.completeClientToolResult({
@@ -465,9 +822,7 @@ describe("AgentStore", () => {
         latestVerificationOk: true,
       });
       expect(accepted.run.usage.firstPreviewAt).toEqual(expect.any(String));
-      expect(accepted.run.usage.firstPreviewDurationMs).toEqual(
-        expect.any(Number),
-      );
+      expect(accepted.run.usage.firstPreviewDurationMs).toBe(result.durationMs);
       expect(duplicate.disposition).toBe("duplicate");
       expect(evidenceRows.map((row) => row.kind).sort()).toEqual([
         "build",
@@ -1271,6 +1626,70 @@ describe("AgentStore", () => {
     }
   });
 
+  it("prefers an active conversation over a newer empty conversation", async () => {
+    const testDatabase = await createTestDatabase();
+
+    try {
+      const projectRepository = new DatabaseProjectRepository(
+        testDatabase.database,
+      );
+      const project = await projectRepository.createProject({
+        ownerId: "owner-1",
+        name: "Conversation Recovery",
+        initialFiles: [],
+      });
+      const store = new AgentStore(testDatabase.database);
+      const activeRun = await store.createRun({
+        ownerId: "owner-1",
+        projectId: project.id,
+        conversationTitle: "等待 Preview",
+        userMessage: "生成页面并运行预览",
+        profile,
+      });
+
+      // 新建空会话会更新会话列表排序，但它没有任何 Run，不应阻断旧会话中
+      // awaiting_client_tool 等待项的恢复。
+      const emptyConversation = await store.createConversation({
+        ownerId: "owner-1",
+        projectId: project.id,
+        title: "新会话",
+      });
+      const conversations = await store.listConversations({
+        ownerId: "owner-1",
+        projectId: project.id,
+      });
+
+      expect(conversations[0]?.id).toBe(emptyConversation.id);
+      await expect(
+        store.findActiveConversationId({
+          ownerId: "owner-1",
+          projectId: project.id,
+        }),
+      ).resolves.toBe(activeRun.conversationId);
+
+      await store.transitionRun({
+        ownerId: "owner-1",
+        runId: activeRun.id,
+        status: "running",
+      });
+      await store.transitionRun({
+        ownerId: "owner-1",
+        runId: activeRun.id,
+        status: "succeeded",
+      });
+
+      // Run 进入终态后不再强行恢复旧会话，路由会自然回落到最近更新的会话。
+      await expect(
+        store.findActiveConversationId({
+          ownerId: "owner-1",
+          projectId: project.id,
+        }),
+      ).resolves.toBeNull();
+    } finally {
+      await testDatabase.close();
+    }
+  });
+
   it("does not expose a conversation snapshot to another owner", async () => {
     const testDatabase = await createTestDatabase();
 
@@ -1300,6 +1719,95 @@ describe("AgentStore", () => {
       ).rejects.toMatchObject({
         code: "AGENT_RUN_NOT_FOUND",
         status: 404,
+      });
+    } finally {
+      await testDatabase.close();
+    }
+  });
+
+  it("keeps transcript writes available after reading a conversation snapshot", async () => {
+    const testDatabase = await createTestDatabase();
+
+    try {
+      const projectRepository = new DatabaseProjectRepository(
+        testDatabase.database,
+      );
+      const project = await projectRepository.createProject({
+        ownerId: "owner-1",
+        name: "Writable After Snapshot",
+        initialFiles: [{ path: "src/App.tsx", content: "export default App" }],
+      });
+      const store = new AgentStore(testDatabase.database);
+      const run = await store.createRun({
+        ownerId: "owner-1",
+        projectId: project.id,
+        conversationTitle: "快照后继续写入",
+        userMessage: "读取快照后继续执行",
+        profile,
+      });
+
+      // 工作台会在 Agent 执行期间频繁拉取快照。快照事务结束后，同一个 Store
+      // 必须仍能追加模型消息，避免读请求把后续写入变成 25006 只读事务错误。
+      await store.getConversationSnapshot({
+        ownerId: run.ownerId,
+        conversationId: run.conversationId,
+      });
+      await expect(
+        store.appendTranscript({
+          conversationId: run.conversationId,
+          runId: run.id,
+          role: "assistant",
+          kind: "assistant_message",
+          content: "快照读取完成，继续写入。",
+        }),
+      ).resolves.toMatchObject({
+        kind: "assistant_message",
+        content: "快照读取完成，继续写入。",
+      });
+    } finally {
+      await testDatabase.close();
+    }
+  });
+
+  it("uses the injected transaction runner for a conversation snapshot", async () => {
+    const testDatabase = await createTestDatabase();
+
+    try {
+      const projectRepository = new DatabaseProjectRepository(
+        testDatabase.database,
+      );
+      const project = await projectRepository.createProject({
+        ownerId: "owner-1",
+        name: "Injected Snapshot Transaction",
+        initialFiles: [],
+      });
+      let runnerCalls = 0;
+      const store = new AgentStore(testDatabase.database, {
+        transaction: async (operation) => {
+          runnerCalls += 1;
+          return testDatabase.database.transaction(operation, {
+            isolationLevel: "repeatable read",
+          });
+        },
+      });
+      const run = await store.createRun({
+        ownerId: "owner-1",
+        projectId: project.id,
+        conversationTitle: "固定连接快照",
+        userMessage: "读取一致性快照",
+        profile,
+      });
+
+      const snapshot = await store.getConversationSnapshot({
+        ownerId: run.ownerId,
+        conversationId: run.conversationId,
+      });
+
+      expect(runnerCalls).toBe(1);
+      expect(snapshot.runs[0]?.id).toBe(run.id);
+      expect(snapshot.transcript[0]).toMatchObject({
+        kind: "user_message",
+        content: "读取一致性快照",
       });
     } finally {
       await testDatabase.close();

@@ -266,6 +266,7 @@ function deriveBrowserVerificationFailure(
     ok: result.checks.build && result.checks.runtime && result.checks.console,
     toolName: "run_preview",
     revision: result.revision,
+    durationMs: result.durationMs,
     summary: result.summary,
     build: result.build,
     runtime: result.runtime,
@@ -444,12 +445,21 @@ export function getPreviewVerificationState(
 }
 
 export function buildVerificationDirective(
-  run: Pick<AgentRunRecord, "id" | "currentRevision">,
+  run: Pick<AgentRunRecord, "id" | "currentRevision" | "usage">,
   transcript: readonly TranscriptMessage[],
 ): string {
   const state = getPreviewVerificationState(run, transcript);
 
   if (!state.attempted) {
+    if (run.usage.fileMutations === 0) {
+      return [
+        "Runtime verification state:",
+        "- This Run has not changed any files and has not requested runtime verification.",
+        "- If the user asked for information or repository inspection, you may answer and finish now.",
+        "- Do not call run_preview only to answer a read-only request.",
+      ].join("\n");
+    }
+
     return [
       "Runtime verification state:",
       `- Revision ${run.currentRevision} has not been checked by run_preview.`,
@@ -488,7 +498,10 @@ export function buildVerificationDirective(
  * 仍沿用 Transcript 中的 run_preview，保证冻结 digest 对应的行为不会漂移。
  */
 export function getAgentVerificationState(input: {
-  run: Pick<AgentRunRecord, "id" | "currentRevision" | "toolsetProfile">;
+  run: Pick<
+    AgentRunRecord,
+    "id" | "currentRevision" | "toolsetProfile" | "usage"
+  >;
   transcript: readonly TranscriptMessage[];
   latestVerificationRun: VerificationRunRecord | null;
 }): AgentVerificationState {
@@ -536,7 +549,10 @@ export function getAgentVerificationState(input: {
 }
 
 export function buildAgentVerificationDirective(input: {
-  run: Pick<AgentRunRecord, "id" | "currentRevision" | "toolsetProfile">;
+  run: Pick<
+    AgentRunRecord,
+    "id" | "currentRevision" | "toolsetProfile" | "usage"
+  >;
   transcript: readonly TranscriptMessage[];
   latestVerificationRun: VerificationRunRecord | null;
 }): string {
@@ -548,6 +564,15 @@ export function buildAgentVerificationDirective(input: {
   const verification = input.latestVerificationRun;
 
   if (!state.attempted) {
+    if (input.run.usage.fileMutations === 0) {
+      return [
+        "Browser verification state:",
+        "- This Run has not changed any files and has not requested browser verification.",
+        "- For an informational or repository-inspection request, answer the user and finish normally.",
+        "- Do not call run_preview or browser_verify only to answer a read-only request.",
+      ].join("\n");
+    }
+
     return [
       "Browser verification state:",
       `- Revision ${input.run.currentRevision} has no browser_verify result.`,

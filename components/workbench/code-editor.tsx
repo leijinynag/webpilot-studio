@@ -5,9 +5,10 @@ import { useEffect, useRef } from "react";
 import type { editor } from "monaco-editor";
 
 import type { WorkspaceFile } from "@/domains/project/workspace";
+import { loadLocalMonacoReact } from "@/components/workbench/monaco-client";
 
 const MonacoEditor = dynamic(
-  () => import("@monaco-editor/react").then((module) => module.Editor),
+  () => loadLocalMonacoReact().then((module) => module.Editor),
   {
     ssr: false,
     loading: () => <div className="editor-loading">正在加载编辑器...</div>,

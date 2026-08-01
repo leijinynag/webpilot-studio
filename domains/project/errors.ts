@@ -6,6 +6,11 @@ export const PROJECT_ERROR_CODES = {
   fileNotFound: "FILE_NOT_FOUND",
   pathConflict: "PROJECT_PATH_CONFLICT",
   revisionConflict: "PROJECT_REVISION_CONFLICT",
+  checkpointNotFound: "PROJECT_CHECKPOINT_NOT_FOUND",
+  changeSetNotFound: "PROJECT_CHANGE_SET_NOT_FOUND",
+  checkpointContentMissing: "PROJECT_CHECKPOINT_CONTENT_MISSING",
+  historyCorrupted: "PROJECT_HISTORY_CORRUPTED",
+  restoreConflict: "PROJECT_RESTORE_CONFLICT",
   storageUnavailable: "STORAGE_KIND_UNAVAILABLE",
   originRejected: "ORIGIN_REJECTED",
 } as const;

@@ -99,7 +99,10 @@ export function projectPendingAssistantText(
   for (const event of events
     .filter((item) => item.runId === activeRunId)
     .toSorted((left, right) => left.sequence - right.sequence)) {
-    if (event.type === "assistant.completed") {
+    if (
+      event.type === "assistant.completed" ||
+      event.type === "model.turn_retried"
+    ) {
       text = "";
       continue;
     }

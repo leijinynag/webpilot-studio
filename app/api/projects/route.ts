@@ -56,7 +56,12 @@ export async function POST(request: Request) {
       ownerId,
       name: body.name,
       storageKind: "database",
-      initialFiles: flattenProjectTemplate(WEBPILOT_RSBUILD_TEMPLATE),
+      // 空项目不写入任何示例源码。只有调用方明确选择 rsbuild 时才展开模板，
+      // 从而让“Blank”与服务端持久化语义保持一致。
+      initialFiles:
+        body.template === "rsbuild"
+          ? flattenProjectTemplate(WEBPILOT_RSBUILD_TEMPLATE)
+          : [],
     });
 
     return NextResponse.json({ project }, { status: 201 });

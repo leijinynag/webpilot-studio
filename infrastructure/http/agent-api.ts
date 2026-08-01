@@ -6,8 +6,12 @@ import { z } from "zod";
 import { isAgentError } from "@/domains/agent/errors";
 import { AgentStore } from "@/domains/agent/store";
 import { isProjectError } from "@/domains/project/errors";
+import { ProjectHistoryService } from "@/domains/project/history";
 import { DatabaseProjectRepository } from "@/domains/project/repository";
-import { getDatabase } from "@/infrastructure/db/client";
+import {
+  getDatabase,
+  runDatabaseTransaction,
+} from "@/infrastructure/db/client";
 
 type ApiErrorBody = {
   error: {
@@ -32,6 +36,9 @@ export function agentJsonResponse<T>(
 ) {
   const response = NextResponse.json(body, init);
   response.headers.set("x-correlation-id", correlationId);
+  // Agent Run 与聚合快照是高频变化的数据库事实。无论 GET 还是 mutation
+  // 响应都禁止浏览器、CDN 或 Next 数据缓存复用，避免刷新读到旧终态。
+  response.headers.set("Cache-Control", "private, no-store, max-age=0");
   return response;
 }
 
@@ -94,7 +101,14 @@ export async function readAgentJsonBody(request: Request): Promise<unknown> {
 export function getAgentPersistence() {
   const database = getDatabase();
   return {
-    store: new AgentStore(database),
+    // 聚合快照需要 REPEATABLE READ，但必须固定到独占 PoolClient，不能依赖
+    // Drizzle 在热更新 bundle 之间进行不稳定的 Pool instanceof 判断。Agent
+    // 原子写事务也共用同一 runner，保证 checkpoint、ChangeSet 和 Run 终态
+    // 在同一连接内获得 read-your-writes 语义。
+    store: new AgentStore(database, {
+      transaction: runDatabaseTransaction,
+    }),
     repository: new DatabaseProjectRepository(database),
+    history: new ProjectHistoryService(database),
   };
 }

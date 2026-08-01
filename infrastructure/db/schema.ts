@@ -35,6 +35,19 @@ export const projectRevisionKind = pgEnum("project_revision_kind", [
   "restore",
 ]);
 
+export const projectCheckpointKind = pgEnum("project_checkpoint_kind", [
+  "agent_start",
+  "agent_success",
+  "restore",
+]);
+
+export const projectChangeOperation = pgEnum("project_change_operation", [
+  "create",
+  "update",
+  "delete",
+  "rename",
+]);
+
 export const transcriptMessageRole = pgEnum("transcript_message_role", [
   "user",
   "assistant",
@@ -236,7 +249,9 @@ export const projectRevisions = pgTable(
       table.projectId,
       table.createdAt,
     ),
-    check("project_revisions_revision_check", sql`${table.revision} >= 1`),
+    // revision 0 表示项目已创建、但尚未写入任何文件。它仍是可被 Agent
+    // checkpoint 引用的完整空快照，第一笔 mutation 会自然推进到 revision 1。
+    check("project_revisions_revision_check", sql`${table.revision} >= 0`),
   ],
 );
 
@@ -390,6 +405,121 @@ export const agentRuns = pgTable(
     index("agent_runs_lease_idx").on(
       table.status,
       table.executionLeaseExpiresAt,
+    ),
+  ],
+);
+
+export const projectCheckpoints = pgTable(
+  "project_checkpoints",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    projectId: uuid("project_id")
+      .notNull()
+      .references(() => projects.id, { onDelete: "cascade" }),
+    revisionId: uuid("revision_id")
+      .notNull()
+      .references(() => projectRevisions.id, { onDelete: "restrict" }),
+    runId: uuid("run_id").references(() => agentRuns.id, {
+      onDelete: "set null",
+    }),
+    kind: projectCheckpointKind("kind").notNull(),
+    summary: text("summary"),
+    createdAt: timestamp("created_at", {
+      withTimezone: true,
+      mode: "date",
+    })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    // 同一 Run 的起点和成功快照只能各有一份。PostgreSQL unique 对 null
+    // 不做互斥，因此 restore checkpoint 可以没有 Run 关联并持续追加。
+    uniqueIndex("project_checkpoints_run_kind_uidx").on(
+      table.runId,
+      table.kind,
+    ),
+    index("project_checkpoints_project_created_idx").on(
+      table.projectId,
+      table.createdAt,
+    ),
+    index("project_checkpoints_revision_idx").on(table.revisionId),
+  ],
+);
+
+export const projectChangeSets = pgTable(
+  "project_change_sets",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    projectId: uuid("project_id")
+      .notNull()
+      .references(() => projects.id, { onDelete: "cascade" }),
+    runId: uuid("run_id")
+      .notNull()
+      .references(() => agentRuns.id, { onDelete: "cascade" }),
+    baseCheckpointId: uuid("base_checkpoint_id")
+      .notNull()
+      .references(() => projectCheckpoints.id, { onDelete: "restrict" }),
+    resultCheckpointId: uuid("result_checkpoint_id")
+      .notNull()
+      .references(() => projectCheckpoints.id, { onDelete: "restrict" }),
+    baseRevision: integer("base_revision").notNull(),
+    resultRevision: integer("result_revision").notNull(),
+    summary: text("summary").notNull(),
+    createdAt: timestamp("created_at", {
+      withTimezone: true,
+      mode: "date",
+    })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    uniqueIndex("project_change_sets_run_uidx").on(table.runId),
+    index("project_change_sets_project_created_idx").on(
+      table.projectId,
+      table.createdAt,
+    ),
+    check(
+      "project_change_sets_revision_order_check",
+      sql`${table.baseRevision} <= ${table.resultRevision}`,
+    ),
+  ],
+);
+
+export const projectChangeSetFiles = pgTable(
+  "project_change_set_files",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    changeSetId: uuid("change_set_id")
+      .notNull()
+      .references(() => projectChangeSets.id, { onDelete: "cascade" }),
+    operation: projectChangeOperation("operation").notNull(),
+    pathBefore: text("path_before"),
+    pathAfter: text("path_after"),
+    beforeHash: text("before_hash").references(() => projectFileBlobs.hash),
+    afterHash: text("after_hash").references(() => projectFileBlobs.hash),
+    sortOrder: integer("sort_order").notNull(),
+  },
+  (table) => [
+    uniqueIndex("project_change_set_files_order_uidx").on(
+      table.changeSetId,
+      table.sortOrder,
+    ),
+    index("project_change_set_files_change_idx").on(
+      table.changeSetId,
+      table.operation,
+    ),
+    check(
+      "project_change_set_files_sort_order_check",
+      sql`${table.sortOrder} >= 0`,
+    ),
+    check(
+      "project_change_set_files_shape_check",
+      sql`
+        (${table.operation} = 'create' and ${table.pathBefore} is null and ${table.pathAfter} is not null and ${table.beforeHash} is null and ${table.afterHash} is not null)
+        or (${table.operation} = 'update' and ${table.pathBefore} is not null and ${table.pathAfter} is not null and ${table.beforeHash} is not null and ${table.afterHash} is not null)
+        or (${table.operation} = 'delete' and ${table.pathBefore} is not null and ${table.pathAfter} is null and ${table.beforeHash} is not null and ${table.afterHash} is null)
+        or (${table.operation} = 'rename' and ${table.pathBefore} is not null and ${table.pathAfter} is not null and ${table.beforeHash} is not null and ${table.afterHash} is not null)
+      `,
     ),
   ],
 );
@@ -666,6 +796,9 @@ export const databaseSchema = {
   projectFiles,
   projectRevisions,
   projectRevisionFiles,
+  projectCheckpoints,
+  projectChangeSets,
+  projectChangeSetFiles,
   conversations,
   transcriptMessages,
   agentRuns,

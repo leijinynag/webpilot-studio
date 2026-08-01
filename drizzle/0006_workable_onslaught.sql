@@ -1,0 +1,2 @@
+ALTER TABLE "project_revisions" DROP CONSTRAINT "project_revisions_revision_check";--> statement-breakpoint
+ALTER TABLE "project_revisions" ADD CONSTRAINT "project_revisions_revision_check" CHECK ("project_revisions"."revision" >= 0);

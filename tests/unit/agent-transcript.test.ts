@@ -126,4 +126,41 @@ describe("Agent transcript assembler", () => {
 
     expect(projectPendingAssistantText(events, "run-1")).toBe("第二轮未完成");
   });
+
+  it("丢弃供应商缺失 Tool Call 时产生的临时前言", () => {
+    const events: AgentRunEvent[] = [
+      {
+        id: "event-1",
+        runId: "run-1",
+        sequence: 1,
+        type: "assistant.delta",
+        payload: { text: "我先检查项目结构。" },
+        createdAt: new Date(),
+      },
+      {
+        id: "event-2",
+        runId: "run-1",
+        sequence: 2,
+        type: "model.turn_retried",
+        payload: {
+          reason: "empty_tool_calls",
+          discardedCharacterCount: 9,
+          consumedModelTurns: 1,
+        },
+        createdAt: new Date(),
+      },
+      {
+        id: "event-3",
+        runId: "run-1",
+        sequence: 3,
+        type: "assistant.delta",
+        payload: { text: "正在读取文件..." },
+        createdAt: new Date(),
+      },
+    ];
+
+    expect(projectPendingAssistantText(events, "run-1")).toBe(
+      "正在读取文件...",
+    );
+  });
 });

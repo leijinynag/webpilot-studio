@@ -14,6 +14,7 @@ import {
   ChevronDown,
   CircleStop,
   FileCode2,
+  GitCompareArrows,
   LoaderCircle,
   MessageSquarePlus,
   PlayCircle,
@@ -26,6 +27,7 @@ import {
 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { ChangeSetDialog } from "@/components/workbench/change-set-dialog";
 import {
   clientToolRequestSchema,
   type ClientToolRequest,
@@ -46,8 +48,10 @@ import { cn } from "@/lib/utils";
 type AgentPanelProps = {
   projectId: string;
   revision: number;
+  dirtyPaths: readonly string[];
   onClientToolRequest?: (request: ClientToolRequest) => void;
   onRevisionChange?: (revision: number) => void;
+  onRestoreComplete: (revision: number) => Promise<void> | void;
 };
 
 type AgentResponse = {
@@ -59,6 +63,11 @@ type AgentErrorResponse = {
   error?: { message?: string };
 };
 
+type OptimisticUserMessage = {
+  content: string;
+  status: "sending" | "queued";
+};
+
 const TERMINAL_STATUSES = new Set([
   "succeeded",
   "failed",
@@ -66,12 +75,30 @@ const TERMINAL_STATUSES = new Set([
   "budget_exhausted",
   "conflicted",
 ]);
+const SNAPSHOT_REFRESH_DELAY_MS = 160;
+const IMMEDIATE_SNAPSHOT_EVENT_TYPES = new Set([
+  "run.created",
+  "run.status_changed",
+  "run.cancellation_requested",
+  "assistant.completed",
+  "model.turn_retried",
+  "model.finished",
+  "tool.completed",
+  "client_tool.requested",
+  "client_tool.completed",
+  "client_tool.result_ignored",
+  "client_tool.wait_recovered",
+  "verification.completed",
+  "verification.completion_blocked",
+]);
 
 export function AgentPanel({
   projectId,
   revision,
+  dirtyPaths,
   onClientToolRequest,
   onRevisionChange,
+  onRestoreComplete,
 }: AgentPanelProps) {
   const [conversations, setConversations] = useState<ConversationRecord[]>([]);
   const [snapshot, setSnapshot] = useState<AgentConversationSnapshot | null>(
@@ -87,16 +114,25 @@ export function AgentPanel({
   const [stopping, setStopping] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [showHistory, setShowHistory] = useState(false);
+  const [changeSetRunId, setChangeSetRunId] = useState<string | null>(null);
   const [streamingAssistantText, setStreamingAssistantText] = useState("");
+  const [optimisticUserMessage, setOptimisticUserMessage] =
+    useState<OptimisticUserMessage | null>(null);
   const streamRef = useRef<EventSource | null>(null);
   const streamRunIdRef = useRef<string | null>(null);
   const reconnectTimerRef = useRef<number | null>(null);
   const lastEventIdRef = useRef(0);
   const selectedConversationRef = useRef<string | null>(null);
+  const explicitConversationSelectionRef = useRef(false);
   const reconnectStreamRef = useRef<(() => void) | null>(null);
   const draftRef = useRef<HTMLTextAreaElement | null>(null);
   const transcriptRef = useRef<HTMLDivElement | null>(null);
   const snapshotRequestRef = useRef(0);
+  const snapshotRefreshTimerRef = useRef<number | null>(null);
+  const snapshotRefreshInFlightRef =
+    useRef<Promise<AgentResponse | null> | null>(null);
+  const snapshotRefreshTrailingRef = useRef(false);
+  const currentProjectIdRef = useRef(projectId);
 
   const activeRun = useMemo(
     () =>
@@ -141,40 +177,7 @@ export function AgentPanel({
     );
   }, [latestRunVerifications, snapshot?.verificationSteps]);
 
-  const loadAgentSnapshot = useCallback(
-    async (
-      conversationId?: string | null,
-      options: { showLoading?: boolean } = {},
-    ) => {
-      const requestId = snapshotRequestRef.current + 1;
-      snapshotRequestRef.current = requestId;
-      if (options.showLoading !== false) {
-        setLoading(true);
-      }
-
-      try {
-        const body = await fetchAgentSnapshot(projectId, conversationId);
-        // SSE 事件可能同时触发多个快照请求，只接受最后一次请求的结果，
-        // 避免较早的慢响应覆盖刚刚到达的最新 Transcript。
-        if (requestId === snapshotRequestRef.current) {
-          applySnapshot(body);
-        }
-      } catch (error) {
-        if (requestId === snapshotRequestRef.current) {
-          setErrorMessage(
-            error instanceof Error ? error.message : "无法加载 Agent 会话。",
-          );
-        }
-      } finally {
-        if (requestId === snapshotRequestRef.current) {
-          setLoading(false);
-        }
-      }
-    },
-    [projectId],
-  );
-
-  function applySnapshot(body: AgentResponse) {
+  const applySnapshot = useCallback((body: AgentResponse) => {
     setConversations(body.conversations);
     setSnapshot(body.snapshot);
     setSelectedConversationId(body.snapshot?.conversation.id ?? null);
@@ -190,39 +193,159 @@ export function AgentPanel({
         (cursor, event) => Math.max(cursor, event.sequence),
         0,
       ) ?? 0;
+    // POST 返回和随后聚合快照之间存在短暂窗口。只在数据库 Transcript 已经
+    // 出现同一条用户消息后移除乐观投影，避免快照较慢时消息闪退，也避免重复展示。
+    setOptimisticUserMessage((current) => {
+      if (
+        current &&
+        body.snapshot?.transcript.some(
+          (message) =>
+            message.kind === "user_message" &&
+            message.content === current.content,
+        )
+      ) {
+        return null;
+      }
+      return current;
+    });
     setErrorMessage(null);
-  }
+  }, []);
+
+  const loadAgentSnapshot = useCallback(
+    async (
+      conversationId?: string | null,
+      options: { showLoading?: boolean } = {},
+    ): Promise<AgentResponse | null> => {
+      const requestId = snapshotRequestRef.current + 1;
+      const requestedProjectId = projectId;
+      snapshotRequestRef.current = requestId;
+      if (options.showLoading !== false) {
+        setLoading(true);
+      }
+
+      try {
+        const body = await fetchAgentSnapshot(projectId, conversationId);
+        // SSE 事件可能同时触发多个快照请求，只接受最后一次请求的结果，
+        // 避免较早的慢响应覆盖刚刚到达的最新 Transcript。
+        if (
+          requestId === snapshotRequestRef.current &&
+          requestedProjectId === currentProjectIdRef.current
+        ) {
+          applySnapshot(body);
+        }
+        return body;
+      } catch (error) {
+        if (
+          requestId === snapshotRequestRef.current &&
+          requestedProjectId === currentProjectIdRef.current
+        ) {
+          setErrorMessage(
+            error instanceof Error ? error.message : "无法加载 Agent 会话。",
+          );
+        }
+        return null;
+      } finally {
+        if (
+          requestId === snapshotRequestRef.current &&
+          requestedProjectId === currentProjectIdRef.current
+        ) {
+          setLoading(false);
+        }
+      }
+    },
+    [applySnapshot, projectId],
+  );
+
+  const scheduleAgentSnapshotRefresh = useCallback(
+    (immediate = false) => {
+      // 一个快照请求尚未结束时只记录一次 trailing refresh。SSE 可能在几十毫秒
+      // 内连续送达 delta、usage、tool 事件，无需为每条事件并发读取完整 Transcript。
+      if (snapshotRefreshInFlightRef.current) {
+        snapshotRefreshTrailingRef.current = true;
+        return;
+      }
+
+      if (snapshotRefreshTimerRef.current !== null) {
+        if (!immediate) {
+          return;
+        }
+        window.clearTimeout(snapshotRefreshTimerRef.current);
+      }
+
+      snapshotRefreshTimerRef.current = window.setTimeout(
+        () => {
+          snapshotRefreshTimerRef.current = null;
+          const request = loadAgentSnapshot(selectedConversationRef.current, {
+            showLoading: false,
+          });
+          snapshotRefreshInFlightRef.current = request;
+
+          void request.finally(() => {
+            if (snapshotRefreshInFlightRef.current === request) {
+              snapshotRefreshInFlightRef.current = null;
+            }
+
+            if (snapshotRefreshTrailingRef.current) {
+              snapshotRefreshTrailingRef.current = false;
+              scheduleAgentSnapshotRefresh();
+            }
+          });
+        },
+        immediate ? 0 : SNAPSHOT_REFRESH_DELAY_MS,
+      );
+    },
+    [loadAgentSnapshot],
+  );
+
+  const flushAgentSnapshotRefresh = useCallback(async () => {
+    // 断线检查必须读取断线后的最新事实。先取消尚未开始的节流刷新，再等待在途
+    // 请求结束，并额外读取一次，避免用断线前的 running 快照决定是否重连。
+    if (snapshotRefreshTimerRef.current !== null) {
+      window.clearTimeout(snapshotRefreshTimerRef.current);
+      snapshotRefreshTimerRef.current = null;
+    }
+    snapshotRefreshTrailingRef.current = false;
+    await snapshotRefreshInFlightRef.current;
+    return loadAgentSnapshot(selectedConversationRef.current, {
+      showLoading: false,
+    });
+  }, [loadAgentSnapshot]);
+
+  useEffect(() => {
+    // projectId 仅用于拒绝迟到的快照响应，不参与渲染。commit 后更新可避免
+    // render 阶段写 ref，同时保证后面的首屏请求 effect 读取到当前项目。
+    currentProjectIdRef.current = projectId;
+  }, [projectId]);
 
   useEffect(() => {
     selectedConversationRef.current = selectedConversationId;
   }, [selectedConversationId]);
 
   useEffect(() => {
-    let cancelled = false;
-
-    void fetchAgentSnapshot(projectId)
-      .then((body) => {
-        if (!cancelled) {
-          applySnapshot(body);
-        }
-      })
-      .catch((error: unknown) => {
-        if (!cancelled) {
-          setErrorMessage(
-            error instanceof Error ? error.message : "无法加载 Agent 会话。",
-          );
-        }
-      })
-      .finally(() => {
-        if (!cancelled) {
-          setLoading(false);
-        }
-      });
+    // 首屏加载与 SSE、切换会话、提交消息使用同一请求序列。项目切换或组件
+    // 卸载时递增序号，使旧请求即使迟到也不能覆盖新项目的数据库快照。
+    // 延迟到当前 effect 调用栈之外开始请求，避免同步 loading 更新形成级联渲染。
+    const timerId = window.setTimeout(() => {
+      // 用户可能在首屏定时器执行前已经点选了历史会话。此时默认请求不能再
+      // 以“服务端最新会话”覆盖明确选择，否则有进行中 Run 的会话会停留在后台，
+      // 工作台也无法恢复它等待中的 run_preview。
+      if (explicitConversationSelectionRef.current) {
+        return;
+      }
+      void loadAgentSnapshot();
+    }, 0);
 
     return () => {
-      cancelled = true;
+      window.clearTimeout(timerId);
+      snapshotRequestRef.current += 1;
+      if (snapshotRefreshTimerRef.current !== null) {
+        window.clearTimeout(snapshotRefreshTimerRef.current);
+        snapshotRefreshTimerRef.current = null;
+      }
+      snapshotRefreshTrailingRef.current = false;
+      explicitConversationSelectionRef.current = false;
     };
-  }, [projectId]);
+  }, [loadAgentSnapshot]);
 
   const reconnectStream = useCallback(() => {
     const runId = activeRun?.id;
@@ -267,7 +390,8 @@ export function AgentPanel({
         });
       } else if (
         persistedEvent?.runId === runId &&
-        persistedEvent.type === "assistant.completed"
+        (persistedEvent.type === "assistant.completed" ||
+          persistedEvent.type === "model.turn_retried")
       ) {
         setStreamingAssistantText("");
       } else if (
@@ -282,22 +406,39 @@ export function AgentPanel({
         }
       }
 
-      // 增量文本先即时投影，快照随后负责收敛 Transcript、工具和 Run 状态。
-      // 这样重连、刷新和事件乱序仍以数据库事实为准。
-      void loadAgentSnapshot(selectedConversationRef.current, {
-        showLoading: false,
-      });
+      // assistant.delta 先即时投影；普通高频事件进入 160ms 合并窗口，终态、
+      // 客户端工具与验证事件在下一个事件循环立即收敛。数据库仍是最终事实，
+      // 但不再出现“一条 SSE 对应一次完整快照 GET”的请求风暴。
+      scheduleAgentSnapshotRefresh(
+        Boolean(
+          persistedEvent &&
+            IMMEDIATE_SNAPSHOT_EVENT_TYPES.has(persistedEvent.type),
+        ),
+      );
     };
 
     stream.onerror = () => {
       stream.close();
       streamRef.current = null;
-      reconnectTimerRef.current = window.setTimeout(() => {
-        reconnectTimerRef.current = null;
-        if (streamRunIdRef.current === runId) {
-          reconnectStreamRef.current?.();
+
+      // EventSource 无法区分“网络断线”和“服务端因 Run 已终态而主动关闭”。
+      // 尤其页面刷新时，聚合快照可能恰好读到旧 Run 与新终态事件的短暂组合：
+      // 游标已越过终态事件，但 UI 仍保留 running。流关闭后先强制读取一次最新
+      // 数据库事实，终态则停止重连，非终态或读取失败才进入有界延迟重连。
+      void flushAgentSnapshotRefresh().then((body) => {
+        const refreshedActiveRun = findActiveRun(body?.snapshot?.runs ?? []);
+        if (body && refreshedActiveRun?.id !== runId) {
+          streamRunIdRef.current = null;
+          return;
         }
-      }, 1200);
+
+        reconnectTimerRef.current = window.setTimeout(() => {
+          reconnectTimerRef.current = null;
+          if (streamRunIdRef.current === runId) {
+            reconnectStreamRef.current?.();
+          }
+        }, 1200);
+      });
     };
 
     for (const eventType of [
@@ -307,6 +448,7 @@ export function AgentPanel({
       "run.progress",
       "assistant.delta",
       "assistant.completed",
+      "model.turn_retried",
       "model.usage",
       "model.finished",
       "tool.started",
@@ -314,12 +456,18 @@ export function AgentPanel({
       "client_tool.requested",
       "client_tool.completed",
       "client_tool.result_ignored",
+      "client_tool.wait_recovered",
       "verification.completed",
       "verification.completion_blocked",
     ]) {
       stream.addEventListener(eventType, handleEvent);
     }
-  }, [activeRun?.id, loadAgentSnapshot, onClientToolRequest]);
+  }, [
+    activeRun?.id,
+    flushAgentSnapshotRefresh,
+    onClientToolRequest,
+    scheduleAgentSnapshotRefresh,
+  ]);
 
   useEffect(() => {
     reconnectStreamRef.current = reconnectStream;
@@ -332,6 +480,11 @@ export function AgentPanel({
         window.clearTimeout(reconnectTimerRef.current);
         reconnectTimerRef.current = null;
       }
+      if (snapshotRefreshTimerRef.current !== null) {
+        window.clearTimeout(snapshotRefreshTimerRef.current);
+        snapshotRefreshTimerRef.current = null;
+      }
+      snapshotRefreshTrailingRef.current = false;
       streamRef.current?.close();
       streamRef.current = null;
       streamRunIdRef.current = null;
@@ -443,6 +596,7 @@ export function AgentPanel({
         );
       }
 
+      selectConversation(body.conversation.id);
       await loadAgentSnapshot(body.conversation.id);
       setShowHistory(false);
       draftRef.current?.focus();
@@ -455,6 +609,15 @@ export function AgentPanel({
     }
   }
 
+  function selectConversation(conversationId: string) {
+    // ref 必须在发请求前同步更新。setState 只会在下一次 commit 后生效，
+    // 若这段窗口内 SSE 断线重拉或首屏定时器启动，旧 selectedConversationId
+    // 会把请求重新指向另一个会话。
+    explicitConversationSelectionRef.current = true;
+    selectedConversationRef.current = conversationId;
+    setSelectedConversationId(conversationId);
+  }
+
   async function sendMessage(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const message = draft.trim();
@@ -463,6 +626,10 @@ export function AgentPanel({
       return;
     }
 
+    // 用户消息先进入本地投影并立即清空输入框。网络、数据库限流检查和 Run
+    // 事务都不再阻塞可见反馈；失败时再把原文恢复到编辑框供用户重试。
+    setDraft("");
+    setOptimisticUserMessage({ content: message, status: "sending" });
     setSending(true);
     setErrorMessage(null);
 
@@ -488,9 +655,19 @@ export function AgentPanel({
         );
       }
 
-      setDraft("");
-      await loadAgentSnapshot(body.run.conversationId);
+      setOptimisticUserMessage((current) =>
+        current?.content === message
+          ? { ...current, status: "queued" }
+          : current,
+      );
+      // SSE 会持续收敛后续状态；这里触发一次首个持久化快照，但不让输入交互
+      // 等待额外的 GET 往返。sending 只代表创建 Run 的 POST 是否仍在进行。
+      void loadAgentSnapshot(body.run.conversationId, { showLoading: false });
     } catch (error) {
+      setOptimisticUserMessage((current) =>
+        current?.content === message ? null : current,
+      );
+      setDraft((current) => (current.trim() ? current : message));
       setErrorMessage(
         error instanceof Error ? error.message : "Agent Run 创建失败。",
       );
@@ -524,6 +701,13 @@ export function AgentPanel({
   }
 
   const transcript = snapshot?.transcript ?? [];
+  const showOptimisticUserMessage =
+    optimisticUserMessage !== null &&
+    !transcript.some(
+      (message) =>
+        message.kind === "user_message" &&
+        message.content === optimisticUserMessage.content,
+    );
 
   return (
     <aside className="agent-panel-v2" aria-label="Agent">
@@ -586,6 +770,7 @@ export function AgentPanel({
                   key={conversation.id}
                   onClick={() => {
                     setShowHistory(false);
+                    selectConversation(conversation.id);
                     void loadAgentSnapshot(conversation.id);
                   }}
                   type="button"
@@ -611,7 +796,9 @@ export function AgentPanel({
             <LoaderCircle className="animate-spin" />
             <span>正在恢复 Agent 状态...</span>
           </div>
-        ) : transcript.length || streamingAssistantText ? (
+        ) : transcript.length ||
+          showOptimisticUserMessage ||
+          streamingAssistantText ? (
           <>
             {transcript.map((message) => (
               <TranscriptItem
@@ -619,6 +806,9 @@ export function AgentPanel({
                 message={message}
               />
             ))}
+            {showOptimisticUserMessage && optimisticUserMessage ? (
+              <OptimisticTranscriptItem message={optimisticUserMessage} />
+            ) : null}
             {streamingAssistantText ? (
               <StreamingAssistantMessage content={streamingAssistantText} />
             ) : null}
@@ -635,6 +825,8 @@ export function AgentPanel({
       {latestRun ? (
         <AgentRunStatus
           activeTool={activeTool}
+          hasStreamingAssistantText={Boolean(streamingAssistantText)}
+          onReviewChanges={() => setChangeSetRunId(latestRun.id)}
           onStop={() => void stopRun()}
           run={latestRun}
           stopping={stopping}
@@ -678,6 +870,20 @@ export function AgentPanel({
           </Button>
         </div>
       </form>
+
+      {changeSetRunId ? (
+        <ChangeSetDialog
+          dirtyPaths={dirtyPaths}
+          key={changeSetRunId}
+          onOpenChange={(open) => {
+            if (!open) {
+              setChangeSetRunId(null);
+            }
+          }}
+          onRestoreComplete={onRestoreComplete}
+          runId={changeSetRunId}
+        />
+      ) : null}
     </aside>
   );
 }
@@ -765,6 +971,24 @@ function TranscriptItem({ message }: { message: TranscriptMessage }) {
   );
 }
 
+function OptimisticTranscriptItem({
+  message,
+}: {
+  message: OptimisticUserMessage;
+}) {
+  return (
+    <article
+      className="agent-message agent-message-user is-pending"
+      data-testid="optimistic-user-message"
+    >
+      <span className="agent-message-label">
+        You · {message.status === "sending" ? "发送中" : "已排队"}
+      </span>
+      <p>{message.content}</p>
+    </article>
+  );
+}
+
 function StreamingAssistantMessage({ content }: { content: string }) {
   return (
     <article className="agent-message agent-message-assistant is-streaming">
@@ -780,6 +1004,8 @@ function StreamingAssistantMessage({ content }: { content: string }) {
 function AgentRunStatus({
   run,
   activeTool,
+  hasStreamingAssistantText,
+  onReviewChanges,
   onStop,
   stopping,
   verificationRuns,
@@ -787,6 +1013,8 @@ function AgentRunStatus({
 }: {
   run: AgentRunRecord;
   activeTool: ToolInvocationRecord | null;
+  hasStreamingAssistantText: boolean;
+  onReviewChanges: () => void;
   onStop: () => void;
   stopping: boolean;
   verificationRuns: VerificationRunRecord[];
@@ -796,6 +1024,15 @@ function AgentRunStatus({
   const status = getRunStatusCopy(run);
   const isActive = !TERMINAL_STATUSES.has(run.status);
   const isFailure = status.tone === "error";
+  const displayedModelTurns =
+    run.status === "running" && !activeTool
+      ? Math.min(run.usage.modelTurns + 1, run.budget.maxModelTurns)
+      : run.usage.modelTurns;
+  const activeDetail = activeTool
+    ? `正在执行 ${activeTool.toolName}`
+    : run.status === "running" && hasStreamingAssistantText
+      ? "模型已响应，正在完成当前步骤"
+      : status.detail;
 
   return (
     <section
@@ -819,11 +1056,9 @@ function AgentRunStatus({
         <span>{elapsed}</span>
       </div>
       <div className="agent-run-status-detail">
+        <span>{activeDetail}</span>
         <span>
-          {activeTool ? `正在执行 ${activeTool.toolName}` : status.detail}
-        </span>
-        <span>
-          {run.usage.modelTurns}/{run.budget.maxModelTurns} turns · r
+          {displayedModelTurns}/{run.budget.maxModelTurns} turns · r
           {run.currentRevision}
         </span>
       </div>
@@ -879,7 +1114,15 @@ function AgentRunStatus({
           {stopping ? "正在停止..." : "停止"}
         </Button>
       ) : (
-        <p className="agent-run-error">{status.message}</p>
+        <>
+          <p className="agent-run-error">{status.message}</p>
+          {run.status === "succeeded" ? (
+            <Button onClick={onReviewChanges} size="sm" variant="outline">
+              <GitCompareArrows data-icon="inline-start" />
+              查看改动
+            </Button>
+          ) : null}
+        </>
       )}
     </section>
   );
@@ -1092,7 +1335,7 @@ function getRunStatusCopy(run: AgentRunRecord): {
     case "running":
       return {
         title: "执行中",
-        detail: "正在分析项目",
+        detail: "正在请求模型规划下一步",
         message: "Agent 正在读取项目并准备下一步操作。",
         tone: "neutral",
       };

@@ -2,6 +2,9 @@ import "server-only";
 
 import { neonConfig, Pool } from "@neondatabase/serverless";
 import { drizzle } from "drizzle-orm/neon-serverless";
+import type { NeonTransaction } from "drizzle-orm/neon-serverless";
+import type { PgTransactionConfig } from "drizzle-orm/pg-core/session";
+import type { ExtractTablesWithRelations } from "drizzle-orm/relations";
 import ws from "ws";
 
 import { databaseSchema } from "@/infrastructure/db/schema";
@@ -23,11 +26,7 @@ const globalDatabase = globalThis as typeof globalThis & {
   webpilotDatabasePool?: Pool;
 };
 
-/**
- * 开发模式复用 Pool，避免 Next.js 热更新反复创建 WebSocket 连接。
- * Vercel 生产实例也只会在当前函数实例生命周期内缓存，不承担跨实例状态。
- */
-export function getDatabase() {
+function getDatabasePool(): Pool {
   const pool =
     globalDatabase.webpilotDatabasePool ??
     new Pool({
@@ -39,7 +38,60 @@ export function getDatabase() {
     globalDatabase.webpilotDatabasePool = pool;
   }
 
-  return drizzle(pool, { schema: databaseSchema });
+  return pool;
+}
+
+/**
+ * 开发模式复用 Pool，避免 Next.js 热更新反复创建 WebSocket 连接。
+ * Vercel 生产实例也只会在当前函数实例生命周期内缓存，不承担跨实例状态。
+ */
+export function getDatabase() {
+  return drizzle(getDatabasePool(), { schema: databaseSchema });
 }
 
 export type AppDatabase = ReturnType<typeof getDatabase>;
+
+type RelationalSchema = ExtractTablesWithRelations<typeof databaseSchema>;
+export type AppDatabaseTransaction = NeonTransaction<
+  typeof databaseSchema,
+  RelationalSchema
+>;
+
+/**
+ * 在一条显式获取的 PoolClient 上执行数据库事务。
+ *
+ * Drizzle 的 Neon Pool 事务会通过 `client instanceof Pool` 判断是否需要
+ * `pool.connect()`。Next.js/Turbopack 开发热更新可能让全局缓存的 Pool 与当前
+ * bundle 中的 Pool 构造器来自不同模块实例，使该判断失效，BEGIN、业务查询和
+ * COMMIT 被 Pool 分配到不同连接。除了破坏原子性，还会让连接残留在事务中，
+ * 后续出现 25001、25006 或 checkpoint 外键不可见等看似无关的错误。
+ *
+ * 这里直接获取 PoolClient，保证事务的全部语句使用同一条连接。事务开始前先
+ * 执行一次 ROLLBACK，清理旧版本热更新可能遗留的事务；异常时再做一次兜底
+ * ROLLBACK，若连接已经无法复位，则销毁而不是放回连接池污染后续请求。
+ */
+export async function runDatabaseTransaction<T>(
+  operation: (transaction: AppDatabaseTransaction) => Promise<T>,
+  config?: PgTransactionConfig,
+): Promise<T> {
+  const client = await getDatabasePool().connect();
+  let destroyConnection = false;
+
+  try {
+    // PostgreSQL 在空闲连接上执行 ROLLBACK 只会返回 warning，不会中断请求。
+    // 这一步专门兼容修复前已经进入连接池的脏连接，后续新连接也可安全执行。
+    await client.query("rollback");
+    const database = drizzle(client, { schema: databaseSchema });
+    return await database.transaction(operation, config);
+  } catch (error) {
+    try {
+      await client.query("rollback");
+    } catch {
+      // 网络断开或协议状态损坏时不能继续复用该连接。
+      destroyConnection = true;
+    }
+    throw error;
+  } finally {
+    client.release(destroyConnection);
+  }
+}

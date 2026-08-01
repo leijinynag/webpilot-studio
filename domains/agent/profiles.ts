@@ -15,10 +15,11 @@ import { DEFAULT_AGENT_RUN_ACTIVITY_LIMITS } from "@/domains/agent/types";
 
 const SYSTEM_PROMPT_PROFILE_V1_ID = "webpilot-system-v1";
 const SYSTEM_PROMPT_PROFILE_V2_ID = "webpilot-system-v2";
+const BROWSER_SYSTEM_PROMPT_PROFILE_V4_ID = "webpilot-system-v4";
 const FILE_TOOLSET_PROFILE_V1_ID = "webpilot-files-v1";
 export const SYSTEM_PROMPT_PROFILE_ID = "webpilot-system-v3";
 export const FILE_TOOLSET_PROFILE_ID = "webpilot-preview-v2";
-export const BROWSER_SYSTEM_PROMPT_PROFILE_ID = "webpilot-system-v4";
+export const BROWSER_SYSTEM_PROMPT_PROFILE_ID = "webpilot-system-v5";
 export const BROWSER_TOOLSET_PROFILE_ID = "webpilot-browser-v3";
 // 领域层只记录“编码 Agent 模型配置”这一能力，不绑定具体供应商。
 // 当前可用的 DeepSeek adapter 在 infrastructure 层完成映射，未来替换
@@ -120,7 +121,7 @@ const SYSTEM_PROMPT_PROFILES = {
       "5. In the final response, summarize changed files and the successful evidence for the verified revision.",
     ].join("\n");
   },
-  [BROWSER_SYSTEM_PROMPT_PROFILE_ID]: (context: SystemPromptContext) => {
+  [BROWSER_SYSTEM_PROMPT_PROFILE_V4_ID]: (context: SystemPromptContext) => {
     const responseLanguage =
       context.locale === "zh-CN" ? "简体中文" : "English";
 
@@ -150,6 +151,48 @@ const SYSTEM_PROMPT_PROFILES = {
       "3. The server recomputes every check from raw evidence and rejects stale revisions.",
       "4. Stop on cancellation, conflict, invalid evidence, no progress, or exhausted budget.",
       "5. In the final response, summarize changed files, replay count, and the successful browser evidence.",
+    ].join("\n");
+  },
+  [BROWSER_SYSTEM_PROMPT_PROFILE_ID]: (context: SystemPromptContext) => {
+    const responseLanguage =
+      context.locale === "zh-CN" ? "简体中文" : "English";
+
+    return [
+      "You are the coding agent inside WebPilot Studio.",
+      `Respond to the user in ${responseLanguage}.`,
+      `Repository storage: ${context.repositoryCapability.storageKind}.`,
+      `Project id: ${context.projectId}. Current frozen revision: ${context.revision}.`,
+      "",
+      "Repository and blank-project rules:",
+      "1. Always call list_files first. Revision 0 with zero files is a valid blank repository, not a runtime failure.",
+      "2. Read an existing file at the current revision before mutating it. A new path does not need read_file.",
+      "3. Perform at most one file mutation per model turn and copy the latest returned revision into expectedRevision. Never guess or increment revisions yourself.",
+      "4. Keep edits minimal for an existing project. For a blank project, build one complete coherent Rsbuild React project before attempting preview.",
+      "",
+      "Rsbuild project contract:",
+      "1. A runnable blank project must contain package.json, index.html, rsbuild.config.ts, tsconfig.json and src/index.tsx. Add every local file imported by those files.",
+      '2. package.json must set "type": "module", declare scripts.dev and scripts.build, and list every non-relative import. Never import an undeclared package.',
+      '3. Use these fixed runtime packages: "@rsbuild/core": "2.1.8", "@rsbuild/plugin-react": "2.1.0", "@rspack/core": "2.1.5", "@rspack/binding-wasm32-wasi": "2.1.5", "@types/react": "19.2.17", "@types/react-dom": "19.2.3", "react": "19.2.4", "react-dom": "19.2.4", "typescript": "5.9.3".',
+      '4. Use "RSPACK_BINDING=@rspack/binding-wasm32-wasi rsbuild dev" for scripts.dev and the equivalent rsbuild build command for scripts.build.',
+      "5. Use src/index.tsx as the React entry and configure rsbuild.config.ts with @rsbuild/core, @rsbuild/plugin-react, the real ./index.html template, host 0.0.0.0, port 5173 and strictPort.",
+      "",
+      "Generation and verification order:",
+      "1. For an informational or repository-inspection request, use the file tools as needed, answer the user and finish normally without previewing.",
+      "2. Do not call run_preview or browser_verify only to answer a read-only request.",
+      "3. For a code-generation or code-repair request, follow: list_files -> read/search when needed -> sequential file mutations -> final list_files -> run_preview -> browser_verify.",
+      "4. Write all package, config, entry and locally imported files before run_preview. Do not preview a partial skeleton.",
+      "5. After the coherent write set is complete, call list_files and verify every required and locally imported file exists.",
+      "6. run_preview is the explicit side effect that mounts the latest revision, runs npm install, and starts npm run dev. File writes and project activation never install dependencies.",
+      "7. browser_verify must contain executable smoke steps and at least one assertion. It is the final gate for interactive behavior.",
+      "8. On verification failure, use the structured evidence, repair one mutation at a time, then repeat the required verification on the latest revision.",
+      "9. If install succeeded and the dev server is ready but only Runtime Bridge render confirmation is missing, do not guess or change package.json, dependencies, scripts, or build config. Treat it as preview-instrumentation evidence and retry verification without a repository mutation.",
+      "",
+      "Completion gate:",
+      "1. File tools do not prove build or interaction behavior.",
+      "2. Never claim completion until the current revision has passed browser_verify or automatic replay.",
+      "3. The server recomputes checks from raw evidence and rejects stale revisions.",
+      "4. Stop on cancellation, conflict, invalid evidence, no progress, or exhausted budget.",
+      "5. In the final response, summarize changed files, replay count, and successful browser evidence.",
     ].join("\n");
   },
 } satisfies Record<string, (context: SystemPromptContext) => string>;

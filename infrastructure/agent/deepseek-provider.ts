@@ -58,6 +58,9 @@ export type DeepSeekProviderOptions = {
   apiKey: string;
   baseUrl?: string;
   timeoutMs?: number;
+  firstEventTimeoutMs?: number;
+  streamInactivityTimeoutMs?: number;
+  finishTimeoutMs?: number;
   maxAttempts?: number;
   retryBaseDelayMs?: number;
   fetchImplementation?: FetchLike;
@@ -66,6 +69,9 @@ export type DeepSeekProviderOptions = {
 export class DeepSeekProvider implements LlmProvider {
   private readonly baseUrl: string;
   private readonly timeoutMs: number;
+  private readonly firstEventTimeoutMs: number;
+  private readonly streamInactivityTimeoutMs: number;
+  private readonly finishTimeoutMs: number;
   private readonly maxAttempts: number;
   private readonly retryBaseDelayMs: number;
   private readonly fetchImplementation: FetchLike;
@@ -76,6 +82,10 @@ export class DeepSeekProvider implements LlmProvider {
       "",
     );
     this.timeoutMs = options.timeoutMs ?? 120_000;
+    this.firstEventTimeoutMs = options.firstEventTimeoutMs ?? 15_000;
+    this.streamInactivityTimeoutMs =
+      options.streamInactivityTimeoutMs ?? 12_000;
+    this.finishTimeoutMs = options.finishTimeoutMs ?? 3_000;
     this.maxAttempts = Math.max(1, options.maxAttempts ?? 3);
     this.retryBaseDelayMs = Math.max(0, options.retryBaseDelayMs ?? 500);
     this.fetchImplementation = options.fetchImplementation ?? fetch;
@@ -118,6 +128,7 @@ export class DeepSeekProvider implements LlmProvider {
     const timeoutController = new AbortController();
     const timeout = setTimeout(() => timeoutController.abort(), this.timeoutMs);
     const signal = combineAbortSignals(input.signal, timeoutController.signal);
+    let sawFinish = false;
 
     try {
       const response = await this.fetchImplementation(
@@ -160,71 +171,106 @@ export class DeepSeekProvider implements LlmProvider {
       }
 
       let sawDone = false;
-      for await (const data of readSseData(response.body)) {
-        if (data === "[DONE]") {
-          sawDone = true;
-          break;
-        }
+      let sawProviderData = false;
+      try {
+        for await (const data of readSseData(response.body, {
+          getTimeout: () => {
+            if (sawFinish) {
+              return {
+                timeoutMs: this.finishTimeoutMs,
+                phase: "finish",
+              };
+            }
 
-        let parsedJson: unknown;
-        try {
-          parsedJson = JSON.parse(data);
-        } catch {
-          throw invalidStreamError("DeepSeek SSE 包含非法 JSON。");
-        }
+            if (sawProviderData) {
+              return {
+                timeoutMs: this.streamInactivityTimeoutMs,
+                phase: "stream",
+              };
+            }
 
-        const parsed = deepSeekChunkSchema.safeParse(parsedJson);
-        if (!parsed.success) {
-          throw invalidStreamError("DeepSeek SSE chunk 结构不合法。", {
-            issues: parsed.error.issues,
-          });
-        }
+            return {
+              timeoutMs: this.firstEventTimeoutMs,
+              phase: "first_event",
+            };
+          },
+        })) {
+          sawProviderData = true;
 
-        for (const choice of parsed.data.choices) {
-          if (choice.index !== 0) {
-            continue;
+          if (data === "[DONE]") {
+            sawDone = true;
+            break;
           }
 
-          if (choice.delta.content) {
-            yield { type: "text_delta", text: choice.delta.content };
+          let parsedJson: unknown;
+          try {
+            parsedJson = JSON.parse(data);
+          } catch {
+            throw invalidStreamError("DeepSeek SSE 包含非法 JSON。");
           }
 
-          for (const toolCall of choice.delta.tool_calls ?? []) {
+          const parsed = deepSeekChunkSchema.safeParse(parsedJson);
+          if (!parsed.success) {
+            throw invalidStreamError("DeepSeek SSE chunk 结构不合法。", {
+              issues: parsed.error.issues,
+            });
+          }
+
+          for (const choice of parsed.data.choices) {
+            if (choice.index !== 0) {
+              continue;
+            }
+
+            if (choice.delta.content) {
+              yield { type: "text_delta", text: choice.delta.content };
+            }
+
+            for (const toolCall of choice.delta.tool_calls ?? []) {
+              yield {
+                type: "tool_call_delta",
+                index: toolCall.index,
+                ...(toolCall.id ? { toolCallId: toolCall.id } : {}),
+                ...(toolCall.function?.name
+                  ? { toolName: toolCall.function.name }
+                  : {}),
+                ...(toolCall.function?.arguments
+                  ? { argumentsDelta: toolCall.function.arguments }
+                  : {}),
+              };
+            }
+
+            if (choice.finish_reason) {
+              sawFinish = true;
+              yield {
+                type: "finish",
+                reason: mapFinishReason(choice.finish_reason),
+              };
+            }
+          }
+
+          if (parsed.data.usage) {
             yield {
-              type: "tool_call_delta",
-              index: toolCall.index,
-              ...(toolCall.id ? { toolCallId: toolCall.id } : {}),
-              ...(toolCall.function?.name
-                ? { toolName: toolCall.function.name }
-                : {}),
-              ...(toolCall.function?.arguments
-                ? { argumentsDelta: toolCall.function.arguments }
-                : {}),
+              type: "usage",
+              inputTokens: parsed.data.usage.prompt_tokens,
+              outputTokens: parsed.data.usage.completion_tokens,
+              totalTokens: parsed.data.usage.total_tokens,
             };
           }
-
-          if (choice.finish_reason) {
-            yield {
-              type: "finish",
-              reason: mapFinishReason(choice.finish_reason),
-            };
-          }
+        }
+      } catch (error) {
+        if (!sawFinish || !isFinishTailTimeout(error)) {
+          throw error;
         }
 
-        if (parsed.data.usage) {
-          yield {
-            type: "usage",
-            inputTokens: parsed.data.usage.prompt_tokens,
-            outputTokens: parsed.data.usage.completion_tokens,
-            totalTokens: parsed.data.usage.total_tokens,
-          };
-        }
+        // DeepSeek 的 OpenAI 兼容流偶尔在 finish_reason 与 usage 后既不发送
+        // [DONE]，也不主动关闭连接。finish_reason 已经封闭当前 choice，短暂
+        // 等待尾帧超时后可以安全结束；工具参数完整性仍由领域层严格校验。
       }
 
-      if (!sawDone) {
+      if (!sawDone && !sawFinish) {
         throw new AgentError(
           AGENT_ERROR_CODES.providerInterrupted,
-          "DeepSeek 流在 [DONE] 之前结束。",
+          "DeepSeek 流在 finish_reason 或 [DONE] 之前结束。",
           502,
         );
       }
@@ -261,10 +307,19 @@ export class DeepSeekProvider implements LlmProvider {
   }
 }
 
+function isFinishTailTimeout(error: unknown): boolean {
+  return (
+    error instanceof AgentError &&
+    error.code === AGENT_ERROR_CODES.providerTimeout &&
+    error.details?.phase === "finish"
+  );
+}
+
 function isRetryablePreStreamError(error: unknown): boolean {
   return (
     error instanceof AgentError &&
-    error.code === AGENT_ERROR_CODES.providerInterrupted
+    (error.code === AGENT_ERROR_CODES.providerInterrupted ||
+      error.code === AGENT_ERROR_CODES.providerTimeout)
   );
 }
 
@@ -333,20 +388,51 @@ function toDeepSeekMessage(message: ProviderMessage) {
 
 async function* readSseData(
   stream: ReadableStream<Uint8Array>,
+  options: {
+    getTimeout: () => {
+      timeoutMs: number;
+      phase: "first_event" | "stream" | "finish";
+    };
+  },
 ): AsyncGenerator<string> {
   const reader = stream.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
 
-  while (true) {
-    const { done, value } = await reader.read();
-    buffer += decoder.decode(value, { stream: !done }).replace(/\r\n/g, "\n");
+  try {
+    while (true) {
+      const { timeoutMs, phase } = options.getTimeout();
+      const { done, value } = await readStreamChunkWithTimeout(
+        reader,
+        timeoutMs,
+        phase,
+      );
+      buffer += decoder.decode(value, { stream: !done }).replace(/\r\n/g, "\n");
 
-    let boundary = buffer.indexOf("\n\n");
-    while (boundary >= 0) {
-      const block = buffer.slice(0, boundary);
-      buffer = buffer.slice(boundary + 2);
-      const data = block
+      let boundary = buffer.indexOf("\n\n");
+      while (boundary >= 0) {
+        const block = buffer.slice(0, boundary);
+        buffer = buffer.slice(boundary + 2);
+        const data = block
+          .split("\n")
+          .filter((line) => line.startsWith("data:"))
+          .map((line) => line.slice(5).trimStart())
+          .join("\n");
+
+        if (data) {
+          yield data;
+        }
+
+        boundary = buffer.indexOf("\n\n");
+      }
+
+      if (done) {
+        break;
+      }
+    }
+
+    if (buffer.trim()) {
+      const data = buffer
         .split("\n")
         .filter((line) => line.startsWith("data:"))
         .map((line) => line.slice(5).trimStart())
@@ -355,25 +441,56 @@ async function* readSseData(
       if (data) {
         yield data;
       }
-
-      boundary = buffer.indexOf("\n\n");
     }
+  } finally {
+    reader.releaseLock();
+  }
+}
 
-    if (done) {
-      break;
+async function readStreamChunkWithTimeout(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  timeoutMs: number,
+  phase: "first_event" | "stream" | "finish",
+): Promise<ReadableStreamReadResult<Uint8Array>> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+
+  try {
+    return await Promise.race([
+      reader.read(),
+      new Promise<never>((_resolve, reject) => {
+        timeout = setTimeout(() => {
+          const timeoutError = new AgentError(
+            AGENT_ERROR_CODES.providerTimeout,
+            getStreamTimeoutMessage(phase),
+            504,
+            { phase, timeoutMs },
+          );
+
+          // 必须先让超时 Promise 进入 rejected 状态，再取消底层 reader。
+          // 若先 cancel，未完成的 reader.read() 可能先以 done=true 结束，
+          // 上层就会把真正的“静默超时”误判为普通 EOF 中断。
+          reject(timeoutError);
+          void reader.cancel("DeepSeek stream inactivity timeout");
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeout) {
+      clearTimeout(timeout);
     }
   }
+}
 
-  if (buffer.trim()) {
-    const data = buffer
-      .split("\n")
-      .filter((line) => line.startsWith("data:"))
-      .map((line) => line.slice(5).trimStart())
-      .join("\n");
-
-    if (data) {
-      yield data;
-    }
+function getStreamTimeoutMessage(
+  phase: "first_event" | "stream" | "finish",
+): string {
+  switch (phase) {
+    case "first_event":
+      return "DeepSeek 长时间未返回首个流事件。";
+    case "stream":
+      return "DeepSeek 流已开始，但长时间没有返回新数据。";
+    case "finish":
+      return "DeepSeek 已声明当前轮次结束，但未及时关闭响应流。";
   }
 }
 

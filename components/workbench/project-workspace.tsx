@@ -228,6 +228,14 @@ export function ProjectWorkspace({
     }
   }
 
+  async function handleRestoreComplete(nextRevision: number) {
+    setAgentRevision(nextRevision);
+
+    // Restore 与普通 Agent mutation 一样只改变 Repository 事实。
+    // reconcile 会更新服务端基线，同时继续保留 Monaco 中尚未保存的 draft。
+    await refreshRepositorySnapshot();
+  }
+
   const handleClientToolRequest = useCallback(
     (request: ClientToolRequest) => {
       if (request.projectId !== project.id) {
@@ -275,9 +283,17 @@ export function ProjectWorkspace({
           throw new Error(body.error?.message ?? "Preview 证据提交失败。");
         }
 
-        setClientToolRequest((current) =>
-          current?.toolCallId === request.toolCallId ? null : current,
-        );
+        const disposition = body.disposition ?? "ignored";
+
+        // ignored 表示服务端尚未接纳这份结果，客户端请求仍然有效。此时若先清空，
+        // 普通 Repository 预览会立即移除 Runtime Bridge，Agent 快照又会重建
+        // 同一请求，两个运行镜像便会在同一 revision 上来回覆盖。
+        if (disposition !== "ignored") {
+          setClientToolRequest((current) =>
+            current?.toolCallId === request.toolCallId ? null : current,
+          );
+        }
+        return disposition;
       } catch (error) {
         const message =
           error instanceof Error
@@ -489,8 +505,10 @@ export function ProjectWorkspace({
 
       <div className="workbench-grid">
         <AgentPanel
+          dirtyPaths={dirtyPaths}
           onClientToolRequest={handleClientToolRequest}
           onRevisionChange={handleAgentRevisionChange}
+          onRestoreComplete={handleRestoreComplete}
           projectId={project.id}
           revision={agentRevision}
         />

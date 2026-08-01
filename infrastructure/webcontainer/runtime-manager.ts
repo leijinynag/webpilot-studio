@@ -130,6 +130,7 @@ export class WebContainerRuntimeManager {
   // 普通 Repository 刷新与 Agent 运行镜像可能在同一 revision 上同时到达。
   // 文件系统写入必须串行，否则两次 diff 会基于同一旧快照计算并交错覆盖 index.html。
   private syncTail: Promise<void> = Promise.resolve();
+  private installProcess: WebContainerProcessAdapter | null = null;
   private devProcess: WebContainerProcessAdapter | null = null;
   // ready 状态只对当前项目有效；切换项目必须销毁旧容器，避免 mount 合并出跨项目残留文件。
   private activeProjectKey: string | null = null;
@@ -162,6 +163,29 @@ export class WebContainerRuntimeManager {
       this.listeners.delete(listener);
     };
   };
+
+  /**
+   * Preview 首次进入只选择项目上下文，不启动 WebContainer。若标签页此前运行过
+   * 另一个项目，则释放旧容器，避免新项目短暂显示旧 iframe 或继续消费旧进程。
+   */
+  activateProject(projectKey: string): void {
+    if (
+      this.activeProjectKey !== null &&
+      this.activeProjectKey !== projectKey
+    ) {
+      this.teardown();
+    }
+  }
+
+  /**
+   * 组件切换 Code/Preview 时可能卸载后重建。通过 Manager 中的项目身份恢复
+   * “该项目已经显式启动”这一事实，而不是因 React 本地 state 丢失而重复安装。
+   */
+  isActiveProject(projectKey: string): boolean {
+    return (
+      this.activeProjectKey === projectKey && this.snapshot.phase !== "idle"
+    );
+  }
 
   start(
     tree: FileSystemTree = WEBPILOT_RSBUILD_TEMPLATE,
@@ -340,6 +364,8 @@ export class WebContainerRuntimeManager {
    */
   teardown(): void {
     this.generation += 1;
+    this.installProcess?.kill();
+    this.installProcess = null;
     this.devProcess?.kill();
     this.devProcess = null;
     this.instance?.teardown();
@@ -382,6 +408,8 @@ export class WebContainerRuntimeManager {
     }
 
     // 重试时保留已 boot 的容器，但旧 dev process 必须停止，避免端口冲突和重复输出。
+    this.installProcess?.kill();
+    this.installProcess = null;
     this.devProcess?.kill();
     this.devProcess = null;
     this.setSnapshot({
@@ -414,6 +442,13 @@ export class WebContainerRuntimeManager {
         "--no-audit",
         "--force",
       ]);
+      // teardown 可能恰好发生在 spawn Promise 已完成、当前 continuation 尚未恢复
+      // 的窗口。此时进程还未登记到字段，必须在恢复后主动终止这份迟到资源。
+      if (generation !== this.generation) {
+        installProcess.kill();
+        this.assertGeneration(generation);
+      }
+      this.installProcess = installProcess;
       // stdout 在部分 WebContainer/npm 组合里会比进程退出更晚关闭。
       // 输出持续后台消费，安装阶段的完成事实以 exit code 为准，避免界面永久卡在 installing。
       const installOutput = this.consumeProcessOutput(
@@ -433,6 +468,10 @@ export class WebContainerRuntimeManager {
             },
           ),
       );
+      // exit 已经 settle 后清除引用。后续 teardown 不必再操作已结束的安装进程。
+      if (this.installProcess === installProcess) {
+        this.installProcess = null;
+      }
       // 给已结束进程的剩余输出一个很短的排空窗口；超时后继续启动，
       // 后台消费者仍会在流真正关闭时自行结束。
       await Promise.race([installOutput, delayMilliseconds(500)]);
@@ -468,6 +507,11 @@ export class WebContainerRuntimeManager {
       if (generation !== this.generation) {
         throw error;
       }
+
+      // WebContainer 的 exit Promise 在网络阻塞时可能永远不结束。超时或任一
+      // 启动阶段失败都必须主动终止安装进程，否则重试会与旧 npm 进程竞争资源。
+      this.installProcess?.kill();
+      this.installProcess = null;
 
       // 主动创建的运行时错误已经携带稳定诊断，不能再被阶段映射覆盖。
       if (error instanceof WebContainerRuntimeError) {
@@ -586,35 +630,69 @@ export class WebContainerRuntimeManager {
     void this.consumeProcessOutput(process, "dev", generation);
 
     // exit 同时覆盖两种情况：就绪前退出应拒绝 start；就绪后退出则把已展示的预览标记为失效。
-    void process.exit.then((exitCode) => {
-      if (generation !== this.generation) {
-        return;
-      }
-
-      if (!serverSettled) {
-        serverSettled = true;
-        unsubscribe();
-        if (timeout !== undefined) {
-          window.clearTimeout(timeout);
+    void process.exit.then(
+      (exitCode) => {
+        if (generation !== this.generation) {
+          return;
         }
-        rejectReady(
-          new WebContainerRuntimeError(
-            "dev_server_failed",
-            `开发服务器在就绪前退出，退出码 ${exitCode}。`,
-          ),
-        );
-        return;
-      }
 
-      if (this.snapshot.phase === "ready") {
-        this.fail(
-          new WebContainerRuntimeError(
-            "dev_server_failed",
-            `开发服务器已停止，退出码 ${exitCode}。`,
-          ),
+        if (!serverSettled) {
+          serverSettled = true;
+          unsubscribe();
+          if (timeout !== undefined) {
+            window.clearTimeout(timeout);
+          }
+          rejectReady(
+            new WebContainerRuntimeError(
+              "dev_server_failed",
+              `开发服务器在就绪前退出，退出码 ${exitCode}。`,
+            ),
+          );
+          return;
+        }
+
+        if (this.snapshot.phase === "ready") {
+          this.fail(
+            new WebContainerRuntimeError(
+              "dev_server_failed",
+              `开发服务器已停止，退出码 ${exitCode}。`,
+            ),
+          );
+        }
+      },
+      (error: unknown) => {
+        // teardown/项目切换会先递增 generation 再 kill 进程。WebContainer 此时
+        // 以 rejected "Process aborted" 表示预期取消，观察并吞掉即可，不能污染宿主控制台。
+        if (generation !== this.generation) {
+          return;
+        }
+
+        const runtimeError = new WebContainerRuntimeError(
+          "dev_server_failed",
+          serverSettled
+            ? "开发服务器进程异常中止。"
+            : "开发服务器在就绪前异常中止。",
+          {
+            cause: error,
+            detail: getErrorDetail(error),
+          },
         );
-      }
-    });
+
+        if (!serverSettled) {
+          serverSettled = true;
+          unsubscribe();
+          if (timeout !== undefined) {
+            window.clearTimeout(timeout);
+          }
+          rejectReady(runtimeError);
+          return;
+        }
+
+        if (this.snapshot.phase === "ready") {
+          this.fail(runtimeError);
+        }
+      },
+    );
 
     return serverReady;
   }

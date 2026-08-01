@@ -3,6 +3,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import { AGENT_ERROR_CODES } from "@/domains/agent/errors";
+import type { ProviderEvent } from "@/domains/agent/provider";
 import { DeepSeekProvider } from "@/infrastructure/agent/deepseek-provider";
 
 function streamResponse(chunks: string[], status = 200): Response {
@@ -20,6 +21,20 @@ function streamResponse(chunks: string[], status = 200): Response {
   );
 }
 
+function stalledStreamResponse(initialChunk?: string): Response {
+  const encoder = new TextEncoder();
+  return new Response(
+    new ReadableStream({
+      start(controller) {
+        if (initialChunk) {
+          controller.enqueue(encoder.encode(initialChunk));
+        }
+      },
+    }),
+    { status: 200, headers: { "Content-Type": "text/event-stream" } },
+  );
+}
+
 describe("DeepSeekProvider", () => {
   it("parses chunked SSE text, tool calls, usage and keep-alives", async () => {
     const fetchImplementation = vi.fn(async () =>
@@ -34,7 +49,7 @@ describe("DeepSeekProvider", () => {
       apiKey: "test-key",
       fetchImplementation,
     });
-    const events = [];
+    const events: ProviderEvent[] = [];
 
     for await (const event of provider.streamTurn({
       model: "deepseek-v4-pro",
@@ -144,7 +159,7 @@ describe("DeepSeekProvider", () => {
     expect(fetchImplementation).toHaveBeenCalledOnce();
   });
 
-  it("rejects a stream that ends without [DONE]", async () => {
+  it("rejects a stream that ends without finish_reason or [DONE]", async () => {
     const fetchImplementation = vi.fn(async () =>
       streamResponse([
         'data: {"choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":null}]}\n\n',
@@ -171,6 +186,44 @@ describe("DeepSeekProvider", () => {
     expect(fetchImplementation).toHaveBeenCalledOnce();
   });
 
+  it("accepts a completed DeepSeek choice when the stream closes without [DONE]", async () => {
+    const provider = new DeepSeekProvider({
+      apiKey: "test-key",
+      fetchImplementation: vi.fn(async () =>
+        streamResponse([
+          'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call-1","type":"function","function":{"name":"list_files","arguments":"{}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":20,"completion_tokens":8,"total_tokens":28}}\n\n',
+        ]),
+      ),
+    });
+    const events: ProviderEvent[] = [];
+
+    for await (const event of provider.streamTurn({
+      model: "deepseek-v4-pro",
+      messages: [{ role: "user", content: "hello" }],
+      tools: [],
+      maxOutputTokens: 128,
+    })) {
+      events.push(event);
+    }
+
+    expect(events).toEqual([
+      {
+        type: "tool_call_delta",
+        index: 0,
+        toolCallId: "call-1",
+        toolName: "list_files",
+        argumentsDelta: "{}",
+      },
+      { type: "finish", reason: "tool_calls" },
+      {
+        type: "usage",
+        inputTokens: 20,
+        outputTokens: 8,
+        totalTokens: 28,
+      },
+    ]);
+  });
+
   it("retries a transient connection failure before the first provider event", async () => {
     const fetchImplementation = vi
       .fn<typeof fetch>()
@@ -186,7 +239,7 @@ describe("DeepSeekProvider", () => {
       fetchImplementation,
       retryBaseDelayMs: 0,
     });
-    const events = [];
+    const events: ProviderEvent[] = [];
 
     for await (const event of provider.streamTurn({
       model: "deepseek-v4-pro",
@@ -226,5 +279,93 @@ describe("DeepSeekProvider", () => {
       code: AGENT_ERROR_CODES.providerInterrupted,
     });
     expect(fetchImplementation).toHaveBeenCalledOnce();
+  });
+
+  it("fails quickly when a started stream stops producing data", async () => {
+    const fetchImplementation = vi.fn(async () =>
+      stalledStreamResponse(
+        'data: {"choices":[{"index":0,"delta":{"content":"我先查看项目"},"finish_reason":null}]}\n\n',
+      ),
+    );
+    const provider = new DeepSeekProvider({
+      apiKey: "test-key",
+      fetchImplementation,
+      streamInactivityTimeoutMs: 10,
+      maxAttempts: 3,
+    });
+    const events: ProviderEvent[] = [];
+
+    await expect(async () => {
+      for await (const event of provider.streamTurn({
+        model: "deepseek-v4-pro",
+        messages: [{ role: "user", content: "hello" }],
+        tools: [],
+        maxOutputTokens: 128,
+      })) {
+        events.push(event);
+      }
+    }).rejects.toMatchObject({
+      code: AGENT_ERROR_CODES.providerTimeout,
+      details: { phase: "stream", timeoutMs: 10 },
+    });
+    expect(events).toEqual([{ type: "text_delta", text: "我先查看项目" }]);
+    expect(fetchImplementation).toHaveBeenCalledOnce();
+  });
+
+  it("retries a first-event timeout before exposing provider output", async () => {
+    const fetchImplementation = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(stalledStreamResponse())
+      .mockResolvedValueOnce(
+        streamResponse([
+          'data: {"choices":[{"index":0,"delta":{"content":"完成"},"finish_reason":"stop"}]}\n\n',
+          "data: [DONE]\n\n",
+        ]),
+      );
+    const provider = new DeepSeekProvider({
+      apiKey: "test-key",
+      fetchImplementation,
+      firstEventTimeoutMs: 10,
+      retryBaseDelayMs: 0,
+      maxAttempts: 2,
+    });
+    const events: ProviderEvent[] = [];
+
+    for await (const event of provider.streamTurn({
+      model: "deepseek-v4-pro",
+      messages: [{ role: "user", content: "hello" }],
+      tools: [],
+      maxOutputTokens: 128,
+    })) {
+      events.push(event);
+    }
+
+    expect(fetchImplementation).toHaveBeenCalledTimes(2);
+    expect(events).toContainEqual({ type: "text_delta", text: "完成" });
+  });
+
+  it("accepts finish_reason after a short wait when the response never closes", async () => {
+    const provider = new DeepSeekProvider({
+      apiKey: "test-key",
+      fetchImplementation: vi.fn(async () =>
+        stalledStreamResponse(
+          'data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}\n\n',
+        ),
+      ),
+      finishTimeoutMs: 10,
+      maxAttempts: 1,
+    });
+    const events: ProviderEvent[] = [];
+
+    for await (const event of provider.streamTurn({
+      model: "deepseek-v4-pro",
+      messages: [{ role: "user", content: "hello" }],
+      tools: [],
+      maxOutputTokens: 128,
+    })) {
+      events.push(event);
+    }
+
+    expect(events).toEqual([{ type: "finish", reason: "tool_calls" }]);
   });
 });

@@ -38,7 +38,7 @@ export class FakeWebContainer implements WebContainerAdapter {
   mountedTree: FileSystemTree | null = null;
   installExitCode = 0;
   // dev server 在正常运行时不会退出。默认永不 settle，避免 ready 后立刻被标记为 failed。
-  devExit = new Promise<number>(() => undefined);
+  devExit: Promise<number> = new Promise<number>(() => undefined);
   previewUrl = "https://5173-webpilot.local";
   private serverReadyListener: ((port: number, url: string) => void) | null =
     null;

@@ -4,6 +4,7 @@ import {
   AGENT_ERROR_CODES,
   AgentError,
   isAgentError,
+  serializeAgentError,
 } from "@/domains/agent/errors";
 import {
   BROWSER_VERIFY_TOOL_NAME,
@@ -32,6 +33,10 @@ import type {
   TranscriptMessage,
 } from "@/domains/agent/types";
 import {
+  getActiveExecutionDurationMs,
+  resumeAgentExecution,
+} from "@/domains/agent/types";
+import {
   buildAgentVerificationDirective,
   getAgentVerificationState,
 } from "@/domains/agent/verification";
@@ -41,15 +46,18 @@ type AgentStorePort = Pick<
   | "appendEvent"
   | "appendTranscript"
   | "claimExecution"
-  | "createVerificationRun"
+  | "completeSuccessfulRun"
   | "findReplayableSmokePlan"
   | "getLatestVerificationRun"
+  | "hasPendingClientToolWait"
   | "registerToolInvocation"
   | "markToolInvocationRunning"
   | "getRun"
   | "listTranscript"
+  | "recoverPendingClientToolWait"
   | "releaseExecutionLease"
   | "renewExecutionLease"
+  | "suspendForClientTool"
   | "transitionRun"
   | "updateRunProgress"
 >;
@@ -62,6 +70,9 @@ type AccumulatedToolCall = {
   name: string;
   argumentsText: string;
 };
+
+const EXECUTION_LEASE_RENEW_INTERVAL_MS = 45_000;
+const MAX_PARTIAL_PROVIDER_STREAM_RETRIES = 2;
 
 export class AgentOrchestrator {
   constructor(
@@ -110,7 +121,31 @@ export class AgentOrchestrator {
           runId: run.id,
           status: "running",
         });
-      } else if (run.status !== "running") {
+      } else if (run.status === "running") {
+        // Provider 的 tool_call 必须与 tool_result 成对。若历史竞态留下
+        // running + pending client Ledger，继续请求模型只会得到供应商 400；
+        // 先恢复等待态，让客户端从 Conversation 快照重建并提交真实结果。
+        const recoveredClientToolWait =
+          await this.store.recoverPendingClientToolWait({
+            ownerId: run.ownerId,
+            runId: run.id,
+            leaseId,
+          });
+
+        if (recoveredClientToolWait) {
+          return;
+        }
+
+        // 历史 Run 可能早于 active execution 计时字段存在。恢复时从当前时刻
+        // 开启新的服务端执行片段，绝不回退到 startedAt 计算整段自然时间。
+        if (!run.usage.activeExecutionStartedAt) {
+          run = await this.store.updateRunProgress({
+            ownerId: run.ownerId,
+            runId: run.id,
+            usage: resumeAgentExecution(run.usage, new Date()),
+          });
+        }
+      } else {
         // 等待浏览器工具时由 SSE/Conversation 快照恢复请求，服务端 Loop 不应
         // 抢跑或把一个健康的 awaiting 状态误判成失败。
         if (run.status === "awaiting_client_tool") {
@@ -124,10 +159,10 @@ export class AgentOrchestrator {
         );
       }
 
-      const startedAt = run.startedAt?.getTime() ?? Date.now();
+      let partialProviderStreamRetries = 0;
 
-      while (run.usage.modelTurns < run.budget.maxModelTurns) {
-        assertWithinWallTime(run, startedAt);
+      modelLoop: while (run.usage.modelTurns < run.budget.maxModelTurns) {
+        assertWithinWallTime(run);
         await this.assertNotCancelled(run, input.signal);
         await this.store.renewExecutionLease({
           ownerId: run.ownerId,
@@ -166,6 +201,7 @@ export class AgentOrchestrator {
             }),
           ].join("\n\n"),
           tools: profiles.toolset.tools,
+          leaseId,
           signal: input.signal,
         });
         const nextUsage = {
@@ -179,6 +215,49 @@ export class AgentOrchestrator {
           runId: run.id,
           usage: nextUsage,
         });
+
+        if (turn.interruption) {
+          if (
+            partialProviderStreamRetries >= MAX_PARTIAL_PROVIDER_STREAM_RETRIES
+          ) {
+            throw turn.interruption;
+          }
+
+          partialProviderStreamRetries += 1;
+          await this.store.appendEvent({
+            runId: run.id,
+            type: "model.turn_retried",
+            payload: {
+              reason: "provider_stream_interrupted",
+              errorCode: turn.interruption.code,
+              discardedCharacterCount: turn.assistantText.length,
+              discardedToolCallCount: turn.toolCalls.length,
+              retryAttempt: partialProviderStreamRetries,
+              maxRetryAttempts: MAX_PARTIAL_PROVIDER_STREAM_RETRIES,
+              consumedModelTurns: run.usage.modelTurns,
+            },
+          });
+          continue;
+        }
+
+        partialProviderStreamRetries = 0;
+
+        // DeepSeek 偶发只返回 finish_reason=tool_calls，却没有发送任何
+        // tool_call_delta。这类响应没有可执行副作用，也没有形成可持久化的
+        // Assistant 消息，因此安全地按同一 Transcript 重试；模型轮次照常
+        // 计入冻结预算，避免供应商持续缺帧时形成无限循环。
+        if (isRetryableEmptyToolCallTurn(turn)) {
+          await this.store.appendEvent({
+            runId: run.id,
+            type: "model.turn_retried",
+            payload: {
+              reason: "empty_tool_calls",
+              discardedCharacterCount: turn.assistantText.length,
+              consumedModelTurns: run.usage.modelTurns,
+            },
+          });
+          continue;
+        }
 
         assertCompleteModelTurn(turn);
 
@@ -233,6 +312,14 @@ export class AgentOrchestrator {
             }),
           });
 
+          // 只读请求不需要启动 WebContainer，也不应该被运行时验证门禁
+          // 反复拦截。只有发生过文件 mutation，或模型主动发起过验证，
+          // 才把验证结果作为本次 Run 的完成条件。
+          if (run.usage.fileMutations === 0 && !verification.attempted) {
+            await this.finishRun(run, "succeeded");
+            return;
+          }
+
           if (verification.ok) {
             await this.finishRun(run, "succeeded");
             return;
@@ -286,17 +373,24 @@ export class AgentOrchestrator {
           });
 
           if (toolCall.name === RUN_PREVIEW_TOOL_NAME) {
-            await this.suspendForRunPreview({
+            const suspended = await this.suspendForRunPreview({
               run,
               toolCall,
               argumentsJson,
               leaseId,
             });
-            return;
+
+            if (suspended) {
+              return;
+            }
+
+            // 参数错误已经作为 tool_result 回喂模型。立即进入下一模型轮次，
+            // 不继续执行同一批次中可能依赖非法调用的其他 Tool Call。
+            continue modelLoop;
           }
 
           if (toolCall.name === BROWSER_VERIFY_TOOL_NAME) {
-            await this.suspendForBrowserVerify({
+            const suspended = await this.suspendForBrowserVerify({
               run,
               toolCall,
               argumentsJson,
@@ -304,7 +398,12 @@ export class AgentOrchestrator {
               source: "agent",
               replayCount: 0,
             });
-            return;
+
+            if (suspended) {
+              return;
+            }
+
+            continue modelLoop;
           }
 
           if (isFileMutationTool(toolCall.name)) {
@@ -430,7 +529,7 @@ export class AgentOrchestrator {
         "Agent 已达到最大模型轮次。",
       );
     } catch (error) {
-      await this.handleTerminalError(input, error);
+      await this.handleTerminalError(input, error, leaseId);
     } finally {
       await this.store.releaseExecutionLease({
         ownerId: input.ownerId,
@@ -449,6 +548,7 @@ export class AgentOrchestrator {
       description: string;
       parameters: Record<string, unknown>;
     }[];
+    leaseId: string;
     signal?: AbortSignal;
   }) {
     let assistantText = "";
@@ -456,58 +556,112 @@ export class AgentOrchestrator {
     let outputTokens = 0;
     let finishReason: ProviderFinishReason | null = null;
     const toolCalls = new Map<number, AccumulatedToolCall>();
-
-    for await (const event of this.provider.streamTurn({
-      model: input.run.model,
-      messages: assembleProviderMessages(input.transcript, {
-        systemPrompt: input.systemPrompt,
-        maxMessageCharacters: input.run.budget.maxToolResultCharacters,
-      }),
-      tools: input.tools,
-      maxOutputTokens: Math.max(
-        256,
-        Math.ceil(input.run.budget.maxOutputCharacters / 4),
-      ),
-      userId: input.run.ownerId,
-      signal: input.signal,
-    })) {
-      switch (event.type) {
-        case "text_delta":
-          assistantText += event.text;
-          if (assistantText.length > input.run.budget.maxOutputCharacters) {
-            throw new AgentError(
-              AGENT_ERROR_CODES.budgetExhausted,
-              "模型输出超过字符预算。",
-              409,
-            );
-          }
-          await this.store.appendEvent({
-            runId: input.run.id,
-            type: "assistant.delta",
-            payload: { text: event.text },
-          });
-          break;
-        case "tool_call_delta":
-          accumulateToolCall(toolCalls, event);
-          break;
-        case "usage":
-          inputTokens = event.inputTokens;
-          outputTokens = event.outputTokens;
-          await this.store.appendEvent({
-            runId: input.run.id,
-            type: "model.usage",
-            payload: event,
-          });
-          break;
-        case "finish":
-          finishReason = event.reason;
-          await this.store.appendEvent({
-            runId: input.run.id,
-            type: "model.finished",
-            payload: { reason: event.reason },
-          });
-          break;
+    let heartbeatError: unknown = null;
+    let heartbeatInFlight: Promise<void> | null = null;
+    let interruption: AgentError | null = null;
+    const renewLease = () => {
+      if (heartbeatError || heartbeatInFlight) {
+        return;
       }
+
+      heartbeatInFlight = this.store
+        .renewExecutionLease({
+          ownerId: input.run.ownerId,
+          runId: input.run.id,
+          leaseId: input.leaseId,
+        })
+        .catch((error: unknown) => {
+          heartbeatError = error;
+        })
+        .finally(() => {
+          heartbeatInFlight = null;
+        });
+    };
+    const heartbeat = setInterval(
+      renewLease,
+      EXECUTION_LEASE_RENEW_INTERVAL_MS,
+    );
+
+    try {
+      try {
+        for await (const event of this.provider.streamTurn({
+          model: input.run.model,
+          messages: assembleProviderMessages(input.transcript, {
+            systemPrompt: input.systemPrompt,
+            maxMessageCharacters: input.run.budget.maxToolResultCharacters,
+          }),
+          tools: input.tools,
+          maxOutputTokens: Math.max(
+            256,
+            Math.ceil(input.run.budget.maxOutputCharacters / 4),
+          ),
+          userId: input.run.ownerId,
+          signal: input.signal,
+        })) {
+          if (heartbeatError) {
+            throw heartbeatError;
+          }
+
+          switch (event.type) {
+            case "text_delta":
+              assistantText += event.text;
+              if (assistantText.length > input.run.budget.maxOutputCharacters) {
+                throw new AgentError(
+                  AGENT_ERROR_CODES.budgetExhausted,
+                  "模型输出超过字符预算。",
+                  409,
+                );
+              }
+              await this.store.appendEvent({
+                runId: input.run.id,
+                type: "assistant.delta",
+                payload: { text: event.text },
+              });
+              break;
+            case "tool_call_delta":
+              accumulateToolCall(toolCalls, event);
+              break;
+            case "usage":
+              inputTokens = event.inputTokens;
+              outputTokens = event.outputTokens;
+              await this.store.appendEvent({
+                runId: input.run.id,
+                type: "model.usage",
+                payload: event,
+              });
+              break;
+            case "finish":
+              finishReason = event.reason;
+              await this.store.appendEvent({
+                runId: input.run.id,
+                type: "model.finished",
+                payload: { reason: event.reason },
+              });
+              break;
+          }
+        }
+      } catch (error) {
+        // Provider 层只会在尚未产生任何事件时自行重试。若流已经输出了部分
+        // 文本或 Tool Call 后中断，这一轮尚未执行任何工具副作用，可以由领域
+        // 状态机丢弃临时输出并按冻结预算重试，避免用户等待到 120 秒总超时。
+        if (
+          isRetryablePartialProviderStream(error) &&
+          (assistantText.length > 0 || toolCalls.size > 0)
+        ) {
+          interruption = error;
+        } else {
+          throw error;
+        }
+      }
+    } finally {
+      clearInterval(heartbeat);
+      await heartbeatInFlight;
+    }
+
+    if (heartbeatError) {
+      // SSE 可能在一段静默推理后才返回下一条 chunk，因此租约续期必须独立于
+      // chunk 到达。续租失败意味着当前实例已失去执行权，不能继续落库模型结果。
+      throw heartbeatError;
     }
 
     return {
@@ -516,6 +670,7 @@ export class AgentOrchestrator {
       inputTokens,
       outputTokens,
       finishReason,
+      interruption,
     };
   }
 
@@ -546,23 +701,73 @@ export class AgentOrchestrator {
     });
   }
 
+  /**
+   * Provider 生成的客户端工具参数属于模型输出，不是用户请求或状态机事实。
+   * 严格校验失败时写入成对的 tool_result，让模型能看到具体 issue 后自我修正；
+   * 此时工具尚未执行，因此不创建 Tool Ledger，也不切换 awaiting 状态。
+   *
+   * revision 冲突、预算耗尽等错误发生在参数通过之后，仍由调用方抛出并终止，
+   * 避免把真实并发冲突误包装成“请模型再猜一次”。
+   */
+  private async persistInvalidClientToolArguments(input: {
+    run: AgentRunRecord;
+    toolCall: AccumulatedToolCall;
+    message: string;
+    issues: readonly object[];
+  }): Promise<void> {
+    const result = {
+      ok: false,
+      toolName: input.toolCall.name,
+      revision: input.run.currentRevision,
+      error: {
+        code: AGENT_ERROR_CODES.toolInvalidArguments,
+        message: input.message,
+        details: {
+          issues: toJsonRecords(input.issues),
+        },
+      },
+    };
+
+    await this.store.appendTranscript({
+      conversationId: input.run.conversationId,
+      runId: input.run.id,
+      role: "tool",
+      kind: "tool_result",
+      toolCallId: input.toolCall.id,
+      toolName: input.toolCall.name,
+      resultJson: result,
+    });
+    await this.store.appendEvent({
+      runId: input.run.id,
+      type: "tool.completed",
+      payload: {
+        toolCallId: input.toolCall.id,
+        toolName: input.toolCall.name,
+        ok: false,
+        revision: input.run.currentRevision,
+        errorCode: AGENT_ERROR_CODES.toolInvalidArguments,
+      },
+    });
+  }
+
   private async suspendForRunPreview(input: {
     run: AgentRunRecord;
     toolCall: AccumulatedToolCall;
     argumentsJson: unknown;
     leaseId: string;
-  }): Promise<void> {
+  }): Promise<boolean> {
     const argumentsResult = runPreviewToolArgumentsSchema.safeParse(
       input.argumentsJson,
     );
 
     if (!argumentsResult.success) {
-      throw new AgentError(
-        AGENT_ERROR_CODES.toolInvalidArguments,
-        "工具 run_preview 的参数不合法。",
-        400,
-        { issues: argumentsResult.error.issues },
-      );
+      await this.persistInvalidClientToolArguments({
+        run: input.run,
+        toolCall: input.toolCall,
+        message: "工具 run_preview 的参数不合法。",
+        issues: argumentsResult.error.issues,
+      });
+      return false;
     }
 
     if (argumentsResult.data.revision !== input.run.currentRevision) {
@@ -586,55 +791,18 @@ export class AgentOrchestrator {
     }
 
     const idempotencyKey = `${input.run.id}:${input.toolCall.id}`;
-    const registration = await this.store.registerToolInvocation({
+    await this.store.suspendForClientTool({
+      ownerId: input.run.ownerId,
       runId: input.run.id,
+      projectId: input.run.projectId,
       toolCallId: input.toolCall.id,
       toolName: RUN_PREVIEW_TOOL_NAME,
-      executionDomain: "client",
       argumentsJson: argumentsResult.data,
       idempotencyKey,
-      revisionBefore: input.run.currentRevision,
-    });
-
-    if (!registration.created) {
-      throw new AgentError(
-        AGENT_ERROR_CODES.toolAlreadyExecuted,
-        "重复的 run_preview Tool Call 不能再次下发浏览器。",
-        409,
-        { toolCallId: input.toolCall.id },
-      );
-    }
-
-    await this.store.markToolInvocationRunning({
-      runId: input.run.id,
-      toolCallId: input.toolCall.id,
-    });
-    await this.store.transitionRun({
-      ownerId: input.run.ownerId,
-      runId: input.run.id,
-      status: "awaiting_client_tool",
-    });
-
-    // 必须在发布 SSE 请求前释放服务端租约。浏览器可能立即完成验证，
-    // 若旧租约仍存在，结果接口恢复 Agent Loop 时会拿不到执行权。
-    await this.store.releaseExecutionLease({
-      ownerId: input.run.ownerId,
-      runId: input.run.id,
+      revision: input.run.currentRevision,
       leaseId: input.leaseId,
     });
-    await this.store.appendEvent({
-      runId: input.run.id,
-      type: "client_tool.requested",
-      payload: {
-        runId: input.run.id,
-        projectId: input.run.projectId,
-        toolCallId: input.toolCall.id,
-        toolName: RUN_PREVIEW_TOOL_NAME,
-        idempotencyKey,
-        revision: input.run.currentRevision,
-        arguments: argumentsResult.data,
-      },
-    });
+    return true;
   }
 
   private async suspendForBrowserVerify(input: {
@@ -644,18 +812,30 @@ export class AgentOrchestrator {
     leaseId: string;
     source: "agent" | "replay";
     replayCount: number;
-  }): Promise<void> {
+  }): Promise<boolean> {
     const argumentsResult = browserVerifyToolArgumentsSchema.safeParse(
       input.argumentsJson,
     );
 
     if (!argumentsResult.success) {
-      throw new AgentError(
-        AGENT_ERROR_CODES.toolInvalidArguments,
-        "工具 browser_verify 的参数不合法。",
-        400,
-        { issues: argumentsResult.error.issues },
-      );
+      // replay 参数来自已持久化且曾通过校验的 smoke plan。若它后来失效，
+      // 说明服务端协议或数据发生漂移，不能伪装成一次可纠正的模型输出。
+      if (input.source === "replay") {
+        throw new AgentError(
+          AGENT_ERROR_CODES.toolInvalidArguments,
+          "持久化的 Browser smoke plan 已失效，无法自动重放。",
+          500,
+          { issues: argumentsResult.error.issues },
+        );
+      }
+
+      await this.persistInvalidClientToolArguments({
+        run: input.run,
+        toolCall: input.toolCall,
+        message: "工具 browser_verify 的参数不合法。",
+        issues: argumentsResult.error.issues,
+      });
+      return false;
     }
 
     if (argumentsResult.data.revision !== input.run.currentRevision) {
@@ -679,68 +859,20 @@ export class AgentOrchestrator {
     }
 
     const idempotencyKey = `${input.run.id}:${input.toolCall.id}`;
-    const registration = await this.store.registerToolInvocation({
-      runId: input.run.id,
-      toolCallId: input.toolCall.id,
-      toolName: BROWSER_VERIFY_TOOL_NAME,
-      executionDomain: "client",
-      argumentsJson: argumentsResult.data,
-      idempotencyKey,
-      revisionBefore: input.run.currentRevision,
-    });
-
-    if (!registration.created) {
-      throw new AgentError(
-        AGENT_ERROR_CODES.toolAlreadyExecuted,
-        "重复的 browser_verify Tool Call 不能再次下发浏览器。",
-        409,
-        { toolCallId: input.toolCall.id },
-      );
-    }
-
-    await this.store.markToolInvocationRunning({
-      runId: input.run.id,
-      toolCallId: input.toolCall.id,
-    });
-    const verification = await this.store.createVerificationRun({
+    await this.store.suspendForClientTool({
       ownerId: input.run.ownerId,
       runId: input.run.id,
       projectId: input.run.projectId,
       toolCallId: input.toolCall.id,
+      toolName: BROWSER_VERIFY_TOOL_NAME,
+      argumentsJson: argumentsResult.data,
+      idempotencyKey,
       revision: input.run.currentRevision,
+      leaseId: input.leaseId,
       source: input.source,
       replayCount: input.replayCount,
-      smokeSteps: toJsonRecords(argumentsResult.data.steps),
-      acceptedNetworkFailures: toJsonRecords(
-        argumentsResult.data.acceptedNetworkFailures,
-      ),
     });
-    await this.store.transitionRun({
-      ownerId: input.run.ownerId,
-      runId: input.run.id,
-      status: "awaiting_client_tool",
-    });
-    await this.store.releaseExecutionLease({
-      ownerId: input.run.ownerId,
-      runId: input.run.id,
-      leaseId: input.leaseId,
-    });
-    await this.store.appendEvent({
-      runId: input.run.id,
-      type: "client_tool.requested",
-      payload: {
-        runId: input.run.id,
-        projectId: input.run.projectId,
-        toolCallId: input.toolCall.id,
-        toolName: BROWSER_VERIFY_TOOL_NAME,
-        idempotencyKey,
-        revision: input.run.currentRevision,
-        arguments: argumentsResult.data,
-        verificationRunId: verification.id,
-        source: input.source,
-        replayCount: input.replayCount,
-      },
-    });
+    return true;
   }
 
   private async assertNotCancelled(
@@ -789,18 +921,76 @@ export class AgentOrchestrator {
       return;
     }
 
-    await this.store.transitionRun({
-      ownerId: latest.ownerId,
-      runId: latest.id,
-      status,
-      errorCode: errorCode ?? null,
-      errorMessage: errorMessage ?? null,
-    });
+    if (status === "succeeded") {
+      await this.completeSuccessfulRunWithRetry(latest);
+    } else {
+      await this.store.transitionRun({
+        ownerId: latest.ownerId,
+        runId: latest.id,
+        status,
+        errorCode: errorCode ?? null,
+        errorMessage: errorMessage ?? null,
+      });
+    }
+  }
+
+  /**
+   * Neon 的 WebSocket 连接可能在事务已经提交或即将开始时瞬时中断。
+   * 第一次失败后必须先重读数据库事实：若 Run 已经 succeeded，说明提交成功但
+   * 客户端没有收到确认；若仍为 running，完整事务可以安全重试一次。
+   *
+   * 成功 checkpoint 与 ChangeSet 都有 Run 级唯一约束，且第一次事务若未提交会
+   * 整体回滚，因此这里只允许一次有界重试，不会制造重复历史记录。
+   */
+  private async completeSuccessfulRunWithRetry(
+    run: AgentRunRecord,
+  ): Promise<void> {
+    try {
+      await this.store.completeSuccessfulRun({
+        ownerId: run.ownerId,
+        runId: run.id,
+      });
+      return;
+    } catch (firstError) {
+      const persisted = await this.store.getRun({
+        ownerId: run.ownerId,
+        runId: run.id,
+      });
+
+      if (persisted.status === "succeeded") {
+        return;
+      }
+
+      if (persisted.status !== "running") {
+        throw firstError;
+      }
+
+      console.warn("[agent-orchestrator] retry successful finalization", {
+        runId: persisted.id,
+        correlationId: persisted.correlationId,
+        error: firstError,
+      });
+
+      try {
+        await this.store.completeSuccessfulRun({
+          ownerId: persisted.ownerId,
+          runId: persisted.id,
+        });
+      } catch (retryError) {
+        console.error("[agent-orchestrator] successful finalization failed", {
+          runId: persisted.id,
+          correlationId: persisted.correlationId,
+          error: retryError,
+        });
+        throw retryError;
+      }
+    }
   }
 
   private async handleTerminalError(
     input: { ownerId: string; runId: string },
     error: unknown,
+    leaseId: string,
   ) {
     const run = await this.store.getRun(input);
 
@@ -812,6 +1002,23 @@ export class AgentOrchestrator {
       run.status === "conflicted"
     ) {
       return;
+    }
+
+    if (run.executionLeaseId !== leaseId) {
+      const healthyClientWait =
+        run.status === "awaiting_client_tool" &&
+        (await this.store.hasPendingClientToolWait(input));
+      const ownedByNewExecutor =
+        run.status === "queued" ||
+        run.status === "running" ||
+        run.status === "awaiting_async_job";
+
+      if (healthyClientWait || ownedByNewExecutor) {
+        // 终止状态也是一种写操作，只能由仍持有租约的执行器提交。这里覆盖两种
+        // 正常接管：浏览器已拿到客户端工具等待权，或另一个服务端实例已接管。
+        // 旧实例无论收到何种迟到错误，都不能覆盖更新后的数据库事实。
+        return;
+      }
     }
 
     // 取消 fence 先于当前实例 AbortController 写入。即使 Provider 把 abort
@@ -827,6 +1034,16 @@ export class AgentOrchestrator {
     }
 
     if (isAgentError(error)) {
+      if (
+        error.code === AGENT_ERROR_CODES.runConflict &&
+        run.status === "awaiting_client_tool" &&
+        (await this.store.hasPendingClientToolWait(input))
+      ) {
+        // 当前实例已失去租约，但另一个执行器已经建立可恢复的客户端等待事实。
+        // 旧实例必须静默退出，不能用自己的迟到冲突覆盖健康的 awaiting 状态。
+        return;
+      }
+
       if (error.code === AGENT_ERROR_CODES.cancelled) {
         await this.finishRun(run, "cancelled", error.code, error.message);
         return;
@@ -851,7 +1068,14 @@ export class AgentOrchestrator {
       return;
     }
 
-    console.error("[agent-orchestrator]", error);
+    console.error(
+      "[agent-orchestrator] terminal error",
+      JSON.stringify({
+        runId: run.id,
+        correlationId: run.correlationId,
+        ...serializeAgentError(error),
+      }),
+    );
     await this.finishRun(
       run,
       "failed",
@@ -938,8 +1162,11 @@ function isFileMutationTool(toolName: string): boolean {
   );
 }
 
-function assertWithinWallTime(run: AgentRunRecord, startedAt: number): void {
-  if (Date.now() - startedAt > run.budget.maxWallTimeSeconds * 1000) {
+function assertWithinWallTime(run: AgentRunRecord): void {
+  if (
+    getActiveExecutionDurationMs(run.usage, new Date()) >
+    run.budget.maxWallTimeSeconds * 1000
+  ) {
     throw new AgentError(
       AGENT_ERROR_CODES.budgetExhausted,
       "Agent 已达到最大运行时间。",
@@ -982,4 +1209,24 @@ function assertCompleteModelTurn(turn: {
       },
     );
   }
+}
+
+/**
+ * 仅允许重试“宣称要调用工具但整轮没有工具数据”的供应商缺帧。
+ * 一旦存在 Tool Call，就交给严格校验检查 id/name/finish reason，
+ * 防止把半截参数或协议错乱误判成一次无害重试。
+ */
+function isRetryableEmptyToolCallTurn(turn: {
+  finishReason: ProviderFinishReason | null;
+  toolCalls: readonly AccumulatedToolCall[];
+}): boolean {
+  return turn.finishReason === "tool_calls" && turn.toolCalls.length === 0;
+}
+
+function isRetryablePartialProviderStream(error: unknown): error is AgentError {
+  return (
+    isAgentError(error) &&
+    (error.code === AGENT_ERROR_CODES.providerTimeout ||
+      error.code === AGENT_ERROR_CODES.providerInterrupted)
+  );
 }

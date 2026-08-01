@@ -4,6 +4,7 @@ import { z } from "zod";
 import { requireRequestOwner } from "@/domains/auth/request-owner";
 import { createFrozenAgentProfile } from "@/domains/agent/profiles";
 import { AGENT_ERROR_CODES, AgentError } from "@/domains/agent/errors";
+import { DEFAULT_MAX_AGENT_MODEL_TURNS } from "@/domains/agent/types";
 import { launchAgentRun } from "@/infrastructure/agent/runtime";
 import { getAgentProviderRuntime } from "@/infrastructure/agent/provider-factory";
 import { serverEnv } from "@/infrastructure/env/server";
@@ -92,7 +93,8 @@ export async function POST(request: Request) {
       },
       provider: providerRuntime.providerName,
       model: providerRuntime.model,
-      maxModelTurns: serverEnv.MAX_AGENT_MODEL_TURNS ?? 12,
+      maxModelTurns:
+        serverEnv.MAX_AGENT_MODEL_TURNS ?? DEFAULT_MAX_AGENT_MODEL_TURNS,
       maxWallTimeSeconds: serverEnv.MAX_AGENT_WALL_TIME_SECONDS ?? 300,
     });
     const run = await store.createRun({

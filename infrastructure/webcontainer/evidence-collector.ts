@@ -69,7 +69,10 @@ export class PreviewEvidenceCollector {
     }
   }
 
-  finish(snapshot: WebContainerRuntimeSnapshot): RunPreviewResult {
+  finish(
+    snapshot: WebContainerRuntimeSnapshot,
+    durationMs = Date.now() - this.startedAt,
+  ): RunPreviewResult {
     const build = createBuildEvidence(snapshot, this.revision);
     const runtimeEvents = mergeForwardedPreviewErrors(
       this.runtimeEvents,
@@ -106,6 +109,7 @@ export class PreviewEvidenceCollector {
       ok,
       toolName: RUN_PREVIEW_TOOL_NAME,
       revision: this.revision,
+      durationMs: normalizeExecutionDuration(durationMs),
       summary: createSummary({
         ok,
         rendered: runtime.rendered,
@@ -154,6 +158,10 @@ export class PreviewEvidenceCollector {
       timestamp: envelope.payload.timestamp,
     });
   }
+}
+
+function normalizeExecutionDuration(durationMs: number): number {
+  return Math.max(0, Math.min(300_000, Math.round(durationMs)));
 }
 
 function createBuildEvidence(

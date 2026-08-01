@@ -15,10 +15,13 @@ export const RUN_PREVIEW_TOOL_DEFINITION = {
     properties: {
       revision: {
         type: "integer",
+        minimum: 0,
         description: "需要验证的当前 Repository revision。",
       },
       observationMs: {
         type: "integer",
+        minimum: 500,
+        maximum: 10_000,
         description: "页面首帧后的观察时间，范围 500 到 10000 毫秒。",
       },
     },
@@ -69,6 +72,13 @@ const BROWSER_TARGET_JSON_SCHEMA = {
   ],
 } as const;
 
+const BROWSER_TIMEOUT_JSON_SCHEMA = {
+  type: "integer",
+  minimum: 100,
+  maximum: 5_000,
+  description: "单步超时时间，范围 100 到 5000 毫秒。",
+} as const;
+
 /**
  * JSON Schema 只承担模型侧约束，真正的权限边界仍是 client-tools.ts 中的
  * strict Zod schema。这里完整列出动作，避免模型用自然语言步骤冒充可执行计划。
@@ -82,6 +92,7 @@ export const BROWSER_VERIFY_TOOL_DEFINITION = {
     properties: {
       revision: {
         type: "integer",
+        minimum: 0,
         description: "必须等于当前 Agent Run revision。",
       },
       steps: {
@@ -95,7 +106,7 @@ export const BROWSER_VERIFY_TOOL_DEFINITION = {
               properties: {
                 action: { const: "click" },
                 target: BROWSER_TARGET_JSON_SCHEMA,
-                timeoutMs: { type: "integer" },
+                timeoutMs: BROWSER_TIMEOUT_JSON_SCHEMA,
               },
               required: ["action", "target"],
               additionalProperties: false,
@@ -106,7 +117,7 @@ export const BROWSER_VERIFY_TOOL_DEFINITION = {
                 action: { const: "fill" },
                 target: BROWSER_TARGET_JSON_SCHEMA,
                 value: { type: "string" },
-                timeoutMs: { type: "integer" },
+                timeoutMs: BROWSER_TIMEOUT_JSON_SCHEMA,
               },
               required: ["action", "target", "value"],
               additionalProperties: false,
@@ -117,7 +128,7 @@ export const BROWSER_VERIFY_TOOL_DEFINITION = {
                 action: { const: "select" },
                 target: BROWSER_TARGET_JSON_SCHEMA,
                 value: { type: "string" },
-                timeoutMs: { type: "integer" },
+                timeoutMs: BROWSER_TIMEOUT_JSON_SCHEMA,
               },
               required: ["action", "target", "value"],
               additionalProperties: false,
@@ -128,7 +139,7 @@ export const BROWSER_VERIFY_TOOL_DEFINITION = {
                 action: { const: "press" },
                 target: BROWSER_TARGET_JSON_SCHEMA,
                 key: { type: "string" },
-                timeoutMs: { type: "integer" },
+                timeoutMs: BROWSER_TIMEOUT_JSON_SCHEMA,
               },
               required: ["action", "key"],
               additionalProperties: false,
@@ -138,7 +149,7 @@ export const BROWSER_VERIFY_TOOL_DEFINITION = {
               properties: {
                 action: { const: "wait_for" },
                 target: BROWSER_TARGET_JSON_SCHEMA,
-                timeoutMs: { type: "integer" },
+                timeoutMs: BROWSER_TIMEOUT_JSON_SCHEMA,
               },
               required: ["action", "timeoutMs"],
               additionalProperties: false,
@@ -149,7 +160,7 @@ export const BROWSER_VERIFY_TOOL_DEFINITION = {
                 action: { const: "assert_text" },
                 target: BROWSER_TARGET_JSON_SCHEMA,
                 text: { type: "string" },
-                timeoutMs: { type: "integer" },
+                timeoutMs: BROWSER_TIMEOUT_JSON_SCHEMA,
               },
               required: ["action", "text"],
               additionalProperties: false,
@@ -159,7 +170,7 @@ export const BROWSER_VERIFY_TOOL_DEFINITION = {
               properties: {
                 action: { const: "assert_visible" },
                 target: BROWSER_TARGET_JSON_SCHEMA,
-                timeoutMs: { type: "integer" },
+                timeoutMs: BROWSER_TIMEOUT_JSON_SCHEMA,
               },
               required: ["action", "target"],
               additionalProperties: false,
@@ -169,7 +180,7 @@ export const BROWSER_VERIFY_TOOL_DEFINITION = {
               properties: {
                 action: { const: "assert_url" },
                 pattern: { type: "string" },
-                timeoutMs: { type: "integer" },
+                timeoutMs: BROWSER_TIMEOUT_JSON_SCHEMA,
               },
               required: ["action", "pattern"],
               additionalProperties: false,
@@ -197,6 +208,8 @@ export const BROWSER_VERIFY_TOOL_DEFINITION = {
       },
       observationMs: {
         type: "integer",
+        minimum: 500,
+        maximum: 10_000,
         description: "步骤完成后的运行时观察时间，范围 500 到 10000 毫秒。",
       },
     },

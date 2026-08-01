@@ -36,8 +36,14 @@ export async function GET(
     // 先通过 Repository 做 owner/project 隔离，再查询会话列表。
     await repository.describe({ ownerId, projectId });
     const conversations = await store.listConversations({ ownerId, projectId });
+    // 刷新或首次进入工作台时，优先恢复尚未完成的 Run。尤其
+    // awaiting_client_tool 必须重新下发 run_preview/browser_verify，
+    // 不能被一个更新时间更晚但没有 Run 的空会话遮住。
+    const activeConversationId = conversationId
+      ? null
+      : await store.findActiveConversationId({ ownerId, projectId });
     const selectedConversationId =
-      conversationId ?? conversations[0]?.id ?? null;
+      conversationId ?? activeConversationId ?? conversations[0]?.id ?? null;
     const snapshot = selectedConversationId
       ? await store.getConversationSnapshot({
           ownerId,

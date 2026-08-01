@@ -45,6 +45,10 @@ export const DEFAULT_AGENT_RUN_ACTIVITY_LIMITS = {
   maxNoProgressRepeats: 2,
 } as const;
 
+// 空项目需要逐文件生成完整骨架，再依次完成 Preview、Browser Verify 和最终说明。
+// 16 轮为一次常规修复保留余量；该值只用于新建 Run 或读取缺失字段的旧数据。
+export const DEFAULT_MAX_AGENT_MODEL_TURNS = 16;
+
 export type AgentRunUsage = {
   modelTurns: number;
   inputTokens: number;
@@ -53,6 +57,8 @@ export type AgentRunUsage = {
   clientResumes: number;
   repairRounds: number;
   repeatedFailureCount: number;
+  activeExecutionDurationMs: number;
+  activeExecutionStartedAt: string | null;
   firstPreviewAt: string | null;
   firstPreviewDurationMs: number | null;
   latestPreviewAt: string | null;
@@ -69,6 +75,8 @@ export const EMPTY_AGENT_RUN_USAGE: AgentRunUsage = {
   clientResumes: 0,
   repairRounds: 0,
   repeatedFailureCount: 0,
+  activeExecutionDurationMs: 0,
+  activeExecutionStartedAt: null,
   firstPreviewAt: null,
   firstPreviewDurationMs: null,
   latestPreviewAt: null,
@@ -85,7 +93,10 @@ export function normalizeAgentRunBudget(
   value: Record<string, unknown>,
 ): AgentRunBudget {
   return {
-    maxModelTurns: positiveInteger(value.maxModelTurns, 12),
+    maxModelTurns: positiveInteger(
+      value.maxModelTurns,
+      DEFAULT_MAX_AGENT_MODEL_TURNS,
+    ),
     maxWallTimeSeconds: positiveInteger(value.maxWallTimeSeconds, 300),
     maxOutputCharacters: positiveInteger(value.maxOutputCharacters, 24_000),
     maxToolResultCharacters: positiveInteger(
@@ -118,6 +129,12 @@ export function normalizeAgentRunUsage(
     clientResumes: nonnegativeInteger(value.clientResumes),
     repairRounds: nonnegativeInteger(value.repairRounds),
     repeatedFailureCount: nonnegativeInteger(value.repeatedFailureCount),
+    activeExecutionDurationMs: nonnegativeInteger(
+      value.activeExecutionDurationMs,
+    ),
+    activeExecutionStartedAt: nullableTimestampString(
+      value.activeExecutionStartedAt,
+    ),
     firstPreviewAt: nullableString(value.firstPreviewAt),
     firstPreviewDurationMs: nullableNonnegativeInteger(
       value.firstPreviewDurationMs,
@@ -154,6 +171,66 @@ function nullableNonnegativeInteger(value: unknown): number | null {
 
 function nullableString(value: unknown): string | null {
   return typeof value === "string" ? value : null;
+}
+
+function nullableTimestampString(value: unknown): string | null {
+  return typeof value === "string" && Number.isFinite(Date.parse(value))
+    ? value
+    : null;
+}
+
+/**
+ * Run 的 wall-time 预算只统计服务端 Agent 真正在运行的时间。
+ *
+ * awaiting_client_tool 期间可能包含浏览器未打开、用户离开页面或 WebContainer
+ * 安装运行等客户端等待，这些时间不应消耗模型执行预算。usage 使用 JSONB，
+ * 因此把累计值和当前片段起点一起持久化即可跨 Serverless 实例恢复。
+ */
+export function resumeAgentExecution(
+  usage: AgentRunUsage,
+  now: Date,
+): AgentRunUsage {
+  return usage.activeExecutionStartedAt
+    ? usage
+    : {
+        ...usage,
+        activeExecutionStartedAt: now.toISOString(),
+      };
+}
+
+export function pauseAgentExecution(
+  usage: AgentRunUsage,
+  now: Date,
+): AgentRunUsage {
+  const segmentStartedAt = usage.activeExecutionStartedAt
+    ? Date.parse(usage.activeExecutionStartedAt)
+    : Number.NaN;
+  const segmentDurationMs = Number.isFinite(segmentStartedAt)
+    ? Math.max(0, now.getTime() - segmentStartedAt)
+    : 0;
+
+  return {
+    ...usage,
+    activeExecutionDurationMs:
+      usage.activeExecutionDurationMs + segmentDurationMs,
+    activeExecutionStartedAt: null,
+  };
+}
+
+export function getActiveExecutionDurationMs(
+  usage: AgentRunUsage,
+  now: Date,
+): number {
+  const segmentStartedAt = usage.activeExecutionStartedAt
+    ? Date.parse(usage.activeExecutionStartedAt)
+    : Number.NaN;
+
+  return (
+    usage.activeExecutionDurationMs +
+    (Number.isFinite(segmentStartedAt)
+      ? Math.max(0, now.getTime() - segmentStartedAt)
+      : 0)
+  );
 }
 
 export type FrozenAgentRunProfile = {

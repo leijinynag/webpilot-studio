@@ -8,11 +8,13 @@ import {
 
 function createDeferred<T>() {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((promiseResolve) => {
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((promiseResolve, promiseReject) => {
     resolve = promiseResolve;
+    reject = promiseReject;
   });
 
-  return { promise, resolve };
+  return { promise, reject, resolve };
 }
 
 describe("WebContainerRuntimeManager", () => {
@@ -303,6 +305,130 @@ describe("WebContainerRuntimeManager", () => {
     });
 
     await expect(manager.start()).resolves.toMatchObject({ phase: "ready" });
+  });
+
+  it("安装超时后终止旧进程，并允许下一次启动使用干净进程重试", async () => {
+    const runtime = new FakeWebContainer();
+    const blockedInstall = new FakeWebContainerProcess(0);
+    Object.defineProperty(blockedInstall, "exit", {
+      value: new Promise<number>(() => undefined),
+    });
+    const retryInstall = new FakeWebContainerProcess(0, [
+      "retry dependencies installed",
+    ]);
+    const originalSpawn = runtime.spawn.bind(runtime);
+    let installAttempt = 0;
+
+    runtime.spawn = async (command, args) => {
+      if (args[0] === "install") {
+        installAttempt += 1;
+        runtime.calls.push(`${command} ${args.join(" ")}`);
+        return installAttempt === 1 ? blockedInstall : retryInstall;
+      }
+      return originalSpawn(command, args);
+    };
+
+    const manager = new WebContainerRuntimeManager({
+      boot: async () => runtime,
+      isCrossOriginIsolated: () => true,
+      installTimeoutMs: 20,
+      serverReadyTimeoutMs: 1_000,
+    });
+
+    await expect(manager.start()).rejects.toMatchObject({
+      diagnostic: {
+        code: "install_failed",
+        message: "依赖安装超时，运行镜像未能完成准备。",
+      },
+    });
+    expect(blockedInstall.killed).toBe(true);
+
+    await expect(manager.start()).resolves.toMatchObject({ phase: "ready" });
+    expect(installAttempt).toBe(2);
+    expect(retryInstall.killed).toBe(false);
+  });
+
+  it("teardown 会终止仍在运行的依赖安装进程", async () => {
+    const runtime = new FakeWebContainer();
+    const blockedInstall = new FakeWebContainerProcess(0);
+    Object.defineProperty(blockedInstall, "exit", {
+      value: new Promise<number>(() => undefined),
+    });
+    const installSpawned = createDeferred<void>();
+    const originalSpawn = runtime.spawn.bind(runtime);
+
+    runtime.spawn = async (command, args) => {
+      if (args[0] === "install") {
+        runtime.calls.push(`${command} ${args.join(" ")}`);
+        installSpawned.resolve();
+        return blockedInstall;
+      }
+      return originalSpawn(command, args);
+    };
+
+    const manager = new WebContainerRuntimeManager({
+      boot: async () => runtime,
+      isCrossOriginIsolated: () => true,
+      installTimeoutMs: 10_000,
+    });
+    const start = manager.start();
+    // 先为 rejection 注册观察者，避免 teardown 后的取消异常在断言接管前
+    // 被 Vitest 记录成 unhandled rejection。
+    const startRejected = expect(start).rejects.toBeInstanceOf(Error);
+    await installSpawned.promise;
+
+    manager.teardown();
+
+    expect(manager.getSnapshot().phase).toBe("idle");
+    // spawn Promise 可能已返回进程，但 await continuation 尚未恢复。Manager 会在
+    // generation 检查点终止这份迟到资源，因此先等待启动链结束再验证 kill。
+    await startRejected;
+    expect(blockedInstall.killed).toBe(true);
+  });
+
+  it("teardown 后观察并忽略 dev 进程的预期中止 rejection", async () => {
+    const runtime = new FakeWebContainer();
+    const devExit = createDeferred<number>();
+    runtime.devExit = devExit.promise;
+    const manager = new WebContainerRuntimeManager({
+      boot: async () => runtime,
+      isCrossOriginIsolated: () => true,
+      serverReadyTimeoutMs: 1_000,
+    });
+
+    await manager.start();
+    manager.teardown();
+    devExit.reject(new Error("Process aborted"));
+
+    // 等待 exit rejection handler 执行。若 Manager 没有注册 rejection 分支，
+    // Vitest 会把这次预期 teardown 记录为 unhandled rejection 并使测试失败。
+    await Promise.resolve();
+    expect(manager.getSnapshot().phase).toBe("idle");
+  });
+
+  it("当前 generation 的 dev 进程异常 rejection 会转成结构化失败", async () => {
+    const runtime = new FakeWebContainer();
+    const devExit = createDeferred<number>();
+    runtime.devExit = devExit.promise;
+    const manager = new WebContainerRuntimeManager({
+      boot: async () => runtime,
+      isCrossOriginIsolated: () => true,
+      serverReadyTimeoutMs: 1_000,
+    });
+
+    await manager.start();
+    devExit.reject(new Error("worker crashed"));
+
+    await vi.waitFor(() => {
+      expect(manager.getSnapshot()).toMatchObject({
+        phase: "failed",
+        diagnostic: {
+          code: "dev_server_failed",
+          message: "开发服务器进程异常中止。",
+          detail: "worker crashed",
+        },
+      });
+    });
   });
 
   it("项目切换后忽略旧项目迟到的 boot 和 finally", async () => {

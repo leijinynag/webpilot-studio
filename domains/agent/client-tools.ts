@@ -92,6 +92,7 @@ export const browserVerifyResultSchema = z
     verificationRunId: z.uuid(),
     revision: z.number().int().nonnegative(),
     replayCount: z.number().int().nonnegative(),
+    durationMs: z.number().int().nonnegative().max(300_000),
     summary: z.string().min(1).max(2_048),
     build: buildEvidenceSchema,
     runtime: runtimeEvidenceSchema,

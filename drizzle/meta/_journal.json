@@ -36,6 +36,20 @@
       "when": 1785330723705,
       "tag": "0004_black_golden_guardian",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1785338287681,
+      "tag": "0005_easy_toad_men",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1785510565174,
+      "tag": "0006_workable_onslaught",
+      "breakpoints": true
     }
   ]
 }
