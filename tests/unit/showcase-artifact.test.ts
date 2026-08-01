@@ -3,6 +3,9 @@ import { describe, expect, it } from "vitest";
 
 import {
   createShowcaseArtifact,
+  sha256Hex,
+  validateShowcaseArtifactFiles,
+  type ShowcaseArtifactManifest,
   normalizeArtifactPath,
   rewriteStaticAssetReferences,
 } from "@/infrastructure/showcase/artifact";
@@ -11,7 +14,9 @@ describe("Showcase artifact", () => {
   it("拒绝绝对路径、路径穿越和远程 URL", () => {
     expect(() => normalizeArtifactPath("../index.html")).toThrow();
     expect(() => normalizeArtifactPath("/index.html")).toThrow();
-    expect(() => normalizeArtifactPath("https://cdn.example.com/app.js")).toThrow();
+    expect(() =>
+      normalizeArtifactPath("https://cdn.example.com/app.js"),
+    ).toThrow();
     expect(() => normalizeArtifactPath("//cdn.example.com/app.js")).toThrow();
   });
 
@@ -63,5 +68,98 @@ describe("Showcase artifact", () => {
         },
       ]),
     ).rejects.toThrow("缺少入口文件");
+  });
+
+  it("发布前重新校验 manifest、文件集合、大小和实际 hash", async () => {
+    const content = new TextEncoder().encode("<h1>showcase</h1>");
+    const hash = await sha256Hex(content);
+    const manifest: ShowcaseArtifactManifest = {
+      format: "webpilot-showcase-artifact-v1",
+      entryPath: "index.html",
+      files: [{ path: "index.html", byteLength: content.byteLength, hash }],
+      totalBytes: content.byteLength,
+      createdAt: new Date().toISOString(),
+    };
+
+    await expect(
+      validateShowcaseArtifactFiles({
+        manifest,
+        files: [{ path: "index.html", content, hash }],
+      }),
+    ).resolves.toBeUndefined();
+
+    await expect(
+      validateShowcaseArtifactFiles({
+        manifest,
+        files: [
+          {
+            path: "index.html",
+            content: new TextEncoder().encode("<h1>tampered</h1>"),
+            hash,
+          },
+        ],
+      }),
+    ).rejects.toThrow("内容 hash 校验失败");
+  });
+
+  it("拒绝 manifest 与上传文件不一致", async () => {
+    const content = new TextEncoder().encode("<h1>showcase</h1>");
+    const hash = await sha256Hex(content);
+    const manifest: ShowcaseArtifactManifest = {
+      format: "webpilot-showcase-artifact-v1",
+      entryPath: "index.html",
+      files: [
+        { path: "index.html", byteLength: content.byteLength, hash },
+        { path: "assets/app.js", byteLength: 1, hash: "0".repeat(64) },
+      ],
+      totalBytes: content.byteLength + 1,
+      createdAt: new Date().toISOString(),
+    };
+
+    await expect(
+      validateShowcaseArtifactFiles({
+        manifest,
+        files: [{ path: "index.html", content, hash }],
+      }),
+    ).rejects.toThrow("数量不一致");
+
+    await expect(
+      validateShowcaseArtifactFiles({
+        manifest: {
+          ...manifest,
+          files: [{ ...manifest.files[0], path: "../index.html" }],
+        },
+        files: [{ path: "index.html", content, hash }],
+      }),
+    ).rejects.toThrow();
+  });
+
+  it("拒绝超过 50 MB 的 artifact", async () => {
+    const manifest: ShowcaseArtifactManifest = {
+      format: "webpilot-showcase-artifact-v1",
+      entryPath: "index.html",
+      files: [
+        {
+          path: "index.html",
+          byteLength: 50 * 1024 * 1024 + 1,
+          hash: "0".repeat(64),
+        },
+      ],
+      totalBytes: 50 * 1024 * 1024 + 1,
+      createdAt: new Date().toISOString(),
+    };
+
+    await expect(
+      validateShowcaseArtifactFiles({
+        manifest,
+        files: [
+          {
+            path: "index.html",
+            content: new Uint8Array(),
+            hash: "0".repeat(64),
+          },
+        ],
+      }),
+    ).rejects.toThrow("超过 50 MB");
   });
 });

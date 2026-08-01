@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
 
+import { MAX_SHOWCASE_ARTIFACT_BYTES } from "@/infrastructure/showcase/artifact";
 import { isShowcaseAdminRequest } from "@/infrastructure/showcase/admin";
 
 const artifactFileSchema = z.object({
@@ -14,7 +15,7 @@ export const showcaseManifestSchema = z
     format: z.literal("webpilot-showcase-artifact-v1"),
     entryPath: z.literal("index.html"),
     files: z.array(artifactFileSchema).min(1).max(500),
-    totalBytes: z.number().int().nonnegative(),
+    totalBytes: z.number().int().nonnegative().max(MAX_SHOWCASE_ARTIFACT_BYTES),
     createdAt: z.iso.datetime(),
   })
   .strict();
@@ -42,7 +43,9 @@ export const showcasePublishRequestSchema = z
           hash: z.string().regex(/^[a-f0-9]{64}$/i),
           contentBase64: z
             .string()
-            .regex(/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/)
+            .regex(
+              /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/,
+            )
             .max(16_000_000),
         }),
       )

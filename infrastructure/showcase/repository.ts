@@ -18,7 +18,7 @@ import {
 } from "@/infrastructure/db/schema";
 import {
   normalizeArtifactPath,
-  sha256Hex,
+  validateShowcaseArtifactFiles,
   type ShowcaseArtifactManifest,
 } from "@/infrastructure/showcase/artifact";
 
@@ -76,10 +76,14 @@ export async function listShowcaseCandidates(): Promise<ShowcaseCaseView[]> {
     )
     .orderBy(asc(showcaseCases.sortOrder), desc(showcaseCases.updatedAt));
 
-  return rows.map(({ case: item, artifact }) => toShowcaseCaseView(item, artifact));
+  return rows.map(({ case: item, artifact }) =>
+    toShowcaseCaseView(item, artifact),
+  );
 }
 
-export async function listPublishedShowcaseCases(): Promise<ShowcaseCaseView[]> {
+export async function listPublishedShowcaseCases(): Promise<
+  ShowcaseCaseView[]
+> {
   const database = getDatabase();
   const rows = await database
     .select({
@@ -97,7 +101,9 @@ export async function listPublishedShowcaseCases(): Promise<ShowcaseCaseView[]> 
     .where(eq(showcaseCases.status, "published"))
     .orderBy(asc(showcaseCases.sortOrder), desc(showcaseCases.publishedAt));
 
-  return rows.map(({ case: item, artifact }) => toShowcaseCaseView(item, artifact));
+  return rows.map(({ case: item, artifact }) =>
+    toShowcaseCaseView(item, artifact),
+  );
 }
 
 export async function getPublishedShowcaseCase(
@@ -117,7 +123,9 @@ export async function getPublishedShowcaseCase(
         eq(showcaseArtifacts.status, "active"),
       ),
     )
-    .where(and(eq(showcaseCases.slug, slug), eq(showcaseCases.status, "published")))
+    .where(
+      and(eq(showcaseCases.slug, slug), eq(showcaseCases.status, "published")),
+    )
     .limit(1);
 
   return row ? toShowcaseCaseView(row.case, row.artifact) : null;
@@ -267,7 +275,10 @@ export async function revokeShowcaseCase(caseId: string): Promise<void> {
     .update(showcaseArtifacts)
     .set({ status: "revoked", revokedAt: now })
     .where(
-      and(eq(showcaseArtifacts.caseId, caseId), eq(showcaseArtifacts.status, "active")),
+      and(
+        eq(showcaseArtifacts.caseId, caseId),
+        eq(showcaseArtifacts.status, "active"),
+      ),
     );
 }
 
@@ -313,14 +324,11 @@ export async function readPublishedArtifactFile(
     return null;
   }
 
-  const blob = await get(
-    `${row.artifact.blobPrefix}/${path}`,
-    {
-      access: "private",
-      token: requireBlobToken(),
-      useCache: true,
-    },
-  );
+  const blob = await get(`${row.artifact.blobPrefix}/${path}`, {
+    access: "private",
+    token: requireBlobToken(),
+    useCache: true,
+  });
 
   if (!blob || blob.statusCode !== 200) {
     return null;
@@ -334,58 +342,17 @@ export async function readPublishedArtifactFile(
   };
 }
 
-async function validatePublishInput(input: ShowcasePublishInput): Promise<void> {
+async function validatePublishInput(
+  input: ShowcasePublishInput,
+): Promise<void> {
   if (input.sourceRevision < 0 || !Number.isInteger(input.sourceRevision)) {
     throw new Error("sourceRevision 必须是非负整数。");
   }
 
-  if (input.files.length !== input.manifest.files.length) {
-    throw new Error("artifact 文件与 manifest 数量不一致。");
-  }
-
-  const manifestFiles = new Map<
-    string,
-    ShowcaseArtifactManifest["files"][number]
-  >();
-  let manifestTotalBytes = 0;
-
-  for (const manifestFile of input.manifest.files) {
-    const path = normalizeArtifactPath(manifestFile.path);
-    if (manifestFiles.has(path)) {
-      throw new Error(`manifest 中存在重复文件：${path}`);
-    }
-
-    manifestFiles.set(path, manifestFile);
-    manifestTotalBytes += manifestFile.byteLength;
-  }
-
-  if (manifestTotalBytes !== input.manifest.totalBytes) {
-    throw new Error("artifact manifest 的 totalBytes 不正确。");
-  }
-
-  let actualTotalBytes = 0;
-  for (const file of input.files) {
-    const path = normalizeArtifactPath(file.path);
-    const manifestFile = manifestFiles.get(path);
-    if (
-      !manifestFile ||
-      manifestFile.hash !== file.hash ||
-      manifestFile.byteLength !== file.content.byteLength
-    ) {
-      throw new Error(`artifact 文件 hash 与 manifest 不一致：${path}`);
-    }
-
-    const actualHash = await sha256Hex(file.content);
-    if (actualHash !== manifestFile.hash.toLowerCase()) {
-      throw new Error(`artifact 文件内容 hash 校验失败：${path}`);
-    }
-
-    actualTotalBytes += file.content.byteLength;
-  }
-
-  if (actualTotalBytes !== input.manifest.totalBytes) {
-    throw new Error("artifact 文件实际大小与 manifest 不一致。");
-  }
+  await validateShowcaseArtifactFiles({
+    manifest: input.manifest,
+    files: input.files,
+  });
 }
 
 function toShowcaseCaseView(

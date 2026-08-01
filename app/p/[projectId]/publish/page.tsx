@@ -6,10 +6,12 @@ import { loadOwnedProject } from "@/domains/project/server";
 
 export default async function PublishRoute({
   params,
+  searchParams,
 }: {
   params: Promise<{ projectId: string }>;
+  searchParams: Promise<{ admin?: string }>;
 }) {
-  const { projectId } = await params;
+  const [{ projectId }, query] = await Promise.all([params, searchParams]);
   const data = await loadOwnedProject(projectId);
 
   if (!data) {
@@ -18,7 +20,7 @@ export default async function PublishRoute({
 
   return (
     <AppShell>
-      <PublishPage project={data.project} />
+      <PublishPage adminMode={query.admin === "1"} project={data.project} />
     </AppShell>
   );
 }

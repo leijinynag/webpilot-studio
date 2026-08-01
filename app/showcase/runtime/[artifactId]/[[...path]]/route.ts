@@ -56,7 +56,6 @@ export async function GET(
         "Permissions-Policy": "camera=(), geolocation=(), microphone=()",
         "Referrer-Policy": "no-referrer",
         "X-Content-Type-Options": "nosniff",
-        "X-Frame-Options": "SAMEORIGIN",
       },
     });
   } catch (error) {

@@ -3187,6 +3187,48 @@ html[data-theme="dark"] .piece-art.travel {
   font-size: 0.5rem;
 }
 
+.showcase-admin-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 11px;
+  margin-top: 28px;
+  padding-top: 20px;
+  border-top: 1px solid var(--border);
+}
+
+.showcase-admin-panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.showcase-admin-panel-head span {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--foreground);
+  font-size: 0.62rem;
+  font-weight: 700;
+}
+
+.showcase-admin-panel-head svg {
+  width: 14px;
+  height: 14px;
+  color: var(--accent);
+}
+
+.showcase-admin-panel-head small,
+.showcase-admin-panel > p {
+  color: var(--muted-foreground);
+  font-size: 0.52rem;
+}
+
+.showcase-admin-panel > p {
+  margin: 0;
+  line-height: 1.55;
+}
+
 /* 错误页脱离产品壳，保证渲染异常时仍有清晰、可操作的恢复路径。 */
 .error-page {
   display: grid;
