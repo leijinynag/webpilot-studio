@@ -65,6 +65,17 @@ export type ProjectRepository = {
   }): Promise<ProjectMutationResult>;
   deleteProject(input: { ownerId: string; projectId: string }): Promise<void>;
   restoreProject(input: { ownerId: string; projectId: string }): Promise<void>;
+  claimBrowserGitProvision(input: {
+    ownerId: string;
+    projectId: string;
+  }): Promise<{
+    allowCreate: boolean;
+    status: ProjectSummary["status"];
+  }>;
+  markBrowserGitUnavailable(input: {
+    ownerId: string;
+    projectId: string;
+  }): Promise<void>;
   listFiles(input: {
     ownerId: string;
     projectId: string;
@@ -167,7 +178,9 @@ export class DatabaseProjectRepository<
           ownerId: input.ownerId,
           name,
           storageKind,
-          status: "ready",
+          // Browser Git 的源码要等客户端成功领取一次性 provision claim 后
+          // 才能创建；Database 项目则在事务提交时已经具备完整源码事实。
+          status: storageKind === "browser_git" ? "creating" : "ready",
           revision: initialRevision,
         })
         .returning();
@@ -288,11 +301,67 @@ export class DatabaseProjectRepository<
       );
   }
 
+  async claimBrowserGitProvision(input: {
+    ownerId: string;
+    projectId: string;
+  }): Promise<{
+    allowCreate: boolean;
+    status: ProjectSummary["status"];
+  }> {
+    const project = await this.getProject(input);
+    this.assertBrowserGitProject(project);
+
+    if (project.status !== "creating") {
+      return { allowCreate: false, status: project.status };
+    }
+
+    // status 条件让 claim 具备一次性消费语义。即使两个页面同时挂载，
+    // 也只有一个请求能把 creating 原子推进到 ready 并获得创建权。
+    const [claimed] = await this.db
+      .update(projects)
+      .set({ status: "ready", updatedAt: new Date() })
+      .where(
+        and(
+          eq(projects.id, project.id),
+          eq(projects.ownerId, input.ownerId),
+          eq(projects.storageKind, "browser_git"),
+          eq(projects.status, "creating"),
+          isNull(projects.deletedAt),
+        ),
+      )
+      .returning({ status: projects.status });
+
+    return claimed
+      ? { allowCreate: true, status: claimed.status }
+      : { allowCreate: false, status: "ready" };
+  }
+
+  async markBrowserGitUnavailable(input: {
+    ownerId: string;
+    projectId: string;
+  }): Promise<void> {
+    const project = await this.getProject(input);
+    this.assertBrowserGitProject(project);
+
+    await this.db
+      .update(projects)
+      .set({ status: "unavailable", updatedAt: new Date() })
+      .where(
+        and(
+          eq(projects.id, project.id),
+          eq(projects.ownerId, input.ownerId),
+          eq(projects.storageKind, "browser_git"),
+          isNull(projects.deletedAt),
+        ),
+      );
+  }
+
   async listFiles(input: {
     ownerId: string;
     projectId: string;
   }): Promise<ProjectFileSnapshot[]> {
     const project = await this.getProject(input);
+    this.assertDatabaseProject(project);
     const rows = await this.db
       .select({
         path: projectFiles.path,
@@ -324,6 +393,7 @@ export class DatabaseProjectRepository<
   }): Promise<ProjectFileSnapshot> {
     const path = assertValidProjectPath(input.path);
     const project = await this.getProject(input);
+    this.assertDatabaseProject(project);
     const [row] = await this.db
       .select({
         path: projectFiles.path,
@@ -370,6 +440,7 @@ export class DatabaseProjectRepository<
     }
 
     const project = await this.getProject(input);
+    this.assertDatabaseProject(project);
     const options = { ...DEFAULT_SEARCH_OPTIONS, ...input.options };
     const rows = await this.db
       .select({
@@ -594,6 +665,7 @@ export class DatabaseProjectRepository<
     expectedRevision?: number;
   }): Promise<ProjectCheckpoint> {
     const project = await this.getProject(input);
+    this.assertDatabaseProject(project);
 
     if (
       input.expectedRevision !== undefined &&
@@ -641,6 +713,7 @@ export class DatabaseProjectRepository<
     expectedRevision: number;
   }): Promise<ProjectMutationResult> {
     const project = await this.getProject(input);
+    this.assertDatabaseProject(project);
 
     return this.db.transaction(async (tx) => {
       await assertRevision(tx, project, input.expectedRevision);
@@ -739,6 +812,26 @@ export class DatabaseProjectRepository<
     return project;
   }
 
+  private assertBrowserGitProject(project: typeof projects.$inferSelect) {
+    if (project.storageKind !== "browser_git") {
+      throw new ProjectError(
+        PROJECT_ERROR_CODES.storageUnavailable,
+        "当前项目不是 Browser Git 项目。",
+        409,
+      );
+    }
+  }
+
+  private assertDatabaseProject(project: typeof projects.$inferSelect) {
+    if (project.storageKind !== "database") {
+      throw new ProjectError(
+        PROJECT_ERROR_CODES.storageUnavailable,
+        "Browser Git 项目的源码只能在当前浏览器中读取。",
+        409,
+      );
+    }
+  }
+
   private async mutateProject(input: {
     ownerId: string;
     projectId: string;
@@ -753,6 +846,7 @@ export class DatabaseProjectRepository<
     ) => Promise<void>;
   }): Promise<ProjectMutationResult> {
     const project = await this.getProject(input);
+    this.assertDatabaseProject(project);
 
     return this.db.transaction(async (tx) => {
       await assertRevision(tx, project, input.expectedRevision);

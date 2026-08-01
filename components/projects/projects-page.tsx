@@ -428,6 +428,7 @@ function formatProjectStatus(status: ProjectSummary["status"]) {
   const labels: Record<ProjectSummary["status"], string> = {
     creating: "Creating",
     ready: "Ready",
+    unavailable: "Local data missing",
     error: "Needs attention",
   };
 

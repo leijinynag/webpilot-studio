@@ -3,7 +3,6 @@ import { z } from "zod";
 
 import { requireRequestOwner } from "@/domains/auth/request-owner";
 import { createProjectRequestSchema } from "@/domains/project/api-schemas";
-import { PROJECT_ERROR_CODES, ProjectError } from "@/domains/project/errors";
 import { flattenProjectTemplate } from "@/domains/project/template";
 import {
   apiErrorResponse,
@@ -43,19 +42,11 @@ export async function POST(request: Request) {
     const ownerId = await requireRequestOwner();
     const body = createProjectRequestSchema.parse(await readJsonBody(request));
 
-    if (body.storageKind === "browser_git") {
-      throw new ProjectError(
-        PROJECT_ERROR_CODES.storageUnavailable,
-        "Browser Git 尚未接入持久化链路。",
-        409,
-      );
-    }
-
     const repository = getProjectRepository();
     const project = await repository.createProject({
       ownerId,
       name: body.name,
-      storageKind: "database",
+      storageKind: body.storageKind,
       // 空项目不写入任何示例源码。只有调用方明确选择 rsbuild 时才展开模板，
       // 从而让“Blank”与服务端持久化语义保持一致。
       initialFiles:

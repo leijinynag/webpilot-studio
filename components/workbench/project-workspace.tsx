@@ -11,6 +11,7 @@ import {
 } from "react";
 import type { editor } from "monaco-editor";
 import {
+  Bot,
   Code2,
   ExternalLink,
   FilePlus2,
@@ -34,6 +35,7 @@ import { EditorTabs } from "@/components/workbench/editor-tabs";
 import { FileOperationDialog } from "@/components/workbench/file-operation-dialog";
 import { FileTree } from "@/components/workbench/file-tree";
 import { PROJECT_ERROR_CODES } from "@/domains/project/errors";
+import { BrowserGitProjectRepository } from "@/domains/project/browser-git-repository";
 import type {
   ClientToolRequest,
   ClientToolResult,
@@ -91,6 +93,23 @@ export function ProjectWorkspace({
   const [agentRevision, setAgentRevision] = useState(project.revision);
   const [clientToolRequest, setClientToolRequest] =
     useState<ClientToolRequest | null>(null);
+  const browserGitRepository = useMemo(
+    () =>
+      project.storageKind === "browser_git"
+        ? new BrowserGitProjectRepository(project)
+        : null,
+    [project],
+  );
+  const [repositoryReady, setRepositoryReady] = useState(
+    project.storageKind === "database",
+  );
+  const [repositoryUnavailable, setRepositoryUnavailable] = useState<
+    string | null
+  >(
+    project.status === "unavailable"
+      ? "当前浏览器中的本地仓库数据已经丢失。"
+      : null,
+  );
   const editorRef = useRef<editor.IStandaloneCodeEditor | null>(null);
   const stateRef = useRef(state);
   stateRef.current = state;
@@ -120,6 +139,55 @@ export function ProjectWorkspace({
     return () => window.removeEventListener("beforeunload", confirmUnload);
   }, []);
 
+  useEffect(() => {
+    const repository = browserGitRepository;
+
+    if (!repository) {
+      return;
+    }
+
+    let cancelled = false;
+
+    async function initializeBrowserRepository() {
+      setRepositoryReady(false);
+      setRepositoryUnavailable(null);
+      try {
+        await repository!.initialize();
+        const [files, gitState] = await Promise.all([
+          repository!.listFiles(),
+          repository!.getGitState(),
+        ]);
+
+        if (!cancelled) {
+          dispatch({
+            type: "reconcile",
+            files,
+            revision: gitState.revision,
+          });
+          setAgentRevision(gitState.revision);
+          setRepositoryReady(true);
+        }
+      } catch (error) {
+        if (!cancelled) {
+          const message =
+            error instanceof Error
+              ? error.message
+              : "Browser Git 仓库无法恢复。";
+          setRepositoryUnavailable(message);
+          dispatch({
+            type: "error",
+            message,
+          });
+        }
+      }
+    }
+
+    void initializeBrowserRepository();
+    return () => {
+      cancelled = true;
+    };
+  }, [browserGitRepository]);
+
   async function saveActiveFile() {
     const current = stateRef.current;
     const path = current.activePath;
@@ -131,6 +199,22 @@ export function ProjectWorkspace({
 
     dispatch({ type: "save-start" });
     try {
+      if (browserGitRepository) {
+        const result = await browserGitRepository.writeFile({
+          path,
+          content: file.draftContent,
+          expectedRevision: current.revision,
+        });
+        const savedFile = await browserGitRepository.readFile({ path });
+        dispatch({
+          type: "save-success",
+          path,
+          revision: result.revision,
+          file: savedFile,
+        });
+        return;
+      }
+
       const response = await fetch(`/api/projects/${project.id}/files`, {
         method: "POST",
         headers: { "content-type": "application/json" },
@@ -186,6 +270,20 @@ export function ProjectWorkspace({
 
   const refreshRepositorySnapshot = useCallback(async () => {
     try {
+      if (browserGitRepository) {
+        const [files, gitState] = await Promise.all([
+          browserGitRepository.listFiles(),
+          browserGitRepository.getGitState(),
+        ]);
+        dispatch({
+          type: "reconcile",
+          files,
+          revision: gitState.revision,
+        });
+        setAgentRevision(gitState.revision);
+        return;
+      }
+
       const [projectResponse, filesResponse] = await Promise.all([
         fetch(`/api/projects/${project.id}`, { cache: "no-store" }),
         fetch(`/api/projects/${project.id}/files`, { cache: "no-store" }),
@@ -216,7 +314,7 @@ export function ProjectWorkspace({
         message: "无法连接 Repository，本地草稿仍被保留。",
       });
     }
-  }, [project.id]);
+  }, [browserGitRepository, project.id]);
 
   function handleAgentRevisionChange(nextRevision: number) {
     setAgentRevision(nextRevision);
@@ -329,6 +427,22 @@ export function ProjectWorkspace({
 
     try {
       if (operation.mode === "create") {
+        if (browserGitRepository) {
+          const result = await browserGitRepository.writeFile({
+            path: value,
+            content: getInitialFileContent(value),
+            expectedRevision: current.revision,
+          });
+          const file = await browserGitRepository.readFile({ path: value });
+          dispatch({
+            type: "create-success",
+            revision: result.revision,
+            file,
+          });
+          setOperation(null);
+          return;
+        }
+
         const response = await fetch(`/api/projects/${project.id}/files`, {
           method: "POST",
           headers: { "content-type": "application/json" },
@@ -351,6 +465,23 @@ export function ProjectWorkspace({
           file: body.file,
         });
       } else if (operation.mode === "rename") {
+        if (browserGitRepository) {
+          const result = await browserGitRepository.renameFile({
+            fromPath: operation.path,
+            toPath: value,
+            expectedRevision: current.revision,
+          });
+          const file = await browserGitRepository.readFile({ path: value });
+          dispatch({
+            type: "rename-success",
+            fromPath: operation.path,
+            revision: result.revision,
+            file,
+          });
+          setOperation(null);
+          return;
+        }
+
         const response = await fetch(`/api/projects/${project.id}/files`, {
           method: "PATCH",
           headers: { "content-type": "application/json" },
@@ -374,6 +505,20 @@ export function ProjectWorkspace({
           file: body.file,
         });
       } else {
+        if (browserGitRepository) {
+          const result = await browserGitRepository.deleteFile({
+            path: operation.path,
+            expectedRevision: current.revision,
+          });
+          dispatch({
+            type: "delete-success",
+            path: operation.path,
+            revision: result.revision,
+          });
+          setOperation(null);
+          return;
+        }
+
         const query = new URLSearchParams({
           path: operation.path,
           expectedRevision: current.revision.toString(),
@@ -503,148 +648,185 @@ export function ProjectWorkspace({
         </div>
       </header>
 
-      <div className="workbench-grid">
-        <AgentPanel
-          dirtyPaths={dirtyPaths}
-          onClientToolRequest={handleClientToolRequest}
-          onRevisionChange={handleAgentRevisionChange}
-          onRestoreComplete={handleRestoreComplete}
-          projectId={project.id}
-          revision={agentRevision}
-        />
-        <section className="workspace workspace-ide">
-          <div className="ide-sidebar">
-            <div aria-label="Explorer" className="ide-panel-heading">
-              <span>
-                Explorer
-                <small>{Object.keys(state.files).length}</small>
-              </span>
-              <Tooltip>
-                <TooltipTrigger asChild>
-                  <Button
-                    aria-label="新建文件"
-                    onClick={() => setOperation({ mode: "create", path: "" })}
-                    size="icon-sm"
-                    variant="ghost"
-                  >
-                    <FilePlus2 />
-                  </Button>
-                </TooltipTrigger>
-                <TooltipContent>新建文件</TooltipContent>
-              </Tooltip>
-            </div>
-            <FileTree
-              activePath={state.activePath}
-              files={state.files}
-              onDelete={(path) => setOperation({ mode: "delete", path })}
-              onOpen={(path) => {
-                dispatch({ type: "open", path });
-                setView("code");
-              }}
-              onRename={(path) => setOperation({ mode: "rename", path })}
-            />
+      {!repositoryReady && !repositoryUnavailable ? (
+        <div className="workspace-repository-loading" role="status">
+          正在恢复浏览器仓库。源码和 Git 状态准备完成后才会显示。
+        </div>
+      ) : null}
+
+      {repositoryUnavailable ? (
+        <section className="workspace-repository-unavailable" role="alert">
+          <GitBranch />
+          <div>
+            <b>本地 Browser Git 仓库不可用</b>
+            <p>{repositoryUnavailable}</p>
+            <p>
+              WebPilot Studio 不会自动创建空仓库覆盖原项目。你仍可返回项目列表，
+              或前往 Source Control 查看可用的导出与恢复信息。
+            </p>
           </div>
-
-          <div className="ide-main">
-            <div className="ide-toolbar">
-              {view === "code" ? (
-                <>
-                  <EditorTabs
-                    activePath={state.activePath}
-                    files={state.files}
-                    onClose={closeFile}
-                    onSelect={(path) => dispatch({ type: "open", path })}
-                    openPaths={state.openPaths}
-                  />
-                  <div className="editor-actions">
-                    <Tooltip>
-                      <TooltipTrigger asChild>
-                        <Button
-                          aria-label="格式化当前文件"
-                          disabled={!activeFile}
-                          onClick={formatActiveFile}
-                          size="icon-sm"
-                          variant="ghost"
-                        >
-                          <WandSparkles />
-                        </Button>
-                      </TooltipTrigger>
-                      <TooltipContent>格式化当前文件</TooltipContent>
-                    </Tooltip>
-                    <Button
-                      disabled={
-                        !activeFile?.dirty || state.saveStatus === "saving"
-                      }
-                      onClick={saveActiveFile}
-                      size="sm"
-                    >
-                      <Save data-icon="inline-start" />
-                      {state.saveStatus === "saving" ? "Saving" : "Save"}
-                    </Button>
-                  </div>
-                </>
-              ) : (
-                <div className="preview-heading">
-                  <span>Live preview</span>
-                  <small>r{Math.max(state.revision, agentRevision)}</small>
-                </div>
-              )}
-            </div>
-
-            <div
-              className={cn("ide-surface", view === "preview" && "is-preview")}
-            >
-              {view === "code" ? (
-                activeFile ? (
-                  <CodeEditor
-                    file={activeFile}
-                    onChange={(content) =>
-                      dispatch({
-                        type: "edit",
-                        path: activeFile.path,
-                        content,
-                      })
-                    }
-                    onEditorReady={(editorInstance) => {
-                      editorRef.current = editorInstance;
-                    }}
-                    onSave={saveActiveFile}
-                  />
-                ) : (
-                  <div className="editor-empty">
-                    <Code2 />
-                    <span>从文件树中打开一个文件</span>
-                  </div>
-                )
-              ) : (
-                <WebContainerPreview
-                  clientToolRequest={clientToolRequest}
-                  files={repositoryFiles}
-                  onClientToolResult={handleClientToolResult}
-                  projectId={project.id}
-                  revision={state.revision}
-                />
-              )}
-            </div>
-
-            <footer
-              className={cn(
-                "workspace-statusbar",
-                state.saveStatus === "conflict" && "is-conflict",
-                state.saveStatus === "error" && "is-error",
-              )}
-            >
-              <span>
-                {state.statusMessage ||
-                  (dirtyPaths.length > 0
-                    ? `${dirtyPaths.length} 个文件未保存`
-                    : `Repository revision ${state.revision}`)}
-              </span>
-              {activeFile ? <span>{activeFile.path}</span> : null}
-            </footer>
-          </div>
+          <Button asChild variant="outline">
+            <Link href="/">返回项目列表</Link>
+          </Button>
         </section>
-      </div>
+      ) : (
+        <div className="workbench-grid">
+          {project.storageKind === "database" ? (
+            <AgentPanel
+              dirtyPaths={dirtyPaths}
+              onClientToolRequest={handleClientToolRequest}
+              onRevisionChange={handleAgentRevisionChange}
+              onRestoreComplete={handleRestoreComplete}
+              projectId={project.id}
+              revision={agentRevision}
+            />
+          ) : (
+            <aside className="agent-panel agent-panel-boundary">
+              <Bot />
+              <b>Browser Git Agent</b>
+              <p>
+                本地仓库 Agent 工具将在 7.4 接入。当前版本不会把源码回退到服务端
+                Database 执行。
+              </p>
+            </aside>
+          )}
+          <section className="workspace workspace-ide">
+            <div className="ide-sidebar">
+              <div aria-label="Explorer" className="ide-panel-heading">
+                <span>
+                  Explorer
+                  <small>{Object.keys(state.files).length}</small>
+                </span>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button
+                      aria-label="新建文件"
+                      onClick={() => setOperation({ mode: "create", path: "" })}
+                      size="icon-sm"
+                      variant="ghost"
+                    >
+                      <FilePlus2 />
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent>新建文件</TooltipContent>
+                </Tooltip>
+              </div>
+              <FileTree
+                activePath={state.activePath}
+                files={state.files}
+                onDelete={(path) => setOperation({ mode: "delete", path })}
+                onOpen={(path) => {
+                  dispatch({ type: "open", path });
+                  setView("code");
+                }}
+                onRename={(path) => setOperation({ mode: "rename", path })}
+              />
+            </div>
+
+            <div className="ide-main">
+              <div className="ide-toolbar">
+                {view === "code" ? (
+                  <>
+                    <EditorTabs
+                      activePath={state.activePath}
+                      files={state.files}
+                      onClose={closeFile}
+                      onSelect={(path) => dispatch({ type: "open", path })}
+                      openPaths={state.openPaths}
+                    />
+                    <div className="editor-actions">
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          <Button
+                            aria-label="格式化当前文件"
+                            disabled={!activeFile}
+                            onClick={formatActiveFile}
+                            size="icon-sm"
+                            variant="ghost"
+                          >
+                            <WandSparkles />
+                          </Button>
+                        </TooltipTrigger>
+                        <TooltipContent>格式化当前文件</TooltipContent>
+                      </Tooltip>
+                      <Button
+                        disabled={
+                          !activeFile?.dirty || state.saveStatus === "saving"
+                        }
+                        onClick={saveActiveFile}
+                        size="sm"
+                      >
+                        <Save data-icon="inline-start" />
+                        {state.saveStatus === "saving" ? "Saving" : "Save"}
+                      </Button>
+                    </div>
+                  </>
+                ) : (
+                  <div className="preview-heading">
+                    <span>Live preview</span>
+                    <small>r{Math.max(state.revision, agentRevision)}</small>
+                  </div>
+                )}
+              </div>
+
+              <div
+                className={cn(
+                  "ide-surface",
+                  view === "preview" && "is-preview",
+                )}
+              >
+                {view === "code" ? (
+                  activeFile ? (
+                    <CodeEditor
+                      file={activeFile}
+                      onChange={(content) =>
+                        dispatch({
+                          type: "edit",
+                          path: activeFile.path,
+                          content,
+                        })
+                      }
+                      onEditorReady={(editorInstance) => {
+                        editorRef.current = editorInstance;
+                      }}
+                      onSave={saveActiveFile}
+                    />
+                  ) : (
+                    <div className="editor-empty">
+                      <Code2 />
+                      <span>从文件树中打开一个文件</span>
+                    </div>
+                  )
+                ) : (
+                  <WebContainerPreview
+                    clientToolRequest={clientToolRequest}
+                    files={repositoryFiles}
+                    onClientToolResult={handleClientToolResult}
+                    projectId={project.id}
+                    revision={state.revision}
+                  />
+                )}
+              </div>
+
+              <footer
+                className={cn(
+                  "workspace-statusbar",
+                  state.saveStatus === "conflict" && "is-conflict",
+                  state.saveStatus === "error" && "is-error",
+                )}
+              >
+                <span>
+                  {state.statusMessage ||
+                    (dirtyPaths.length > 0
+                      ? `${dirtyPaths.length} 个文件未保存`
+                      : `Repository revision ${state.revision}`)}
+                </span>
+                {activeFile ? <span>{activeFile.path}</span> : null}
+              </footer>
+            </div>
+          </section>
+        </div>
+      )}
 
       {operation ? (
         <FileOperationDialog

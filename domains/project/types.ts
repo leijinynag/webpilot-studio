@@ -1,5 +1,5 @@
 export type ProjectStorageKind = "database" | "browser_git";
-export type ProjectStatus = "creating" | "ready" | "error";
+export type ProjectStatus = "creating" | "ready" | "unavailable" | "error";
 
 export type ProjectSummary = {
   id: string;

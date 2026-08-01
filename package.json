@@ -25,6 +25,7 @@
     "test:e2e:preview": "playwright test tests/e2e/preview-deployment.spec.ts --workers=1"
   },
   "dependencies": {
+    "@isomorphic-git/lightning-fs": "4.6.2",
     "@monaco-editor/react": "4.7.0",
     "@neondatabase/serverless": "1.1.0",
     "@vercel/blob": "2.6.1",
@@ -33,6 +34,7 @@
     "clsx": "2.1.1",
     "dotenv": "17.4.2",
     "drizzle-orm": "0.45.2",
+    "isomorphic-git": "1.36.2",
     "lucide-react": "1.26.0",
     "monaco-editor": "0.52.2",
     "next": "16.2.11",
@@ -63,6 +65,7 @@
     "eslint": "9.39.5",
     "eslint-config-next": "16.2.11",
     "eslint-config-prettier": "10.1.8",
+    "fake-indexeddb": "6.2.4",
     "jsdom": "29.1.1",
     "prettier": "3.9.6",
     "prettier-plugin-tailwindcss": "0.8.1",

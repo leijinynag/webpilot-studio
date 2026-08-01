@@ -25,6 +25,9 @@ type CreateProjectResponse = {
 export function NewProjectPage() {
   const router = useRouter();
   const [name, setName] = useState("Untitled project");
+  const [storageKind, setStorageKind] = useState<"database" | "browser_git">(
+    "database",
+  );
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -39,7 +42,7 @@ export function NewProjectPage() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           name,
-          storageKind: "database",
+          storageKind,
           template: "empty",
         }),
       });
@@ -87,7 +90,7 @@ export function NewProjectPage() {
         <div className="form-heading">
           <div>
             <h2 className="font-editorial">Project setup</h2>
-            <p>当前版本使用数据库持久化，Browser Git 将在后续里程碑接入。</p>
+            <p>选择一种 Repository。Browser Git 只保存在当前浏览器中。</p>
           </div>
           <Button
             aria-label="关闭新建项目"
@@ -121,8 +124,11 @@ export function NewProjectPage() {
           <span className="field-label">Repository</span>
           <div className="storage-options">
             <button
-              aria-pressed="true"
-              className="storage-option active"
+              aria-pressed={storageKind === "database"}
+              className={`storage-option ${
+                storageKind === "database" ? "active" : ""
+              }`}
+              onClick={() => setStorageKind("database")}
               type="button"
             >
               <div className="storage-option-head">
@@ -135,9 +141,11 @@ export function NewProjectPage() {
               <p>代码保存在 PostgreSQL，刷新和跨会话访问时可恢复当前项目。</p>
             </button>
             <button
-              aria-disabled="true"
-              className="storage-option unavailable"
-              disabled
+              aria-pressed={storageKind === "browser_git"}
+              className={`storage-option ${
+                storageKind === "browser_git" ? "active" : ""
+              }`}
+              onClick={() => setStorageKind("browser_git")}
               type="button"
             >
               <div className="storage-option-head">
@@ -145,9 +153,11 @@ export function NewProjectPage() {
                   <GitBranch />
                   Browser Git
                 </b>
-                <span className="storage-coming-soon">Coming later</span>
+                <span className="storage-coming-soon">Local only</span>
               </div>
-              <p>浏览器内完整 Git 暂存、提交、历史和分支将在后续里程碑开放。</p>
+              <p>
+                完整 Git 暂存、提交和历史保存在当前浏览器，清理站点数据会丢失。
+              </p>
             </button>
           </div>
         </div>

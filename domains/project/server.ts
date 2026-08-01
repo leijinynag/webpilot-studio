@@ -34,17 +34,17 @@ export async function loadOwnedProject(
   const repository = getProjectRepository();
 
   try {
-    const projectPromise = repository.describe({
+    const project = await repository.describe({
       ownerId,
       projectId: parsedParams.data.projectId,
     });
-    const filesPromise = options.includeFiles
-      ? repository.listFiles({
-          ownerId,
-          projectId: parsedParams.data.projectId,
-        })
-      : Promise.resolve([]);
-    const [project, files] = await Promise.all([projectPromise, filesPromise]);
+    const files =
+      options.includeFiles && project.storageKind === "database"
+        ? await repository.listFiles({
+            ownerId,
+            projectId: parsedParams.data.projectId,
+          })
+        : [];
 
     return { project, files };
   } catch (error) {

@@ -53,4 +53,14 @@ export const fileMutationRequestSchema = z
   })
   .strict();
 
+export const browserGitProvisionRequestSchema = z.discriminatedUnion("action", [
+  z.object({ action: z.literal("claim") }).strict(),
+  z
+    .object({
+      action: z.literal("unavailable"),
+      reason: z.string().trim().min(1).max(500),
+    })
+    .strict(),
+]);
+
 export type CreateProjectRequest = z.infer<typeof createProjectRequestSchema>;

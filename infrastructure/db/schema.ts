@@ -23,6 +23,7 @@ export const projectStorageKind = pgEnum("project_storage_kind", [
 export const projectStatus = pgEnum("project_status", [
   "creating",
   "ready",
+  "unavailable",
   "error",
 ]);
 
