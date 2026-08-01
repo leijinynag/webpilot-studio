@@ -3,11 +3,13 @@
 import Link from "next/link";
 import { useEffect, useMemo, useState } from "react";
 import {
+  Ban,
   Check,
   Download,
   ExternalLink,
   LoaderCircle,
   LockKeyhole,
+  RefreshCw,
   Send,
   Smartphone,
 } from "lucide-react";
@@ -59,6 +61,15 @@ export function PublishPage({
   );
   const [publishCoverUrl, setPublishCoverUrl] = useState("");
   const [publishSortOrder, setPublishSortOrder] = useState("0");
+  const [publishCaseId, setPublishCaseId] = useState<string | null>(null);
+  const [adminCandidates, setAdminCandidates] = useState<ShowcaseAdminCase[]>(
+    [],
+  );
+  const [candidateState, setCandidateState] = useState<CandidateState>({
+    phase: "idle",
+    message: "尚未加载候选案例",
+    detail: "",
+  });
   const [publishState, setPublishState] = useState<PublishState>({
     phase: "idle",
     message: "等待管理员发布",
@@ -220,6 +231,7 @@ export function PublishPage({
           "x-showcase-admin-token": adminToken.trim(),
         },
         body: JSON.stringify({
+          caseId: publishCaseId ?? undefined,
           projectId: project.id,
           title: publishTitle.trim(),
           slug: publishSlug.trim(),
@@ -236,7 +248,7 @@ export function PublishPage({
         }),
       });
       const body = (await response.json().catch(() => ({}))) as {
-        case?: { slug: string };
+        case?: { id: string; projectId: string | null; slug: string };
         error?: { message?: string };
       };
 
@@ -249,12 +261,143 @@ export function PublishPage({
         message: "Showcase 已发布",
         detail: `公开地址：/showcase/${body.case.slug}`,
       });
+      setPublishCaseId(body.case.id);
+      setCandidateState((current) => ({
+        ...current,
+        message: "候选案例已更新",
+      }));
     } catch (error) {
       setPublishState({
         phase: "failed",
         message: "Showcase 发布失败",
         detail:
           error instanceof Error ? error.message : "请检查管理 token 后重试。",
+      });
+    }
+  }
+
+  async function handleLoadCandidates() {
+    const token = adminToken.trim();
+    if (!adminMode || !token) {
+      setCandidateState({
+        phase: "blocked",
+        message: "需要管理员 token",
+        detail: "候选案例接口不会接受匿名请求。",
+      });
+      return;
+    }
+
+    setCandidateState({
+      phase: "loading",
+      message: "正在读取管理员候选",
+      detail: "只读取发布元数据，不读取其他项目源码。",
+    });
+
+    try {
+      const response = await fetch("/api/showcase/admin/candidates", {
+        headers: {
+          "x-showcase-admin-token": token,
+        },
+        cache: "no-store",
+      });
+      const body = (await response.json().catch(() => ({}))) as {
+        cases?: ShowcaseAdminCase[];
+        error?: { message?: string };
+      };
+
+      if (!response.ok || !body.cases) {
+        throw new Error(body.error?.message ?? "管理员候选读取失败。");
+      }
+
+      setAdminCandidates(body.cases);
+      const currentCase = body.cases.find(
+        (item) => item.projectId === project.id,
+      );
+
+      if (currentCase) {
+        setPublishCaseId(currentCase.id);
+        setPublishTitle(currentCase.title);
+        setPublishSlug(currentCase.slug);
+        setPublishDescription(currentCase.description ?? "");
+        setPublishCoverUrl(currentCase.coverUrl ?? "");
+        setPublishSortOrder(String(currentCase.sortOrder));
+      } else {
+        setPublishCaseId(null);
+      }
+
+      setCandidateState({
+        phase: "success",
+        message: currentCase
+          ? "已找到当前项目的 Showcase 案例"
+          : "已加载候选案例",
+        detail: `${body.cases.length} 个案例可管理。`,
+      });
+    } catch (error) {
+      setCandidateState({
+        phase: "failed",
+        message: "候选案例读取失败",
+        detail:
+          error instanceof Error
+            ? error.message
+            : "请检查管理员 token 后重试。",
+      });
+    }
+  }
+
+  async function handleRevoke() {
+    if (!publishCaseId || !adminToken.trim()) {
+      setCandidateState({
+        phase: "blocked",
+        message: "暂时不能撤销",
+        detail: "请先加载当前项目的 Showcase 案例。",
+      });
+      return;
+    }
+
+    setCandidateState({
+      phase: "loading",
+      message: "正在撤销 Showcase",
+      detail: "撤销后，公开列表、详情页和 Runtime 会立即停止新增访问。",
+    });
+
+    try {
+      const response = await fetch(
+        `/api/showcase/admin/${publishCaseId}/revoke`,
+        {
+          method: "POST",
+          headers: {
+            "x-showcase-admin-token": adminToken.trim(),
+          },
+        },
+      );
+      const body = (await response.json().catch(() => ({}))) as {
+        error?: { message?: string };
+      };
+
+      if (!response.ok) {
+        throw new Error(body.error?.message ?? "Showcase 撤销失败。");
+      }
+
+      setAdminCandidates((current) =>
+        current.map((item) =>
+          item.id === publishCaseId
+            ? { ...item, status: "revoked", artifact: null }
+            : item,
+        ),
+      );
+      setCandidateState({
+        phase: "success",
+        message: "Showcase 已撤销",
+        detail: "重新发布时会创建新的不可变 artifact。",
+      });
+    } catch (error) {
+      setCandidateState({
+        phase: "failed",
+        message: "Showcase 撤销失败",
+        detail:
+          error instanceof Error
+            ? error.message
+            : "请检查管理员 token 后重试。",
       });
     }
   }
@@ -391,14 +534,33 @@ export function PublishPage({
                 <label className="field-label" htmlFor="showcase-admin-token">
                   Admin token
                 </label>
-                <input
-                  className="field"
-                  id="showcase-admin-token"
-                  onChange={(event) => setAdminToken(event.target.value)}
-                  placeholder="仅本次请求使用"
-                  type="password"
-                  value={adminToken}
-                />
+                <div className="admin-token-row">
+                  <input
+                    className="field"
+                    id="showcase-admin-token"
+                    onChange={(event) => setAdminToken(event.target.value)}
+                    placeholder="仅本次请求使用"
+                    type="password"
+                    value={adminToken}
+                  />
+                  <Button
+                    aria-label="加载 Showcase 候选"
+                    className="app-button-quiet"
+                    disabled={
+                      candidateState.phase === "loading" ||
+                      adminToken.trim().length === 0
+                    }
+                    onClick={() => void handleLoadCandidates()}
+                    size="icon"
+                    title="加载 Showcase 候选"
+                  >
+                    {candidateState.phase === "loading" ? (
+                      <LoaderCircle className="animate-spin" />
+                    ) : (
+                      <RefreshCw />
+                    )}
+                  </Button>
+                </div>
               </div>
             </>
           ) : null}
@@ -492,6 +654,66 @@ export function PublishPage({
               <b>{publishState.message}</b>
               <span>{publishState.detail}</span>
             </div>
+            <div className="publish-build-feedback" role="status">
+              <b>{candidateState.message}</b>
+              <span>{candidateState.detail}</span>
+            </div>
+            {adminCandidates.length > 0 ? (
+              <div className="showcase-candidate-list">
+                <div className="showcase-candidate-list-head">
+                  <span>Candidate cases</span>
+                  <small>{adminCandidates.length} total</small>
+                </div>
+                {adminCandidates.map((item) => (
+                  <button
+                    className={`showcase-candidate ${
+                      item.id === publishCaseId ? "is-selected" : ""
+                    }`}
+                    disabled={item.projectId !== project.id}
+                    key={item.id}
+                    onClick={() => {
+                      if (item.projectId !== project.id) {
+                        return;
+                      }
+                      setPublishCaseId(item.id);
+                      setPublishTitle(item.title);
+                      setPublishSlug(item.slug);
+                      setPublishDescription(item.description ?? "");
+                      setPublishCoverUrl(item.coverUrl ?? "");
+                      setPublishSortOrder(String(item.sortOrder));
+                    }}
+                    type="button"
+                  >
+                    <span>
+                      <b>{item.title}</b>
+                      <small>
+                        {item.status} · {item.slug}
+                      </small>
+                    </span>
+                    <span className="showcase-candidate-revision">
+                      {item.artifact
+                        ? `r${item.artifact.sourceRevision}`
+                        : "no artifact"}
+                    </span>
+                  </button>
+                ))}
+              </div>
+            ) : null}
+            {publishCaseId ? (
+              <Button
+                className="app-button-danger"
+                disabled={
+                  candidateState.phase === "loading" ||
+                  publishState.phase === "publishing"
+                }
+                onClick={() => void handleRevoke()}
+                size="sm"
+                variant="outline"
+              >
+                <Ban data-icon="inline-start" />
+                Revoke current Showcase
+              </Button>
+            ) : null}
           </div>
         ) : null}
         <Link className="back-to-workbench" href={`/p/${project.id}`}>
@@ -647,3 +869,23 @@ function CheckRow({ label, value }: { label: string; value: string }) {
     </div>
   );
 }
+
+type ShowcaseAdminCase = {
+  id: string;
+  projectId: string | null;
+  title: string;
+  slug: string;
+  description: string | null;
+  coverUrl: string | null;
+  sortOrder: number;
+  status: "draft" | "published" | "revoked";
+  artifact: {
+    sourceRevision: number;
+  } | null;
+};
+
+type CandidateState = {
+  phase: "idle" | "loading" | "success" | "failed" | "blocked";
+  message: string;
+  detail: string;
+};
