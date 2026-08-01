@@ -1,7 +1,9 @@
 # Showcase Runtime Vercel 部署
 
-Showcase Runtime 使用同一份仓库代码部署为第二个 Vercel Project，例如
-`webpilot-showcase`。它只对外提供 `/showcase/runtime/:artifactId/*`，
+Showcase Runtime 使用同一份仓库代码部署为第二个 Vercel Project：
+`webpilot-showcase`，生产域名为
+`https://webpilot-showcase.vercel.app`。它只对外提供
+`/showcase/runtime/:artifactId/*`，
 主站通过 `SHOWCASE_ORIGIN` 把详情页 iframe 指向该独立域名。
 
 ## Runtime 环境变量
@@ -52,6 +54,10 @@ host-only Cookie 发送到 Runtime。
    `SHOWCASE_RUNTIME_ONLY=true`。
 4. 将 `SHOWCASE_ORIGIN` 指向第二个 Project 的独立域名，再分别部署 Preview 和
    Production。
+
+当前 Production 部署已完成，别名为
+`https://webpilot-showcase.vercel.app`。部署检查地址和项目配置保留在
+Vercel Project 中，文档不记录任何数据库、Blob 或管理密钥。
 
 Runtime Project 的数据库角色只授予 Showcase 两张表的读取权限，Blob token
 只用于 `get()`；主站的 LLM、队列、Redis、匿名会话和管理员 token 不复制过去。
