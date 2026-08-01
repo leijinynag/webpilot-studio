@@ -49,6 +49,7 @@ export const serverEnvSchema = z
     REDIS_TOKEN: optionalString,
     SHOWCASE_ADMIN_TOKEN: optionalString,
     SHOWCASE_ORIGIN: optionalUrl,
+    SHOWCASE_PARENT_ORIGIN: optionalUrl,
     AGENT_ENABLED: optionalBoolean,
     IMAGE_GENERATION_ENABLED: optionalBoolean,
     ATTACHMENT_UPLOAD_ENABLED: optionalBoolean,

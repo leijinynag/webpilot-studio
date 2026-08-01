@@ -1,35 +1,13 @@
 import { ArrowUpRight } from "lucide-react";
+import Link from "next/link";
 
-const showcasePieces = [
-  {
-    title: "Still / Objects",
-    detail: "Editorial commerce · by Guest Builder",
-    className: "objects featured",
-    windowTitle: "Objects for slower days.",
-  },
-  {
-    title: "Atlas Finance",
-    detail: "Dashboard",
-    className: "finance",
-  },
-  {
-    title: "Northwind Notes",
-    detail: "Writing tool",
-    className: "notes",
-  },
-  {
-    title: "Studio Archive",
-    detail: "Portfolio",
-    className: "gallery",
-  },
-  {
-    title: "Quiet Routes",
-    detail: "Travel journal",
-    className: "travel",
-  },
-] as const;
+import type { ShowcaseCaseView } from "@/infrastructure/showcase/repository";
 
-export function ShowcasePage() {
+export function ShowcasePage({
+  cases,
+}: {
+  cases: ShowcaseCaseView[];
+}) {
   return (
     <div className="showcase-page page-in">
       <div className="showcase-head">
@@ -55,34 +33,46 @@ export function ShowcasePage() {
         </div>
       </div>
 
-      <div className="showcase-grid">
-        {showcasePieces.map((piece) => (
-          <article
-            className={`showcase-piece ${piece.className}`}
-            key={piece.title}
-          >
-            <div className={`piece-art ${piece.className.split(" ")[0]}`}>
-              <div className="piece-window">
-                {"windowTitle" in piece ? (
-                  <div>
-                    <span>THE NEW COLLECTION</span>
-                    <h3>{piece.windowTitle}</h3>
+      {cases.length === 0 ? (
+        <div className="showcase-empty">
+          <b>还没有公开案例</b>
+          <span>完成构建并发布后，作品会出现在这里。</span>
+        </div>
+      ) : (
+        <div className="showcase-grid">
+          {cases.map((item) => (
+            <Link
+              className="showcase-piece"
+              href={`/showcase/${item.slug}`}
+              key={item.id}
+            >
+              <div className="piece-art">
+                {item.coverUrl ? (
+                  // 封面来自管理员发布元数据，Runtime 仍然只负责 artifact。
+                  // 这里不使用 next/image，因为封面域名由管理员配置，不能把任意
+                  // 公开域名加入主站的图片优化白名单。
+                  // eslint-disable-next-line @next/next/no-img-element
+                  <img alt="" src={item.coverUrl} />
+                ) : (
+                  <div className="piece-window">
+                    <span>WEBPILOT SHOWCASE</span>
+                    <h3>{item.title}</h3>
                   </div>
-                ) : null}
+                )}
               </div>
-            </div>
-            <div className="piece-info">
-              <div>
-                <b>{piece.title}</b>
-                <span>{piece.detail}</span>
+              <div className="piece-info">
+                <div>
+                  <b>{item.title}</b>
+                  <span>{item.description ?? "Web project"}</span>
+                </div>
+                <span className="piece-arrow">
+                  <ArrowUpRight />
+                </span>
               </div>
-              <span className="piece-arrow">
-                <ArrowUpRight />
-              </span>
-            </div>
-          </article>
-        ))}
-      </div>
+            </Link>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

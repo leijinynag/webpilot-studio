@@ -18,6 +18,7 @@ import {
 } from "@/infrastructure/db/schema";
 import {
   normalizeArtifactPath,
+  sha256Hex,
   type ShowcaseArtifactManifest,
 } from "@/infrastructure/showcase/artifact";
 
@@ -135,7 +136,7 @@ export async function publishShowcaseArtifact(
   const blobPrefix = `showcase/${artifactId}`;
   const uploadedUrls: string[] = [];
 
-  validatePublishInput(input);
+  await validatePublishInput(input);
 
   try {
     for (const file of input.files) {
@@ -333,7 +334,7 @@ export async function readPublishedArtifactFile(
   };
 }
 
-function validatePublishInput(input: ShowcasePublishInput): void {
+async function validatePublishInput(input: ShowcasePublishInput): Promise<void> {
   if (input.sourceRevision < 0 || !Number.isInteger(input.sourceRevision)) {
     throw new Error("sourceRevision 必须是非负整数。");
   }
@@ -342,13 +343,48 @@ function validatePublishInput(input: ShowcasePublishInput): void {
     throw new Error("artifact 文件与 manifest 数量不一致。");
   }
 
-  const manifestFiles = new Map(input.manifest.files.map((file) => [file.path, file]));
+  const manifestFiles = new Map<
+    string,
+    ShowcaseArtifactManifest["files"][number]
+  >();
+  let manifestTotalBytes = 0;
+
+  for (const manifestFile of input.manifest.files) {
+    const path = normalizeArtifactPath(manifestFile.path);
+    if (manifestFiles.has(path)) {
+      throw new Error(`manifest 中存在重复文件：${path}`);
+    }
+
+    manifestFiles.set(path, manifestFile);
+    manifestTotalBytes += manifestFile.byteLength;
+  }
+
+  if (manifestTotalBytes !== input.manifest.totalBytes) {
+    throw new Error("artifact manifest 的 totalBytes 不正确。");
+  }
+
+  let actualTotalBytes = 0;
   for (const file of input.files) {
     const path = normalizeArtifactPath(file.path);
     const manifestFile = manifestFiles.get(path);
-    if (!manifestFile || manifestFile.hash !== file.hash) {
+    if (
+      !manifestFile ||
+      manifestFile.hash !== file.hash ||
+      manifestFile.byteLength !== file.content.byteLength
+    ) {
       throw new Error(`artifact 文件 hash 与 manifest 不一致：${path}`);
     }
+
+    const actualHash = await sha256Hex(file.content);
+    if (actualHash !== manifestFile.hash.toLowerCase()) {
+      throw new Error(`artifact 文件内容 hash 校验失败：${path}`);
+    }
+
+    actualTotalBytes += file.content.byteLength;
+  }
+
+  if (actualTotalBytes !== input.manifest.totalBytes) {
+    throw new Error("artifact 文件实际大小与 manifest 不一致。");
   }
 }
 

@@ -12,6 +12,12 @@ import {
  * API Route 仍会独立验证 Cookie；Proxy 不是授权边界，只负责尽早建立会话。
  */
 export function proxy(request: NextRequest) {
+  // Showcase Runtime 使用独立域名部署，不需要匿名 owner 身份。主站 host-only
+  // Cookie 不会跨域发送，这里也不在 Runtime 域名额外签发无意义的会话 Cookie。
+  if (request.nextUrl.pathname.startsWith("/showcase/runtime/")) {
+    return NextResponse.next();
+  }
+
   const cookieName = getAnonymousSessionCookieName();
   const existing = verifyAnonymousSession(
     request.cookies.get(cookieName)?.value,

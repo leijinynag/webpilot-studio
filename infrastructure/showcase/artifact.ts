@@ -134,7 +134,7 @@ export async function createShowcaseArtifact(
   };
 }
 
-async function sha256Hex(value: Uint8Array): Promise<string> {
+export async function sha256Hex(value: Uint8Array): Promise<string> {
   // DOM 的 BufferSource 类型在不同 TypeScript 版本中对 SharedArrayBuffer
   // 的兼容范围不同。复制到普通 ArrayBuffer 后，浏览器和 Node 的 Web Crypto
   // 都能接受同一份确定输入。

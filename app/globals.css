@@ -2778,6 +2778,143 @@ html[data-theme="dark"] .piece-art.travel {
   transform: rotate(7deg);
 }
 
+.piece-art > img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.showcase-empty {
+  display: grid;
+  min-height: 300px;
+  place-items: center;
+  align-content: center;
+  gap: 8px;
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius-panel);
+  color: var(--muted-foreground);
+  text-align: center;
+}
+
+.showcase-empty b {
+  color: var(--foreground);
+  font-family: var(--font-editorial), Georgia, serif;
+  font-size: 1.2rem;
+  font-weight: 400;
+}
+
+.showcase-empty span {
+  font-size: 0.66rem;
+}
+
+.showcase-detail {
+  min-height: 749px;
+  padding: 30px 38px 38px;
+  background: var(--surface);
+}
+
+.showcase-detail-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 38px;
+}
+
+.showcase-detail-head .back-to-workbench {
+  margin-top: 0;
+  padding-top: 0;
+}
+
+.showcase-detail-head .back-to-workbench svg,
+.showcase-runtime-link svg {
+  width: 14px;
+  height: 14px;
+}
+
+.showcase-detail-hero {
+  display: grid;
+  grid-template-columns: minmax(230px, 0.32fr) minmax(0, 0.68fr);
+  gap: 28px;
+  min-height: 620px;
+  margin-top: 22px;
+}
+
+.showcase-detail-copy {
+  display: flex;
+  align-items: flex-start;
+  flex-direction: column;
+  padding: 28px 0;
+}
+
+.showcase-detail-title {
+  max-width: 500px;
+  margin: 0;
+  font-size: clamp(2.8rem, 5vw, 4.7rem);
+  line-height: 0.92;
+  overflow-wrap: anywhere;
+}
+
+.showcase-detail-copy > p {
+  max-width: 390px;
+  margin: 24px 0 0;
+  color: var(--muted-foreground);
+  font-size: 0.72rem;
+  line-height: 1.7;
+}
+
+.showcase-detail-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 24px;
+}
+
+.showcase-detail-meta span {
+  padding: 5px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-compact);
+  color: var(--muted-foreground);
+  font-size: 0.52rem;
+}
+
+.showcase-runtime-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  margin-top: auto;
+  padding: 9px 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-compact);
+  color: var(--foreground);
+  font-size: 0.62rem;
+  transition:
+    border-color var(--duration-state) var(--ease-out),
+    background-color var(--duration-state) var(--ease-out);
+}
+
+.showcase-runtime-link:hover {
+  border-color: var(--accent);
+  background: var(--surface-2);
+}
+
+.showcase-detail-preview {
+  overflow: hidden;
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-panel);
+  background: var(--surface-2);
+  box-shadow: var(--shadow-panel);
+}
+
+.showcase-runtime-frame {
+  display: block;
+  width: 100%;
+  height: 100%;
+  min-height: 620px;
+  border: 0;
+  background: white;
+}
+
 /* 06 Publish：左侧是确认预览，右侧是可审阅的发布元数据。 */
 .publish-page {
   display: grid;
@@ -3172,6 +3309,23 @@ html[data-theme="dark"] .piece-art.travel {
     gap: 20px;
   }
 
+  .showcase-detail-hero {
+    grid-template-columns: 1fr;
+  }
+
+  .showcase-detail-copy {
+    min-height: 300px;
+  }
+
+  .showcase-runtime-link {
+    margin-top: 28px;
+  }
+
+  .showcase-detail-preview,
+  .showcase-runtime-frame {
+    min-height: 520px;
+  }
+
   .showcase-grid {
     grid-template-columns: 1fr 1fr;
     grid-template-rows: 260px 200px 200px;
@@ -3210,6 +3364,7 @@ html[data-theme="dark"] .piece-art.travel {
   .create-form,
   .projects-aside,
   .showcase-page,
+  .showcase-detail,
   .publish-settings,
   .publish-preview {
     padding-right: 18px;
@@ -3277,11 +3432,21 @@ html[data-theme="dark"] .piece-art.travel {
 
   .showcase-grid {
     grid-template-columns: 1fr;
-    grid-template-rows: 300px repeat(4, 190px);
+    grid-auto-rows: 220px;
+    grid-template-rows: none;
   }
 
   .showcase-piece.featured {
     grid-row: auto;
+  }
+
+  .showcase-detail-title {
+    font-size: 3rem;
+  }
+
+  .showcase-detail-preview,
+  .showcase-runtime-frame {
+    min-height: 440px;
   }
 
   .publish-form-grid {
