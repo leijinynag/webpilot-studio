@@ -136,6 +136,27 @@ describe("WebContainerRuntimeManager", () => {
     });
   });
 
+  it("显式执行 production build 并读取 dist 生成 Showcase artifact", async () => {
+    const runtime = new FakeWebContainer();
+    const manager = new WebContainerRuntimeManager({
+      boot: async () => runtime,
+      isCrossOriginIsolated: () => true,
+      productionBuildTimeoutMs: 1_000,
+    });
+
+    const result = await manager.buildProduction(
+      { "package.json": { file: { contents: "{}" } } },
+      "project-a",
+      4,
+    );
+
+    expect(result.manifest.entryPath).toBe("index.html");
+    expect(result.manifest.files).toHaveLength(1);
+    expect(runtime.calls).toContain("npm run build");
+    expect(runtime.calls).toContain("readdir:dist");
+    expect(runtime.calls).toContain("read:dist/index.html");
+  });
+
   it("相同 revision 的不同运行镜像 key 仍会触发同步", async () => {
     const runtime = new FakeWebContainer();
     const manager = new WebContainerRuntimeManager({

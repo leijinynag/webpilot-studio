@@ -14,6 +14,8 @@ import {
   WEBPILOT_PREVIEW_PORT,
   WEBPILOT_RSBUILD_TEMPLATE,
 } from "@/infrastructure/webcontainer/project-template";
+import type { ShowcaseArtifact } from "@/infrastructure/showcase/artifact";
+import { createShowcaseArtifact } from "@/infrastructure/showcase/artifact";
 
 type RuntimeListener = () => void;
 type ServerReadyListener = (port: number, url: string) => void;
@@ -30,6 +32,11 @@ export type WebContainerAdapter = {
   spawn(command: string, args: string[]): Promise<WebContainerProcessAdapter>;
   on(event: "server-ready", listener: ServerReadyListener): () => void;
   fs: {
+    readdir(
+      path: string,
+      options: { withFileTypes: true },
+    ): Promise<Array<{ name: string; isDirectory(): boolean }>>;
+    readFile(path: string): Promise<Uint8Array>;
     mkdir(path: string, options: { recursive: true }): Promise<string>;
     rename(oldPath: string, newPath: string): Promise<void>;
     rm(
@@ -48,6 +55,12 @@ export type WebContainerRuntimeDependencies = {
   isCrossOriginIsolated: () => boolean;
   installTimeoutMs?: number;
   serverReadyTimeoutMs?: number;
+  productionBuildTimeoutMs?: number;
+};
+
+export type ProductionBuildResult = ShowcaseArtifact & {
+  buildDurationMs: number;
+  logs: string[];
 };
 
 // 日志属于高频状态，必须设置上限，避免长时间运行后 snapshot 无限增长并拖慢 React 更新。
@@ -150,6 +163,8 @@ export class WebContainerRuntimeManager {
         dependencies?.isCrossOriginIsolated ?? isBrowserCrossOriginIsolated,
       installTimeoutMs: dependencies?.installTimeoutMs ?? 180_000,
       serverReadyTimeoutMs: dependencies?.serverReadyTimeoutMs ?? 120_000,
+      productionBuildTimeoutMs:
+        dependencies?.productionBuildTimeoutMs ?? 180_000,
     };
   }
 
@@ -265,6 +280,75 @@ export class WebContainerRuntimeManager {
     );
 
     return queuedSync;
+  }
+
+  /**
+   * 生产构建是发布动作的一部分，只有 Publish 页面显式调用才会执行。
+   * 构建前复用当前项目的 boot/mount/install 结果，随后停止常驻 dev server，
+   * 读取 dist 文件并交给 Showcase artifact 层打包。
+   */
+  async buildProduction(
+    tree: FileSystemTree = WEBPILOT_RSBUILD_TEMPLATE,
+    projectKey = "default-template",
+    revision: number | null = null,
+    runtimeKey = `production:${revision ?? "unknown"}`,
+  ): Promise<ProductionBuildResult> {
+    await this.start(tree, projectKey, revision, runtimeKey);
+
+    if (!this.instance || this.activeProjectKey !== projectKey) {
+      throw new WebContainerRuntimeError(
+        "dev_server_failed",
+        "生产构建没有可用的 WebContainer 实例。",
+      );
+    }
+
+    const buildStartedAt = Date.now();
+    const buildLogs: string[] = [];
+    this.devProcess?.kill();
+    this.devProcess = null;
+    this.appendLog("[build] 停止开发服务器，开始 production build...");
+
+    const process = await this.instance.spawn("npm", ["run", "build"]);
+    const outputPromise = this.consumeProcessOutput(
+      process,
+      "build",
+      this.generation,
+      buildLogs,
+    );
+    const exitCode = await withTimeout(
+      process.exit,
+      this.dependencies.productionBuildTimeoutMs,
+      () =>
+        new WebContainerRuntimeError(
+          "dev_server_failed",
+          "生产构建超时，未能生成可发布产物。",
+          {
+            detail: `npm run build 在 ${this.dependencies.productionBuildTimeoutMs}ms 内未退出。`,
+          },
+        ),
+    );
+
+    await Promise.race([outputPromise, delayMilliseconds(500)]);
+
+    if (exitCode !== 0) {
+      throw new WebContainerRuntimeError(
+        "dev_server_failed",
+        `生产构建失败，退出码 ${exitCode}。`,
+        { detail: buildLogs.at(-1) },
+      );
+    }
+
+    const outputFiles = await readDirectoryTree(this.instance, "dist");
+    const artifact = await createShowcaseArtifact(outputFiles);
+    this.appendLog(
+      `[build] production build 完成，共 ${artifact.manifest.files.length} 个文件。`,
+    );
+
+    return {
+      ...artifact,
+      buildDurationMs: Date.now() - buildStartedAt,
+      logs: buildLogs,
+    };
   }
 
   private async performSyncRevision(
@@ -699,8 +783,9 @@ export class WebContainerRuntimeManager {
 
   private async consumeProcessOutput(
     process: WebContainerProcessAdapter,
-    source: "install" | "dev",
+    source: "install" | "dev" | "build",
     generation: number,
+    collectedLogs?: string[],
   ): Promise<void> {
     try {
       await process.output.pipeTo(
@@ -721,6 +806,7 @@ export class WebContainerRuntimeManager {
                   value.length > 0 && !NPM_SPINNER_LINE_PATTERN.test(value),
               )) {
               this.appendLog(`[${source}] ${line}`);
+              collectedLogs?.push(line);
               if (source === "dev") {
                 this.captureForwardedPreviewError(line);
               }
@@ -834,6 +920,32 @@ function flattenRuntimeTree(
 
 function delayMilliseconds(milliseconds: number): Promise<void> {
   return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
+}
+
+async function readDirectoryTree(
+  instance: WebContainerAdapter,
+  directory: string,
+  parentPath = "",
+  files: Array<{ path: string; content: Uint8Array }> = [],
+): Promise<Array<{ path: string; content: Uint8Array }>> {
+  const entries = await instance.fs.readdir(directory, { withFileTypes: true });
+
+  for (const entry of entries) {
+    const relativePath = parentPath ? `${parentPath}/${entry.name}` : entry.name;
+    const absolutePath = `${directory}/${relativePath}`;
+
+    if (entry.isDirectory()) {
+      await readDirectoryTree(instance, directory, relativePath, files);
+      continue;
+    }
+
+    files.push({
+      path: relativePath,
+      content: await instance.fs.readFile(absolutePath),
+    });
+  }
+
+  return files;
 }
 
 function withTimeout<T>(

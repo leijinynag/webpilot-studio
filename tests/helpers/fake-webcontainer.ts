@@ -43,6 +43,21 @@ export class FakeWebContainer implements WebContainerAdapter {
   private serverReadyListener: ((port: number, url: string) => void) | null =
     null;
   readonly fs = {
+    readdir: async (
+      path: string,
+      options: { withFileTypes: true },
+    ): Promise<Array<{ name: string; isDirectory(): boolean }>> => {
+      void options;
+      this.calls.push(`readdir:${path}`);
+      if (path === "dist") {
+        return [{ name: "index.html", isDirectory: () => false }];
+      }
+      return [];
+    },
+    readFile: async (path: string): Promise<Uint8Array> => {
+      this.calls.push(`read:${path}`);
+      return new TextEncoder().encode("<html><body>built</body></html>");
+    },
     mkdir: async (path: string) => {
       this.calls.push(`mkdir:${path}`);
       return path;
@@ -66,7 +81,9 @@ export class FakeWebContainer implements WebContainerAdapter {
   async spawn(
     command: string,
     args: string[],
+    options?: Record<string, unknown>,
   ): Promise<WebContainerProcessAdapter> {
+    void options;
     const invocation = `${command} ${args.join(" ")}`;
     this.calls.push(invocation);
 
@@ -78,17 +95,23 @@ export class FakeWebContainer implements WebContainerAdapter {
       ]);
     }
 
-    const process = new FakeWebContainerProcess(0, ["dev server starting"]);
+    const process = new FakeWebContainerProcess(0, [
+      args[0] === "build" ? "production build complete" : "dev server starting",
+    ]);
     // exit 在接口上是 readonly，这里用测试专用 Promise 替换默认的立即成功结果。
-    Object.defineProperty(process, "exit", {
-      value: this.devExit,
-    });
+    if (args[0] === "run" && args[1] === "dev") {
+      Object.defineProperty(process, "exit", {
+        value: this.devExit,
+      });
+    }
 
     // 使用 microtask 模拟 spawn 返回后异步触发 server-ready，
     // 同时验证 Manager 必须在 spawn 之前完成事件订阅。
-    queueMicrotask(() => {
-      this.serverReadyListener?.(5173, this.previewUrl);
-    });
+    if (args[0] === "run" && args[1] === "dev") {
+      queueMicrotask(() => {
+        this.serverReadyListener?.(5173, this.previewUrl);
+      });
+    }
     return process;
   }
 

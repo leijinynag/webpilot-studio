@@ -172,6 +172,18 @@ export function ProjectWorkspace({
   const dirtyPaths = selectDirtyPaths(state);
 
   useEffect(() => {
+    // 发布页无法访问另一个路由实例中的 reducer，因此只同步“是否有草稿”
+    // 这项跨页面事实，不同步正文，避免把 Monaco 内容复制到持久化存储。
+    const key = `webpilot:dirty-drafts:${project.id}`;
+    if (dirtyPaths.length === 0) {
+      window.sessionStorage.removeItem(key);
+      return;
+    }
+
+    window.sessionStorage.setItem(key, JSON.stringify(dirtyPaths));
+  }, [dirtyPaths, project.id]);
+
+  useEffect(() => {
     function confirmUnload(event: BeforeUnloadEvent) {
       if (!hasDirtyFiles(stateRef.current)) {
         return;

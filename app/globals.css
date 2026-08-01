@@ -2892,6 +2892,39 @@ html[data-theme="dark"] .piece-art.travel {
   height: 9px;
 }
 
+.build-step.is-idle .build-check {
+  color: var(--muted-foreground);
+  background: var(--surface-3);
+}
+
+.build-step.is-loading .build-check {
+  color: var(--surface);
+  background: var(--accent);
+}
+
+.build-step.is-failed .build-check,
+.build-step.is-blocked .build-check {
+  color: var(--surface);
+  background: var(--destructive);
+}
+
+.publish-build-feedback {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin: -10px 0 21px;
+  padding: 11px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-control);
+  background: var(--surface-2);
+  font-size: 0.58rem;
+}
+
+.publish-build-feedback span {
+  color: var(--muted-foreground);
+  line-height: 1.45;
+}
+
 .publish-settings {
   padding: 38px 42px;
   background: var(--surface);

@@ -1,12 +1,152 @@
+"use client";
+
 import Link from "next/link";
-import { Check, ExternalLink, Smartphone } from "lucide-react";
+import { Check, Download, ExternalLink, LoaderCircle, Smartphone } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
 
 import { PreviewSite } from "@/components/demo/preview-site";
 import { Button } from "@/components/ui/button";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
-import type { ProjectDescription } from "@/domains/project/types";
+import { BrowserGitProjectRepository } from "@/domains/project/browser-git-repository";
+import { buildProjectTemplate } from "@/domains/project/template";
+import type {
+  ProjectDescription,
+  ProjectFileSnapshot,
+} from "@/domains/project/types";
+import { webContainerRuntimeManager } from "@/infrastructure/webcontainer/runtime-manager";
 
 export function PublishPage({ project }: { project: ProjectDescription }) {
+  const [buildState, setBuildState] = useState<BuildState>({
+    phase: "idle",
+    message: "尚未构建",
+    detail: "",
+  });
+  const [dirtyPaths] = useState<string[]>(() => {
+    if (typeof window === "undefined") {
+      return [];
+    }
+
+    const stored = window.sessionStorage.getItem(
+      `webpilot:dirty-drafts:${project.id}`,
+    );
+    return stored ? parseDirtyPaths(stored) : [];
+  });
+  const [repositoryFiles, setRepositoryFiles] = useState<
+    ProjectFileSnapshot[]
+  >([]);
+  const [repositoryRevision, setRepositoryRevision] = useState(project.revision);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function loadRepositorySnapshot() {
+      try {
+        const snapshot =
+          project.storageKind === "browser_git"
+            ? await loadBrowserGitSnapshot(project)
+            : await loadDatabaseSnapshot(project.id);
+
+        if (!cancelled) {
+          setRepositoryFiles(snapshot.files);
+          setRepositoryRevision(snapshot.revision);
+          setBuildState((current) =>
+            current.phase === "idle"
+              ? {
+                  ...current,
+                  detail: `${snapshot.files.length} 个文件 · revision ${snapshot.revision}`,
+                }
+              : current,
+          );
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setBuildState({
+            phase: "failed",
+            message: "无法读取当前 Repository",
+            detail: error instanceof Error ? error.message : "请返回工作台重试。",
+          });
+        }
+      }
+    }
+
+    void loadRepositorySnapshot();
+    return () => {
+      cancelled = true;
+    };
+  }, [project]);
+
+  const canBuild = useMemo(
+    () =>
+      buildState.phase !== "building" &&
+      dirtyPaths.length === 0 &&
+      repositoryFiles.length > 0,
+    [buildState.phase, dirtyPaths.length, repositoryFiles.length],
+  );
+
+  async function handleBuildAndDownload() {
+    if (dirtyPaths.length > 0) {
+      setBuildState({
+        phase: "blocked",
+        message: "存在未保存草稿",
+        detail: dirtyPaths.join("、"),
+      });
+      return;
+    }
+
+    if (repositoryFiles.length === 0) {
+      setBuildState({
+        phase: "blocked",
+        message: "当前项目没有可构建文件",
+        detail: "请先在工作台创建并保存代码。",
+      });
+      return;
+    }
+
+    setBuildState({
+      phase: "building",
+      message: "正在准备 production build",
+      detail: "仅在你点击此按钮后启动 WebContainer。",
+    });
+
+    try {
+      const result = await webContainerRuntimeManager.buildProduction(
+        buildProjectTemplate(
+          repositoryFiles.map((file) => ({
+            path: file.path,
+            content: file.content,
+          })),
+        ),
+        project.id,
+        repositoryRevision,
+        `showcase:${project.id}:${repositoryRevision}`,
+      );
+      const archive = new Blob([toArrayBuffer(result.archive)], {
+        type: "application/zip",
+      });
+      const url = URL.createObjectURL(archive);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = `${toSafeFileName(project.name)}-showcase.zip`;
+      anchor.click();
+      URL.revokeObjectURL(url);
+
+      setBuildState({
+        phase: "success",
+        message: "ZIP 已生成",
+        detail: `${result.manifest.files.length} 个文件 · ${formatBytes(
+          result.manifest.totalBytes,
+        )} · ${result.buildDurationMs}ms`,
+        result,
+      });
+    } catch (error) {
+      setBuildState({
+        phase: "failed",
+        message: "生产构建失败",
+        detail: error instanceof Error ? error.message : "请查看运行日志后重试。",
+      });
+    }
+  }
+
   return (
     <div className="publish-page page-in">
       <section className="publish-preview">
@@ -30,9 +170,26 @@ export function PublishPage({ project }: { project: ProjectDescription }) {
           <PreviewSite />
         </div>
         <div className="build-status">
-          <BuildStep label="Production build" />
-          <BuildStep label="Assets collected" />
-          <BuildStep label="4 smoke checks" />
+          <BuildStep
+            label="Production build"
+            state={buildState.phase}
+          />
+          <BuildStep
+            label={
+              buildState.result
+                ? `${buildState.result.manifest.files.length} assets collected`
+                : "Assets collected"
+            }
+            state={buildState.result ? "success" : "idle"}
+          />
+          <BuildStep
+            label={
+              buildState.result
+                ? `${formatBytes(buildState.result.manifest.totalBytes)} ZIP`
+                : "ZIP export"
+            }
+            state={buildState.result ? "success" : "idle"}
+          />
         </div>
       </section>
 
@@ -96,16 +253,51 @@ export function PublishPage({ project }: { project: ProjectDescription }) {
         </div>
 
         <div className="publish-checks">
-          <CheckRow label="Production build completed" value="Passed" />
-          <CheckRow label="Broken asset scan" value="Passed" />
-          <CheckRow label="Primary interaction flow" value="4 / 4" />
-          <CheckRow label="Console errors" value="0" />
+          <CheckRow
+            label="Repository snapshot"
+            value={
+              repositoryFiles.length > 0
+                ? `r${repositoryRevision}`
+                : "Loading"
+            }
+          />
+          <CheckRow
+            label="Unsaved Monaco drafts"
+            value={dirtyPaths.length === 0 ? "0" : `${dirtyPaths.length} blocked`}
+          />
+          <CheckRow
+            label="Build status"
+            value={buildState.message}
+          />
+          <CheckRow
+            label="Entry file"
+            value={buildState.result ? "index.html" : "Pending"}
+          />
+        </div>
+        <div className="publish-build-feedback" role="status">
+          <b>{buildState.message}</b>
+          <span>{buildState.detail}</span>
         </div>
         <div className="publish-actions">
-          <span>Last checkpoint · Run 04</span>
-          <Button className="app-button-accent" size="sm">
-            Publish showcase
-            <ExternalLink data-icon="inline-end" />
+          <span>{buildState.result ? "ZIP ready to review" : "Explicit build required"}</span>
+          <Button
+            className="app-button-accent"
+            disabled={!canBuild}
+            onClick={handleBuildAndDownload}
+            size="sm"
+          >
+            {buildState.phase === "building" ? (
+              <LoaderCircle className="animate-spin" data-icon="inline-start" />
+            ) : buildState.result ? (
+              <Download data-icon="inline-start" />
+            ) : (
+              <ExternalLink data-icon="inline-start" />
+            )}
+            {buildState.phase === "building"
+              ? "Building..."
+              : buildState.result
+                ? "Build again"
+                : "Build & download ZIP"}
           </Button>
         </div>
         <Link className="back-to-workbench" href={`/p/${project.id}`}>
@@ -116,15 +308,115 @@ export function PublishPage({ project }: { project: ProjectDescription }) {
   );
 }
 
-function BuildStep({ label }: { label: string }) {
+function BuildStep({
+  label,
+  state,
+}: {
+  label: string;
+  state: BuildState["phase"] | "idle";
+}) {
   return (
-    <div className="build-step">
-      <span className="build-check">
-        <Check />
+    <div className={`build-step is-${state}`}>
+      <span className="build-check" aria-hidden="true">
+        {state === "building" ? (
+          <LoaderCircle className="animate-spin" />
+        ) : (
+          <Check />
+        )}
       </span>
       <span>{label}</span>
     </div>
   );
+}
+
+type BuildState = {
+  phase: "idle" | "building" | "success" | "failed" | "blocked";
+  message: string;
+  detail: string;
+  result?: Awaited<
+    ReturnType<typeof webContainerRuntimeManager.buildProduction>
+  >;
+};
+
+async function loadDatabaseSnapshot(projectId: string) {
+  const response = await fetch(`/api/projects/${projectId}/files`, {
+    cache: "no-store",
+  });
+  const body = (await response.json().catch(() => ({}))) as {
+    files?: ProjectFileSnapshot[];
+    error?: { message?: string };
+  };
+
+  if (!response.ok || !body.files) {
+    throw new Error(body.error?.message ?? "数据库 Repository 读取失败。");
+  }
+
+  return {
+    files: body.files,
+    revision: await loadProjectRevision(projectId),
+  };
+}
+
+async function loadBrowserGitSnapshot(project: ProjectDescription) {
+  const repository = new BrowserGitProjectRepository(project);
+  await repository.initialize();
+  const [files, description] = await Promise.all([
+    repository.listFiles(),
+    repository.describe(),
+  ]);
+  return { files, revision: description.revision };
+}
+
+async function loadProjectRevision(projectId: string): Promise<number> {
+  const response = await fetch(`/api/projects/${projectId}`, {
+    cache: "no-store",
+  });
+  const body = (await response.json().catch(() => ({}))) as {
+    project?: ProjectDescription;
+    error?: { message?: string };
+  };
+
+  if (!response.ok || !body.project) {
+    throw new Error(body.error?.message ?? "项目 revision 读取失败。");
+  }
+
+  return body.project.revision;
+}
+
+function parseDirtyPaths(value: string): string[] {
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return Array.isArray(parsed)
+      ? parsed.filter((path): path is string => typeof path === "string")
+      : [];
+  } catch {
+    return [];
+  }
+}
+
+function toArrayBuffer(value: Uint8Array): ArrayBuffer {
+  const copy = new Uint8Array(value.byteLength);
+  copy.set(value);
+  return copy.buffer;
+}
+
+function toSafeFileName(value: string): string {
+  return (
+    value
+      .trim()
+      .replace(/[^a-zA-Z0-9\u4e00-\u9fff_-]+/g, "-")
+      .replace(/^-+|-+$/g, "") || "webpilot-project"
+  );
+}
+
+function formatBytes(value: number): string {
+  if (value < 1024) {
+    return `${value} B`;
+  }
+  if (value < 1024 * 1024) {
+    return `${(value / 1024).toFixed(1)} KB`;
+  }
+  return `${(value / 1024 / 1024).toFixed(1)} MB`;
 }
 
 function CheckRow({ label, value }: { label: string; value: string }) {
