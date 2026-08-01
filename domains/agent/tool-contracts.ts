@@ -1,4 +1,7 @@
 import type { LlmToolDefinition } from "@/domains/agent/provider";
+import { z } from "zod";
+
+import { assertValidProjectPath } from "@/domains/project/path";
 
 export const FILE_TOOL_NAMES = {
   listFiles: "list_files",
@@ -11,6 +14,81 @@ export const FILE_TOOL_NAMES = {
 
 export type FileToolName =
   (typeof FILE_TOOL_NAMES)[keyof typeof FILE_TOOL_NAMES];
+
+export const GIT_TOOL_NAMES = {
+  status: "git_status",
+  log: "git_log",
+  currentBranch: "git_current_branch",
+  stage: "git_stage",
+  unstage: "git_unstage",
+  commit: "git_commit",
+} as const;
+
+export type GitToolName = (typeof GIT_TOOL_NAMES)[keyof typeof GIT_TOOL_NAMES];
+
+const projectPathSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(500)
+  .transform(assertValidProjectPath);
+const expectedRevisionSchema = z.number().int().nonnegative();
+
+export const FILE_TOOL_SCHEMAS = {
+  [FILE_TOOL_NAMES.listFiles]: z.object({}).strict(),
+  [FILE_TOOL_NAMES.searchText]: z
+    .object({
+      query: z.string().trim().min(1).max(200),
+      maxResults: z.number().int().positive().max(100).optional(),
+    })
+    .strict(),
+  [FILE_TOOL_NAMES.readFile]: z.object({ path: projectPathSchema }).strict(),
+  [FILE_TOOL_NAMES.writeFile]: z
+    .object({
+      path: projectPathSchema,
+      content: z.string().max(1_000_000),
+      expectedRevision: expectedRevisionSchema,
+    })
+    .strict(),
+  [FILE_TOOL_NAMES.deleteFile]: z
+    .object({
+      path: projectPathSchema,
+      expectedRevision: expectedRevisionSchema,
+    })
+    .strict(),
+  [FILE_TOOL_NAMES.renameFile]: z
+    .object({
+      fromPath: projectPathSchema,
+      toPath: projectPathSchema,
+      expectedRevision: expectedRevisionSchema,
+    })
+    .strict(),
+} as const;
+
+export const GIT_TOOL_SCHEMAS = {
+  [GIT_TOOL_NAMES.status]: z.object({}).strict(),
+  [GIT_TOOL_NAMES.log]: z
+    .object({
+      maxCount: z.number().int().min(1).max(100).default(30),
+    })
+    .strict(),
+  [GIT_TOOL_NAMES.currentBranch]: z.object({}).strict(),
+  [GIT_TOOL_NAMES.stage]: z
+    .object({
+      paths: z.array(projectPathSchema).min(1).max(200),
+    })
+    .strict(),
+  [GIT_TOOL_NAMES.unstage]: z
+    .object({
+      paths: z.array(projectPathSchema).min(1).max(200),
+    })
+    .strict(),
+  [GIT_TOOL_NAMES.commit]: z
+    .object({
+      message: z.string().trim().min(1).max(500),
+    })
+    .strict(),
+} as const;
 
 const PROJECT_PATH_SCHEMA = {
   type: "string",
@@ -105,6 +183,99 @@ export const FILE_TOOL_DEFINITIONS = [
         },
       },
       required: ["fromPath", "toPath", "expectedRevision"],
+      additionalProperties: false,
+    },
+  },
+] as const satisfies readonly LlmToolDefinition[];
+
+export const GIT_TOOL_DEFINITIONS = [
+  {
+    name: GIT_TOOL_NAMES.status,
+    description:
+      "读取 Browser Git 当前 staged、unstaged、untracked 状态。只读操作。",
+    parameters: {
+      type: "object",
+      properties: {},
+      required: [],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: GIT_TOOL_NAMES.log,
+    description: "读取 Browser Git 本地提交历史。只读操作。",
+    parameters: {
+      type: "object",
+      properties: {
+        maxCount: {
+          type: "integer",
+          minimum: 1,
+          maximum: 100,
+          description: "最多返回的提交数量。",
+        },
+      },
+      required: [],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: GIT_TOOL_NAMES.currentBranch,
+    description: "读取 Browser Git 当前本地分支。只读操作。",
+    parameters: {
+      type: "object",
+      properties: {},
+      required: [],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: GIT_TOOL_NAMES.stage,
+    description:
+      "把指定路径加入 Browser Git 暂存区。只有原始用户消息明确授权 stage 时才允许。",
+    parameters: {
+      type: "object",
+      properties: {
+        paths: {
+          type: "array",
+          minItems: 1,
+          maxItems: 200,
+          items: PROJECT_PATH_SCHEMA,
+        },
+      },
+      required: ["paths"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: GIT_TOOL_NAMES.unstage,
+    description:
+      "把指定路径移出 Browser Git 暂存区。只有原始用户消息明确授权 unstage 时才允许。",
+    parameters: {
+      type: "object",
+      properties: {
+        paths: {
+          type: "array",
+          minItems: 1,
+          maxItems: 200,
+          items: PROJECT_PATH_SCHEMA,
+        },
+      },
+      required: ["paths"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: GIT_TOOL_NAMES.commit,
+    description:
+      "提交 Browser Git 已暂存内容。必须有原始用户明确 commit 指令和冻结的作者姓名、邮箱。",
+    parameters: {
+      type: "object",
+      properties: {
+        message: {
+          type: "string",
+          description: "本地 Git commit message。",
+        },
+      },
+      required: ["message"],
       additionalProperties: false,
     },
   },

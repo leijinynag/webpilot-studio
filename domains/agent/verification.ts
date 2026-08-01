@@ -505,7 +505,7 @@ export function getAgentVerificationState(input: {
   transcript: readonly TranscriptMessage[];
   latestVerificationRun: VerificationRunRecord | null;
 }): AgentVerificationState {
-  if (input.run.toolsetProfile !== "webpilot-browser-v3") {
+  if (!isBrowserVerificationToolset(input.run.toolsetProfile)) {
     const preview = getPreviewVerificationState(input.run, input.transcript);
     return {
       ...preview,
@@ -517,11 +517,15 @@ export function getAgentVerificationState(input: {
 
   const verification = input.latestVerificationRun;
   if (!verification) {
+    const preview = getPreviewVerificationState(input.run, input.transcript);
+
     return {
-      attempted: false,
+      // Browser profile 下 run_preview 只是中间证据，不能代替交互验证。
+      // 但它仍属于一次验证尝试，必须阻止模型在 Preview 后直接文本收尾。
+      attempted: preview.attempted,
       ok: false,
-      revision: null,
-      failure: null,
+      revision: preview.revision,
+      failure: preview.failure,
       kind: "browser",
       replayCount: 0,
       summary: null,
@@ -548,6 +552,13 @@ export function getAgentVerificationState(input: {
   };
 }
 
+function isBrowserVerificationToolset(toolsetProfile: string): boolean {
+  return (
+    toolsetProfile === "webpilot-browser-v3" ||
+    toolsetProfile === "webpilot-browser-git-v4"
+  );
+}
+
 export function buildAgentVerificationDirective(input: {
   run: Pick<
     AgentRunRecord,
@@ -556,7 +567,7 @@ export function buildAgentVerificationDirective(input: {
   transcript: readonly TranscriptMessage[];
   latestVerificationRun: VerificationRunRecord | null;
 }): string {
-  if (input.run.toolsetProfile !== "webpilot-browser-v3") {
+  if (!isBrowserVerificationToolset(input.run.toolsetProfile)) {
     return buildVerificationDirective(input.run, input.transcript);
   }
 

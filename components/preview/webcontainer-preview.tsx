@@ -48,8 +48,9 @@ import {
 } from "@/domains/agent/evidence";
 import {
   clientToolRequestSchema,
-  type ClientToolRequest,
-  type ClientToolResult,
+  isPreviewClientToolRequest,
+  type PreviewClientToolRequest,
+  type PreviewClientToolResult,
 } from "@/domains/agent/client-tools";
 import { BrowserBridgeController } from "@/infrastructure/webcontainer/browser-bridge-controller";
 import { PreviewEvidenceCollector } from "@/infrastructure/webcontainer/evidence-collector";
@@ -58,11 +59,11 @@ import { injectRuntimeBridge } from "@/infrastructure/webcontainer/runtime-bridg
 import { webContainerRuntimeManager } from "@/infrastructure/webcontainer/runtime-manager";
 
 type WebContainerPreviewProps = {
-  clientToolRequest?: ClientToolRequest | null;
+  clientToolRequest?: PreviewClientToolRequest | null;
   files: readonly ProjectFileSnapshot[];
   onClientToolResult?: (
-    request: ClientToolRequest,
-    result: ClientToolResult,
+    request: PreviewClientToolRequest,
+    result: PreviewClientToolResult,
   ) =>
     | "accepted"
     | "duplicate"
@@ -154,6 +155,7 @@ function ProjectWebContainerPreview({
     previewUrlRef.current = snapshot.previewUrl;
     activeClientToolExecutionKeyRef.current = clientToolExecutionKey;
   }, [
+    clientToolRequest,
     clientToolExecutionKey,
     onClientToolResult,
     projectTree,
@@ -201,6 +203,7 @@ function ProjectWebContainerPreview({
     const requestResult = clientToolRequestSchema.safeParse(clientToolRequest);
     if (
       !requestResult.success ||
+      !isPreviewClientToolRequest(requestResult.data) ||
       !clientToolExecutionKey ||
       requestResult.data.projectId !== projectId ||
       requestResult.data.revision !== revision ||
@@ -471,7 +474,7 @@ function ProjectWebContainerPreview({
       }
     }
 
-    async function submitResult(result: ClientToolResult) {
+    async function submitResult(result: PreviewClientToolResult) {
       if (
         isStaleExecution() ||
         submittedToolCallIdsRef.current.has(request.toolCallId)
@@ -551,9 +554,14 @@ function ProjectWebContainerPreview({
       }
 
       const collector = evidenceCollectorRef.current;
-      const requestResult =
-        clientToolRequestSchema.safeParse(clientToolRequestRef.current);
-      if (!collector || !requestResult.success) {
+      const requestResult = clientToolRequestSchema.safeParse(
+        clientToolRequestRef.current,
+      );
+      if (
+        !collector ||
+        !requestResult.success ||
+        !isPreviewClientToolRequest(requestResult.data)
+      ) {
         return;
       }
 
@@ -629,11 +637,7 @@ function ProjectWebContainerPreview({
             clientToolRequest?.toolCallId ?? null,
           )
         : null,
-    [
-      clientToolRequest?.toolCallId,
-      frameRevision,
-      visibleSnapshot.previewUrl,
-    ],
+    [clientToolRequest?.toolCallId, frameRevision, visibleSnapshot.previewUrl],
   );
   // 保留足够多的上下文供用户定位安装或编译失败，容器本身负责滚动，
   // 避免只显示堆栈尾部而丢失真正的首条错误信息。
@@ -753,11 +757,13 @@ function ProjectWebContainerPreview({
             ref={iframeRef}
             className="webcontainer-frame"
             onLoad={() => {
-              const requestResult =
-                clientToolRequestSchema.safeParse(
-                  clientToolRequestRef.current,
-                );
-              if (requestResult.success) {
+              const requestResult = clientToolRequestSchema.safeParse(
+                clientToolRequestRef.current,
+              );
+              if (
+                requestResult.success &&
+                isPreviewClientToolRequest(requestResult.data)
+              ) {
                 const executionKey = createClientToolExecutionKey(
                   requestResult.data,
                   projectId,
@@ -838,7 +844,7 @@ function ProjectWebContainerPreview({
 type BrowserResponsePayload = BrowserBridgeResponse["payload"];
 
 function createClientToolExecutionKey(
-  request: ClientToolRequest | null | undefined,
+  request: PreviewClientToolRequest | null | undefined,
   projectId: string,
   revision: number,
 ): string | null {
@@ -877,7 +883,7 @@ function createBrowserVerifyResult(input: {
   browser: BrowserExecutionEvidence;
   network: NetworkEvidence;
   preview: RunPreviewResult;
-  request: Extract<ClientToolRequest, { toolName: "browser_verify" }>;
+  request: Extract<PreviewClientToolRequest, { toolName: "browser_verify" }>;
 }): BrowserVerifyResult {
   const assertionActions = new Set([
     "assert_text",
@@ -1005,7 +1011,7 @@ export async function waitForRuntimeRender({
   iframeRef: React.RefObject<HTMLIFrameElement | null>;
   pollIntervalMs?: number;
   reloadFrame: () => void;
-  request: ClientToolRequest;
+  request: PreviewClientToolRequest;
   timeoutMs: number;
 }): Promise<void> {
   const startedAt = Date.now();
@@ -1027,10 +1033,7 @@ export async function waitForRuntimeRender({
     // 首次导航需要一个连续窗口完成 HTML、模块图和 React 首帧。每秒销毁 iframe
     // 会让较慢项目永远回到加载起点，因此只在等待中段执行一次 cache-busting
     // 兜底刷新，兼顾旧 index.html 缓存与稳定首帧两种情况。
-    if (
-      !fallbackReloaded &&
-      Date.now() - startedAt >= fallbackReloadAfterMs
-    ) {
+    if (!fallbackReloaded && Date.now() - startedAt >= fallbackReloadAfterMs) {
       fallbackReloaded = true;
       reloadFrame();
     }
@@ -1058,7 +1061,7 @@ export async function waitForRuntimeRender({
 function postRuntimeProbe(
   iframe: HTMLIFrameElement | null,
   previewUrl: string | null,
-  request: ClientToolRequest,
+  request: PreviewClientToolRequest,
 ): void {
   if (!iframe?.contentWindow || !previewUrl) {
     return;

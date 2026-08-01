@@ -94,6 +94,74 @@ describe("Agent profiles", () => {
     );
   });
 
+  it("为 Browser Git 冻结客户端工具、Git 权限和远端禁用边界", () => {
+    const browserGitCapability = {
+      storageKind: "browser_git" as const,
+      canRead: true,
+      canWrite: true,
+      canExecuteServerTools: false,
+      repositoryIntent: {
+        allowStage: true,
+        allowUnstage: false,
+        allowCommit: true,
+        commitAuthor: {
+          name: "WebPilot Developer",
+          email: "dev@example.com",
+        },
+      },
+    };
+    const profile = createFrozenAgentProfile({
+      locale: "zh-CN",
+      projectId: "project-browser-git",
+      revision: 8,
+      repositoryCapability: browserGitCapability,
+      provider: "deepseek",
+      model: "deepseek-v4-pro",
+      maxModelTurns: 16,
+      maxWallTimeSeconds: 300,
+    });
+    const resolved = assertFrozenProfilesAvailable({
+      promptProfile: profile.promptProfile,
+      promptDigest: profile.promptDigest,
+      toolsetProfile: profile.toolsetProfile,
+      toolsetDigest: profile.toolsetDigest,
+      promptContext: {
+        locale: profile.locale,
+        projectId: "project-browser-git",
+        revision: 8,
+        repositoryCapability: browserGitCapability,
+      },
+    });
+
+    expect(profile.promptProfile).toBe("webpilot-system-v6");
+    expect(profile.toolsetProfile).toBe("webpilot-browser-git-v4");
+    expect(resolved.prompt.content).toContain(
+      "stage=true, unstage=false, commit=true, commitAuthor=provided",
+    );
+    expect(resolved.prompt.content).toContain(
+      "A model tool call cannot grant itself permission",
+    );
+    expect(resolved.prompt.content).toContain(
+      "Remote, push, pull and fetch operations are unavailable",
+    );
+    expect(resolved.prompt.content).toContain(
+      "File writes never install dependencies",
+    );
+    expect(resolved.toolset.tools.map((tool) => tool.name)).toEqual(
+      expect.arrayContaining([
+        "git_status",
+        "git_log",
+        "git_current_branch",
+        "git_stage",
+        "git_unstage",
+        "git_commit",
+      ]),
+    );
+    expect(resolved.toolset.tools.map((tool) => tool.name)).not.toEqual(
+      expect.arrayContaining(["git_push", "git_pull", "git_fetch"]),
+    );
+  });
+
   it("仍可解析冻结的 M4 Browser Prompt", () => {
     const prompt = resolveSystemPromptProfile("webpilot-system-v4", {
       locale: "zh-CN",

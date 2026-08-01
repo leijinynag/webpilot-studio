@@ -143,20 +143,38 @@ type RestorePreview = {
   }>;
 };
 
-async function createProject(page: Page, name: string): Promise<Project> {
+async function createProject(
+  page: Page,
+  name: string,
+  input: {
+    storageKind?: "database" | "browser_git";
+    template?: "empty" | "rsbuild";
+  } = {},
+): Promise<Project> {
   // 先建立匿名 owner Cookie；项目 API 和工作台请求必须共享同一浏览器会话。
   await page.goto("/");
   const response = await page.request.post("/api/projects", {
     data: {
       name,
-      storageKind: "database",
-      template: "rsbuild",
+      storageKind: input.storageKind ?? "database",
+      template: input.template ?? "rsbuild",
     },
   });
 
   expect(response.status()).toBe(201);
   const body = (await response.json()) as { project: Project };
   return body.project;
+}
+
+async function waitForBrowserRepository(page: Page): Promise<void> {
+  // Browser Git 首次进入工作台需要先完成 IndexedDB/Worker 初始化。
+  // Agent composer 必须等仓库事实恢复后再启用，否则 Run 无法拿到真实 revision。
+  await expect(
+    page.getByText("正在恢复浏览器仓库。源码和 Git 状态准备完成后才会显示。"),
+  ).toHaveCount(0, { timeout: 15_000 });
+  await expect(page.getByLabel("Explorer")).toBeVisible({
+    timeout: 15_000,
+  });
 }
 
 async function waitForTerminalRun(
@@ -611,6 +629,48 @@ test.describe("Agent workspace live flow", () => {
       "src/index.tsx",
     );
     expect(protectedFile.content).toBe(userContent);
+  });
+
+  test("modifies Browser Git through client tools without creating an implicit commit", async ({
+    page,
+  }) => {
+    // 真实模型和浏览器内 WebContainer 只在显式开启 Agent E2E 时运行；
+    // 默认回归继续使用 deterministic client-tool/integration tests。
+    test.setTimeout(900_000);
+    const project = await createProject(page, "M7 live Browser Git agent", {
+      storageKind: "browser_git",
+      template: "rsbuild",
+    });
+
+    await page.goto(`/p/${project.id}`);
+    await waitForBrowserRepository(page);
+
+    const prompt =
+      "读取 src/index.tsx，把页面 h1 文案改成 M7 Browser Git Agent Verified。只修改代码并完成运行验证，不要执行 git stage、git commit 或任何远程 Git 操作。";
+    const createdRun = await startAgentRunFromWorkspace(page, prompt);
+    const run = await waitForTerminalRun(page, createdRun.id, 720_000);
+
+    expect(run.status, run.errorMessage ?? "Browser Git Agent 未成功完成。").toBe(
+      "succeeded",
+    );
+    expect(run.currentRevision).toBeGreaterThan(project.revision);
+
+    // Browser Git 的源码事实只存在浏览器仓库，工作台文件树是这里的可见证明。
+    await expect(
+      page.getByRole("treeitem", { name: /src\/index\.tsx/ }),
+    ).toBeVisible({ timeout: 15_000 });
+
+    await page.getByRole("link", { name: /Source Control/ }).click();
+    await expect(page.getByText("Working tree clean", { exact: true })).toHaveCount(
+      0,
+      { timeout: 15_000 },
+    );
+    await expect(
+      page.getByRole("button", { name: "暂存 src/index.tsx" }),
+    ).toBeVisible({ timeout: 15_000 });
+
+    // 用户没有明确授权 Git 操作时，Agent 可以修改源码，但不得隐式创建 commit。
+    await expect(page.getByText("还没有 commit。", { exact: true })).toBeVisible();
   });
 
   test("stops a run before it can mutate the repository", async ({ page }) => {

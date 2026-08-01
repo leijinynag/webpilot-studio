@@ -57,6 +57,13 @@
       "when": 1785579098444,
       "tag": "0007_dear_corsair",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1785588943831,
+      "tag": "0008_gray_demogoblin",
+      "breakpoints": true
     }
   ]
 }

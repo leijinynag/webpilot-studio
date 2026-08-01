@@ -1,6 +1,7 @@
 import LightningFS from "@isomorphic-git/lightning-fs";
 import * as git from "isomorphic-git";
 
+import { serializeMigrationManifest } from "@/domains/project/migration-manifest";
 import { assertValidProjectPath } from "@/domains/project/path";
 import type {
   ProjectCheckpoint,
@@ -13,6 +14,7 @@ import type {
   BrowserGitCheckpointRecord,
   BrowserGitCommit,
   BrowserGitFileInput,
+  BrowserGitMigrationValidation,
   BrowserGitRepositoryState,
   BrowserGitWorkerOperation,
   BrowserGitWorkerPayloadMap,
@@ -127,12 +129,194 @@ export class BrowserGitRuntime {
         return this.restoreCheckpoint(
           request.payload as BrowserGitWorkerPayloadMap["restore_checkpoint"],
         );
+      case "initialize_migration_candidate":
+        return this.initializeMigrationCandidate(
+          request.payload as BrowserGitWorkerPayloadMap["initialize_migration_candidate"],
+        );
+      case "validate_migration_candidate":
+        return this.validateMigrationCandidate(
+          request.payload as BrowserGitWorkerPayloadMap["validate_migration_candidate"],
+        );
+      case "delete_repository":
+        return this.deleteRepository();
+      case "promote_migration_candidate":
+        throw workerDomainError(
+          "INVALID_REQUEST",
+          "promote 必须由 Worker 协调 candidate 与正式 Repository。",
+        );
     }
   }
 
   async getRevision(): Promise<number> {
     const metadata = await this.readMetadata();
     return metadata.revision;
+  }
+
+  async initializeMigrationCandidate(
+    input: BrowserGitWorkerPayloadMap["initialize_migration_candidate"],
+  ): Promise<BrowserGitMigrationValidation> {
+    const existing = await this.tryReadMetadata();
+
+    // 页面重试时可能重新收到同一 prepare 结果。已有 candidate 只能进入
+    // 严格校验，不能重新 init 或覆盖用户浏览器里的任何数据。
+    if (existing) {
+      return this.validateMigrationCandidate(input);
+    }
+
+    const actualManifestHash = await hashFileManifest(input.initialFiles);
+    if (actualManifestHash !== input.manifestHash) {
+      throw workerDomainError(
+        "INVALID_REQUEST",
+        "迁移文件清单与服务端 manifest 不一致。",
+        {
+          expectedManifestHash: input.manifestHash,
+          actualManifestHash,
+        },
+      );
+    }
+
+    await ensureDirectory(this.fs, CHECKPOINT_DIRECTORY);
+    await ensureDirectory(this.fs, REPOSITORY_DIRECTORY);
+    await git.init({
+      fs: this.lightningFs,
+      dir: REPOSITORY_DIRECTORY,
+      defaultBranch: DEFAULT_BRANCH,
+    });
+
+    for (const file of input.initialFiles) {
+      const path = assertValidProjectPath(file.path);
+      await writeTextFile(this.fs, repositoryPath(path), file.content);
+      await git.add({
+        fs: this.lightningFs,
+        dir: REPOSITORY_DIRECTORY,
+        filepath: path,
+      });
+    }
+
+    // 即使 Database 项目为空也创建 initial commit。迁移 proof 因而始终拥有
+    // 可校验的 HEAD，后续 Source Control 也不会出现“已迁移但无历史”的歧义。
+    await git.commit({
+      fs: this.lightningFs,
+      dir: REPOSITORY_DIRECTORY,
+      message: "Migrate database repository",
+      author: SYSTEM_AUTHOR,
+    });
+
+    const now = new Date().toISOString();
+    await this.writeMetadata({
+      projectId: this.projectId,
+      ownerId: null,
+      name: normalizeProjectName(input.projectName),
+      revision: input.sourceRevision,
+      createdAt: now,
+      updatedAt: now,
+      deletedAt: null,
+      unavailable: false,
+      unavailableReason: null,
+    });
+    await this.fs.flush();
+
+    return this.validateMigrationCandidate(input);
+  }
+
+  async validateMigrationCandidate(
+    input: BrowserGitWorkerPayloadMap["validate_migration_candidate"],
+  ): Promise<BrowserGitMigrationValidation> {
+    const metadata = await this.readMetadata();
+    const state = await this.getState();
+    const files = await this.listFiles();
+    const manifestHash = await hashFileManifest(files);
+
+    if (
+      metadata.revision !== input.sourceRevision ||
+      state.branch !== DEFAULT_BRANCH ||
+      !state.head ||
+      state.files.length > 0 ||
+      manifestHash !== input.manifestHash
+    ) {
+      throw workerDomainError(
+        "INVALID_REQUEST",
+        "Browser Git candidate 校验失败，未进入正式迁移。",
+        {
+          expectedRevision: input.sourceRevision,
+          actualRevision: metadata.revision,
+          branch: state.branch,
+          head: state.head,
+          clean: state.files.length === 0,
+          expectedManifestHash: input.manifestHash,
+          actualManifestHash: manifestHash,
+        },
+      );
+    }
+
+    return {
+      repositoryId: this.projectId,
+      revision: metadata.revision,
+      head: state.head,
+      branch: DEFAULT_BRANCH,
+      clean: true,
+      manifestHash,
+      fileCount: files.length,
+    };
+  }
+
+  async promoteMigrationCandidate(
+    input: BrowserGitWorkerPayloadMap["promote_migration_candidate"],
+    getTargetRuntime: (projectId: string) => BrowserGitRuntime,
+  ): Promise<BrowserGitMigrationValidation> {
+    const candidate = await this.validateMigrationCandidate({
+      sourceRevision: input.sourceRevision,
+      manifestHash: input.manifestHash,
+    });
+
+    if (candidate.head !== input.head) {
+      throw workerDomainError(
+        "INVALID_REQUEST",
+        "candidate HEAD 与服务端 finalize proof 不一致。",
+        { expectedHead: input.head, actualHead: candidate.head },
+      );
+    }
+
+    const target = getTargetRuntime(input.targetProjectId);
+    const targetMetadata = await target.tryReadMetadata();
+
+    if (targetMetadata) {
+      const existing = await target.validateMigrationCandidate({
+        sourceRevision: input.sourceRevision,
+        manifestHash: input.manifestHash,
+      });
+      if (existing.head !== input.head) {
+        throw workerDomainError(
+          "PROJECT_PATH_CONFLICT",
+          "正式 Browser Git 仓库已经存在且 HEAD 不匹配，已拒绝覆盖。",
+          { expectedHead: input.head, actualHead: existing.head },
+        );
+      }
+      return existing;
+    }
+
+    const entries = await readBinaryEntries(this.fs, REPOSITORY_DIRECTORY);
+    await target.importPromotedRepository({
+      projectName: input.projectName,
+      sourceRevision: input.sourceRevision,
+      entries,
+    });
+    const promoted = await target.validateMigrationCandidate({
+      sourceRevision: input.sourceRevision,
+      manifestHash: input.manifestHash,
+    });
+
+    if (promoted.head !== input.head) {
+      // 复制后的正式仓库若未保持相同 HEAD，立即清理这份不可达数据。
+      await target.deleteRepository();
+      throw workerDomainError(
+        "STORAGE_UNAVAILABLE",
+        "正式 Browser Git 仓库校验失败，已清理候选副本。",
+        { expectedHead: input.head, actualHead: promoted.head },
+      );
+    }
+
+    return promoted;
   }
 
   private async initialize(
@@ -619,6 +803,53 @@ export class BrowserGitRuntime {
     };
   }
 
+  private async importPromotedRepository(input: {
+    projectName: string;
+    sourceRevision: number;
+    entries: readonly { path: string; content: Uint8Array }[];
+  }) {
+    if (await this.tryReadMetadata()) {
+      throw workerDomainError(
+        "PROJECT_PATH_CONFLICT",
+        "正式 Browser Git 仓库已经存在，拒绝覆盖。",
+      );
+    }
+
+    await ensureDirectory(this.fs, CHECKPOINT_DIRECTORY);
+    await ensureDirectory(this.fs, REPOSITORY_DIRECTORY);
+    for (const entry of input.entries) {
+      await writeBinaryFile(
+        this.fs,
+        `${REPOSITORY_DIRECTORY}/${entry.path}`,
+        entry.content,
+      );
+    }
+
+    const now = new Date().toISOString();
+    await this.writeMetadata({
+      projectId: this.projectId,
+      ownerId: null,
+      name: normalizeProjectName(input.projectName),
+      revision: input.sourceRevision,
+      createdAt: now,
+      updatedAt: now,
+      deletedAt: null,
+      unavailable: false,
+      unavailableReason: null,
+    });
+    await this.fs.flush();
+  }
+
+  private async deleteRepository() {
+    // LightningFS 没有公开的 deleteDatabase API。重新以 wipe 模式 init
+    // 会清空同名 object store，随后 flush 一个空根，达到可重试的 cleanup。
+    await this.lightningFs.init(`webpilot-browser-git-${this.projectId}`, {
+      wipe: true,
+    });
+    await this.fs.flush();
+    return { archive: "", fileCount: 0 };
+  }
+
   private async finishWorkspaceMutation(
     metadata: BrowserGitProjectMetadata,
     changedPaths: string[],
@@ -966,6 +1197,36 @@ async function readAllEntries(
   return entries;
 }
 
+async function readBinaryEntries(
+  fs: PromisifiedFS,
+  directory: string,
+  relativeDirectory = "",
+): Promise<Array<{ path: string; content: Uint8Array }>> {
+  const names = await fs.readdir(directory);
+  const entries: Array<{ path: string; content: Uint8Array }> = [];
+
+  for (const name of names.sort()) {
+    const absolutePath = `${directory}/${name}`;
+    const relativePath = relativeDirectory
+      ? `${relativeDirectory}/${name}`
+      : name;
+    const stats = await fs.stat(absolutePath);
+
+    if (stats.isDirectory()) {
+      entries.push(
+        ...(await readBinaryEntries(fs, absolutePath, relativePath)),
+      );
+    } else {
+      const content = await fs.readFile(absolutePath);
+      const stableContent = new Uint8Array(content.byteLength);
+      stableContent.set(content);
+      entries.push({ path: relativePath, content: stableContent });
+    }
+  }
+
+  return entries;
+}
+
 async function writeTextFile(fs: PromisifiedFS, path: string, content: string) {
   await ensureDirectory(fs, parentDirectory(path));
   await fs.writeFile(path, content, "utf8");
@@ -1070,6 +1331,18 @@ function isQuotaExceededError(error: unknown) {
 
 async function sha256(content: string) {
   return sha256Bytes(new TextEncoder().encode(content));
+}
+
+async function hashFileManifest(
+  files: readonly { path: string; content?: string; hash?: string }[],
+) {
+  const entries = await Promise.all(
+    files.map(async (file) => ({
+      path: assertValidProjectPath(file.path),
+      hash: file.hash ?? (await sha256(file.content ?? "")),
+    })),
+  );
+  return sha256(serializeMigrationManifest(entries));
 }
 
 async function sha256Bytes(content: Uint8Array) {

@@ -3420,6 +3420,158 @@ html[data-theme="dark"] .piece-art.travel {
   font-size: 0.875rem;
 }
 
+.browser-git-migration-dialog {
+  gap: 18px;
+  max-width: 520px;
+  padding: 20px;
+}
+
+.browser-git-migration-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding-right: 32px;
+}
+
+.browser-git-migration-mark {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted-foreground);
+}
+
+.browser-git-migration-mark svg {
+  width: 18px;
+  height: 18px;
+}
+
+.browser-git-migration-mark span {
+  width: 28px;
+  height: 1px;
+  background: var(--border);
+}
+
+.browser-git-migration-risk,
+.browser-git-migration-drafts,
+.browser-git-migration-result {
+  display: flex;
+  gap: 12px;
+  padding: 13px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-panel);
+  background: var(--surface-2);
+}
+
+.browser-git-migration-risk > svg,
+.browser-git-migration-result > svg {
+  width: 18px;
+  height: 18px;
+  flex: 0 0 auto;
+  margin-top: 1px;
+}
+
+.browser-git-migration-risk b,
+.browser-git-migration-drafts b,
+.browser-git-migration-result b {
+  color: var(--foreground);
+  font-size: 0.875rem;
+}
+
+.browser-git-migration-risk p,
+.browser-git-migration-drafts p,
+.browser-git-migration-result p {
+  margin: 4px 0 0;
+  color: var(--muted-foreground);
+  font-size: 0.8125rem;
+  line-height: 1.55;
+}
+
+.browser-git-migration-drafts {
+  display: block;
+  border-color: color-mix(in srgb, var(--destructive) 28%, var(--border));
+}
+
+.browser-git-migration-drafts ul {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 10px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.browser-git-migration-drafts li {
+  max-width: 100%;
+  padding: 3px 7px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-control);
+  overflow: hidden;
+  color: var(--muted-foreground);
+  background: var(--surface);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.75rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.browser-git-migration-steps {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.browser-git-migration-steps li {
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr);
+  align-items: center;
+  min-height: 36px;
+  padding: 5px 8px;
+  border-radius: var(--radius-control);
+  color: var(--muted-foreground);
+  font-size: 0.8125rem;
+}
+
+.browser-git-migration-steps li.is-active {
+  color: var(--foreground);
+  background: var(--surface-2);
+}
+
+.browser-git-migration-steps li.is-complete {
+  color: var(--foreground);
+}
+
+.browser-git-migration-steps svg {
+  width: 16px;
+  height: 16px;
+}
+
+.browser-git-migration-spinner {
+  animation: browser-git-migration-spin 0.8s linear infinite;
+}
+
+.browser-git-migration-result.is-error {
+  border-color: color-mix(in srgb, var(--destructive) 28%, var(--border));
+}
+
+.browser-git-migration-result.is-success {
+  border-color: color-mix(in srgb, var(--foreground) 20%, var(--border));
+}
+
+@keyframes browser-git-migration-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .browser-git-migration-spinner {
+    animation: none;
+  }
+}
+
 .workspace-repository-unavailable {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr) auto;

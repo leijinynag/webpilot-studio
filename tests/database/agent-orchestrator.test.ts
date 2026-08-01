@@ -18,7 +18,10 @@ import type {
   ProviderTurnInput,
 } from "@/domains/agent/provider";
 import { AgentStore } from "@/domains/agent/store";
-import type { AgentRunBudget } from "@/domains/agent/types";
+import type {
+  AgentRunBudget,
+  RepositoryIntent,
+} from "@/domains/agent/types";
 import { DatabaseProjectRepository } from "@/domains/project/repository";
 import {
   agentRuns,
@@ -68,13 +71,18 @@ async function createFixture(
     budget?: Partial<AgentRunBudget>;
     profileVersion?: "m3" | "m4";
     initialFiles?: readonly { path: string; content: string }[];
+    storageKind?: "database" | "browser_git";
+    repositoryRevision?: number;
+    repositoryIntent?: RepositoryIntent;
   } = {},
 ) {
   const testDatabase = await createTestDatabase();
   const repository = new DatabaseProjectRepository(testDatabase.database);
+  const storageKind = options.storageKind ?? "database";
   const project = await repository.createProject({
     ownerId: "owner-1",
     name: "Agent Orchestrator",
+    storageKind,
     initialFiles: options.initialFiles ?? [
       {
         path: "src/App.tsx",
@@ -82,15 +90,35 @@ async function createFixture(
       },
     ],
   });
+  if (storageKind === "browser_git") {
+    await repository.claimBrowserGitProvision({
+      ownerId: "owner-1",
+      projectId: project.id,
+    });
+  }
+  const repositoryRevision =
+    storageKind === "browser_git"
+      ? (options.repositoryRevision ?? project.revision)
+      : project.revision;
   const profile = createFrozenAgentProfile({
     locale: "zh-CN",
     projectId: project.id,
-    revision: project.revision,
+    revision: repositoryRevision,
     repositoryCapability: {
-      storageKind: "database",
+      storageKind,
       canRead: true,
       canWrite: true,
-      canExecuteServerTools: true,
+      canExecuteServerTools: storageKind === "database",
+      ...(storageKind === "browser_git"
+        ? {
+            repositoryIntent: options.repositoryIntent ?? {
+              allowStage: false,
+              allowUnstage: false,
+              allowCommit: false,
+              commitAuthor: null,
+            },
+          }
+        : {}),
     },
     provider: "deepseek",
     model: "deepseek-v4-pro",
@@ -100,6 +128,8 @@ async function createFixture(
   const frozenProfile =
     options.profileVersion === "m3"
       ? createM3Profile(profile, project.id, project.revision)
+      : options.profileVersion === "m4"
+        ? createM4Profile(profile, project.id, project.revision)
       : profile;
   const store = new AgentStore(testDatabase.database);
   const run = await store.createRun({
@@ -112,6 +142,7 @@ async function createFixture(
       budget: { ...frozenProfile.budget, ...options.budget },
       ...(options.promptDigest ? { promptDigest: options.promptDigest } : {}),
     },
+    startRevision: repositoryRevision,
   });
 
   return {
@@ -135,6 +166,28 @@ function createM3Profile(
     repositoryCapability: profile.repositoryCapability,
   });
   const toolset = resolveToolsetProfile("webpilot-preview-v2");
+
+  return {
+    ...profile,
+    promptProfile: prompt.id,
+    promptDigest: prompt.digest,
+    toolsetProfile: toolset.id,
+    toolsetDigest: toolset.digest,
+  };
+}
+
+function createM4Profile(
+  profile: ReturnType<typeof createFrozenAgentProfile>,
+  projectId: string,
+  revision: number,
+) {
+  const prompt = resolveSystemPromptProfile("webpilot-system-v4", {
+    locale: profile.locale,
+    projectId,
+    revision,
+    repositoryCapability: profile.repositoryCapability,
+  });
+  const toolset = resolveToolsetProfile("webpilot-browser-v3");
 
   return {
     ...profile,
@@ -286,6 +339,191 @@ function createBrowserResult(
 }
 
 describe("AgentOrchestrator", () => {
+  it("Browser Git 文件工具只挂起到客户端，不调用 Database FileToolExecutor", async () => {
+    const fixture = await createFixture({
+      storageKind: "browser_git",
+      repositoryRevision: 7,
+    });
+    const provider = new ScriptedProvider([
+      [
+        {
+          type: "tool_call_delta",
+          index: 0,
+          toolCallId: "call-browser-list",
+          toolName: "list_files",
+          argumentsDelta: "{}",
+        },
+        { type: "finish", reason: "tool_calls" },
+      ],
+    ]);
+    const executeSpy = vi.spyOn(fixture.fileTools, "execute");
+
+    try {
+      await new AgentOrchestrator(
+        fixture.store,
+        provider,
+        fixture.fileTools,
+      ).run({
+        ownerId: fixture.run.ownerId,
+        runId: fixture.run.id,
+      });
+
+      const snapshot = await fixture.store.getConversationSnapshot({
+        ownerId: fixture.run.ownerId,
+        conversationId: fixture.run.conversationId,
+      });
+
+      expect(executeSpy).not.toHaveBeenCalled();
+      expect(snapshot.runs.at(-1)).toMatchObject({
+        status: "awaiting_client_tool",
+        currentRevision: 7,
+      });
+      expect(snapshot.tools.at(-1)).toMatchObject({
+        toolCallId: "call-browser-list",
+        toolName: "list_files",
+        executionDomain: "client",
+        status: "running",
+        revisionBefore: 7,
+      });
+      expect(snapshot.events.at(-1)).toMatchObject({
+        type: "client_tool.requested",
+        payload: {
+          projectId: fixture.run.projectId,
+          toolName: "list_files",
+          revision: 7,
+        },
+      });
+    } finally {
+      await fixture.testDatabase.close();
+    }
+  });
+
+  it("模型不能通过 Tool Call 为自己获得 commit 权限", async () => {
+    const fixture = await createFixture({
+      storageKind: "browser_git",
+      repositoryRevision: 4,
+    });
+    const provider = new ScriptedProvider([
+      [
+        {
+          type: "tool_call_delta",
+          index: 0,
+          toolCallId: "call-forbidden-commit",
+          toolName: "git_commit",
+          argumentsDelta: JSON.stringify({ message: "feat: forbidden" }),
+        },
+        { type: "finish", reason: "tool_calls" },
+      ],
+      [
+        {
+          type: "text_delta",
+          text: "当前没有获得提交权限，因此没有执行本地提交。",
+        },
+        { type: "finish", reason: "stop" },
+      ],
+    ]);
+
+    try {
+      await new AgentOrchestrator(
+        fixture.store,
+        provider,
+        fixture.fileTools,
+      ).run({
+        ownerId: fixture.run.ownerId,
+        runId: fixture.run.id,
+      });
+
+      const snapshot = await fixture.store.getConversationSnapshot({
+        ownerId: fixture.run.ownerId,
+        conversationId: fixture.run.conversationId,
+      });
+
+      expect(snapshot.runs.at(-1)).toMatchObject({
+        status: "succeeded",
+        currentRevision: 4,
+      });
+      expect(snapshot.tools.at(-1)).toMatchObject({
+        toolCallId: "call-forbidden-commit",
+        toolName: "git_commit",
+        executionDomain: "client",
+        status: "failed",
+        errorCode: AGENT_ERROR_CODES.toolInvalidArguments,
+      });
+      expect(
+        snapshot.events.some(
+          (event) => event.type === "client_tool.requested",
+        ),
+      ).toBe(false);
+    } finally {
+      await fixture.testDatabase.close();
+    }
+  });
+
+  it("明确授权的 commit 使用冻结 author 并挂起到浏览器", async () => {
+    const fixture = await createFixture({
+      storageKind: "browser_git",
+      repositoryRevision: 5,
+      repositoryIntent: {
+        allowStage: false,
+        allowUnstage: false,
+        allowCommit: true,
+        commitAuthor: {
+          name: "Frozen Developer",
+          email: "frozen@example.com",
+        },
+      },
+    });
+    const provider = new ScriptedProvider([
+      [
+        {
+          type: "tool_call_delta",
+          index: 0,
+          toolCallId: "call-authorized-commit",
+          toolName: "git_commit",
+          argumentsDelta: JSON.stringify({ message: "feat: local commit" }),
+        },
+        { type: "finish", reason: "tool_calls" },
+      ],
+    ]);
+
+    try {
+      await new AgentOrchestrator(
+        fixture.store,
+        provider,
+        fixture.fileTools,
+      ).run({
+        ownerId: fixture.run.ownerId,
+        runId: fixture.run.id,
+      });
+
+      const snapshot = await fixture.store.getConversationSnapshot({
+        ownerId: fixture.run.ownerId,
+        conversationId: fixture.run.conversationId,
+      });
+      const requested = snapshot.events.find(
+        (event) =>
+          event.type === "client_tool.requested" &&
+          event.payload.toolCallId === "call-authorized-commit",
+      );
+
+      expect(snapshot.runs.at(-1)).toMatchObject({
+        status: "awaiting_client_tool",
+        currentRevision: 5,
+      });
+      expect(requested?.payload).toMatchObject({
+        toolName: "git_commit",
+        revision: 5,
+        arguments: { message: "feat: local commit" },
+        author: {
+          name: "Frozen Developer",
+          email: "frozen@example.com",
+        },
+      });
+    } finally {
+      await fixture.testDatabase.close();
+    }
+  });
+
   it("模型流输出半句后中断时丢弃临时文本并在预算内重试", async () => {
     const fixture = await createFixture({ maxModelTurns: 3 });
     let turnIndex = 0;

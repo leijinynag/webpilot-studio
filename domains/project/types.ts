@@ -16,6 +16,19 @@ export type ProjectDescription = ProjectSummary & {
   fileCount: number;
 };
 
+export type BrowserGitProvision = {
+  allowCreate: boolean;
+  status: ProjectStatus;
+  /**
+   * 初始源码只随首次成功 claim 返回。后续页面恢复只能打开 IndexedDB，
+   * 不能再次把服务端暂存快照当作本地仓库事实覆盖用户修改。
+   */
+  initialFiles: Array<{
+    path: string;
+    content: string;
+  }>;
+};
+
 export type ProjectFileSnapshot = {
   path: string;
   content: string;
@@ -111,4 +124,27 @@ export type ProjectSearchOptions = {
   maxResults?: number;
   maxExcerptCharacters?: number;
   maxTotalCharacters?: number;
+};
+
+export type BrowserGitMigrationFile = {
+  path: string;
+  content: string;
+  hash: string;
+};
+
+export type BrowserGitMigrationPreparation = {
+  sessionId: string;
+  token: string;
+  projectId: string;
+  projectName: string;
+  sourceRevision: number;
+  candidateRepositoryId: string;
+  manifestHash: string;
+  files: BrowserGitMigrationFile[];
+  expiresAt: string;
+};
+
+export type BrowserGitMigrationResult = {
+  project: ProjectDescription;
+  alreadyCompleted: boolean;
 };

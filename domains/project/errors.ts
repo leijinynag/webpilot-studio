@@ -12,6 +12,8 @@ export const PROJECT_ERROR_CODES = {
   historyCorrupted: "PROJECT_HISTORY_CORRUPTED",
   restoreConflict: "PROJECT_RESTORE_CONFLICT",
   storageUnavailable: "STORAGE_KIND_UNAVAILABLE",
+  migrationConflict: "BROWSER_GIT_MIGRATION_CONFLICT",
+  migrationExpired: "BROWSER_GIT_MIGRATION_EXPIRED",
   originRejected: "ORIGIN_REJECTED",
 } as const;
 

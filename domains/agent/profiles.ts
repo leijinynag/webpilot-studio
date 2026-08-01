@@ -5,7 +5,10 @@ import {
   BROWSER_VERIFY_TOOL_DEFINITION,
   RUN_PREVIEW_TOOL_DEFINITION,
 } from "@/domains/agent/client-tool-contracts";
-import { FILE_TOOL_DEFINITIONS } from "@/domains/agent/tool-contracts";
+import {
+  FILE_TOOL_DEFINITIONS,
+  GIT_TOOL_DEFINITIONS,
+} from "@/domains/agent/tool-contracts";
 import type {
   AgentLocale,
   FrozenAgentRunProfile,
@@ -21,6 +24,8 @@ export const SYSTEM_PROMPT_PROFILE_ID = "webpilot-system-v3";
 export const FILE_TOOLSET_PROFILE_ID = "webpilot-preview-v2";
 export const BROWSER_SYSTEM_PROMPT_PROFILE_ID = "webpilot-system-v5";
 export const BROWSER_TOOLSET_PROFILE_ID = "webpilot-browser-v3";
+export const BROWSER_GIT_SYSTEM_PROMPT_PROFILE_ID = "webpilot-system-v6";
+export const BROWSER_GIT_TOOLSET_PROFILE_ID = "webpilot-browser-git-v4";
 // 领域层只记录“编码 Agent 模型配置”这一能力，不绑定具体供应商。
 // 当前可用的 DeepSeek adapter 在 infrastructure 层完成映射，未来替换
 // Provider 时不需要修改 Agent Run、Transcript 或 Orchestrator。
@@ -195,6 +200,41 @@ const SYSTEM_PROMPT_PROFILES = {
       "5. In the final response, summarize changed files, replay count, and successful browser evidence.",
     ].join("\n");
   },
+  [BROWSER_GIT_SYSTEM_PROMPT_PROFILE_ID]: (context: SystemPromptContext) => {
+    const responseLanguage =
+      context.locale === "zh-CN" ? "简体中文" : "English";
+    const intent = context.repositoryCapability.repositoryIntent;
+
+    return [
+      "You are the coding agent inside WebPilot Studio.",
+      `Respond to the user in ${responseLanguage}.`,
+      "Repository storage: browser_git. Repository source and Git state exist only in the user's browser.",
+      `Project id: ${context.projectId}. Current frozen revision: ${context.revision}.`,
+      "",
+      "Browser repository rules:",
+      "1. list_files, search_text, read_file and all file mutations execute through a browser client tool. Never assume the server can read Browser Git source.",
+      "2. Always call list_files first. Read an existing file at the current revision before mutating it. A new path does not need read_file.",
+      "3. Perform at most one mutating tool per model turn. For file mutations, use the exact latest expectedRevision and continue from the returned revision.",
+      "4. git_status, git_log and git_current_branch are read-only and allowed.",
+      `5. Frozen Git permissions: stage=${intent?.allowStage === true}, unstage=${intent?.allowUnstage === true}, commit=${intent?.allowCommit === true}, commitAuthor=${intent?.commitAuthor ? "provided" : "missing"}.`,
+      "6. git_stage, git_unstage and git_commit are allowed only when the frozen permission says true. A model tool call cannot grant itself permission.",
+      "7. git_commit also requires the server-provided frozen author identity. Never invent, infer, or substitute an author name or email.",
+      "8. Remote, push, pull and fetch operations are unavailable in this version. Do not claim they were performed.",
+      "",
+      "Generation and verification order:",
+      "1. Read-only repository questions may finish without Preview.",
+      "2. For code changes, complete a coherent file set before run_preview. File writes never install dependencies.",
+      "3. Follow: list_files -> read/search -> sequential mutations -> final list_files -> run_preview -> browser_verify.",
+      "4. browser_verify must include executable smoke steps and at least one assertion.",
+      "5. On failure, repair from structured evidence and verify the latest revision again.",
+      "",
+      "Completion gate:",
+      "1. File and Git tool success does not prove runtime behavior.",
+      "2. Never claim a code change is complete until the latest revision passes browser_verify or automatic replay.",
+      "3. Stop on cancellation, conflict, unavailable browser repository, invalid evidence, no progress, or exhausted budget.",
+      "4. In the final response, distinguish code changes, local Git operations, and verification evidence.",
+    ].join("\n");
+  },
 } satisfies Record<string, (context: SystemPromptContext) => string>;
 
 const TOOLSET_PROFILES = {
@@ -205,6 +245,12 @@ const TOOLSET_PROFILES = {
   ],
   [BROWSER_TOOLSET_PROFILE_ID]: [
     ...FILE_TOOL_DEFINITIONS,
+    RUN_PREVIEW_TOOL_DEFINITION,
+    BROWSER_VERIFY_TOOL_DEFINITION,
+  ],
+  [BROWSER_GIT_TOOLSET_PROFILE_ID]: [
+    ...FILE_TOOL_DEFINITIONS,
+    ...GIT_TOOL_DEFINITIONS,
     RUN_PREVIEW_TOOL_DEFINITION,
     BROWSER_VERIFY_TOOL_DEFINITION,
   ],
@@ -259,11 +305,19 @@ export function createFrozenAgentProfile(input: {
   maxModelTurns: number;
   maxWallTimeSeconds: number;
 }): FrozenAgentRunProfile {
+  const usesBrowserGit =
+    input.repositoryCapability.storageKind === "browser_git";
   const prompt = resolveSystemPromptProfile(
-    BROWSER_SYSTEM_PROMPT_PROFILE_ID,
+    usesBrowserGit
+      ? BROWSER_GIT_SYSTEM_PROMPT_PROFILE_ID
+      : BROWSER_SYSTEM_PROMPT_PROFILE_ID,
     input,
   );
-  const toolset = resolveToolsetProfile(BROWSER_TOOLSET_PROFILE_ID);
+  const toolset = resolveToolsetProfile(
+    usesBrowserGit
+      ? BROWSER_GIT_TOOLSET_PROFILE_ID
+      : BROWSER_TOOLSET_PROFILE_ID,
+  );
 
   return {
     locale: input.locale,

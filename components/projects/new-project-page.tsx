@@ -52,9 +52,9 @@ export function NewProjectPage() {
         throw new Error(body.error?.message ?? "项目创建失败，请稍后重试。");
       }
 
-      // 使用服务端生成的 UUID 跳转；随后刷新仍由匿名 Cookie 找回同一个项目。
+      // 使用服务端生成的 UUID 只导航一次；Browser Git 首次 provision claim
+      // 必须保持单次消费，避免额外 refresh 造成第二次初始化竞态。
       router.push(`/p/${body.project.id}`);
-      router.refresh();
     } catch (creationError) {
       setError(
         creationError instanceof Error

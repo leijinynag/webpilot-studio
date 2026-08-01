@@ -11,7 +11,6 @@ import {
 } from "react";
 import type { editor } from "monaco-editor";
 import {
-  Bot,
   Code2,
   ExternalLink,
   FilePlus2,
@@ -31,15 +30,22 @@ import {
 } from "@/components/ui/tooltip";
 import { CodeEditor } from "@/components/workbench/code-editor";
 import { AgentPanel } from "@/components/workbench/agent-panel";
+import { BrowserGitMigrationDialog } from "@/components/workbench/browser-git-migration-dialog";
 import { EditorTabs } from "@/components/workbench/editor-tabs";
 import { FileOperationDialog } from "@/components/workbench/file-operation-dialog";
 import { FileTree } from "@/components/workbench/file-tree";
 import { PROJECT_ERROR_CODES } from "@/domains/project/errors";
 import { BrowserGitProjectRepository } from "@/domains/project/browser-git-repository";
 import type {
+  BrowserRepositoryClientToolRequest,
   ClientToolRequest,
   ClientToolResult,
 } from "@/domains/agent/client-tools";
+import { isPreviewClientToolRequest } from "@/domains/agent/client-tools";
+import {
+  createBrowserRepositoryToolFailure,
+  executeBrowserRepositoryClientTool,
+} from "@/domains/agent/browser-git-client-tools";
 import type {
   ProjectDescription,
   ProjectFileSnapshot,
@@ -76,6 +82,16 @@ type ApiErrorBody = {
   };
 };
 
+class ClientToolResultSubmissionError extends Error {
+  constructor(
+    message: string,
+    readonly retryable: boolean,
+  ) {
+    super(message);
+    this.name = "ClientToolResultSubmissionError";
+  }
+}
+
 export function ProjectWorkspace({
   initialFiles,
   project,
@@ -111,8 +127,37 @@ export function ProjectWorkspace({
       : null,
   );
   const editorRef = useRef<editor.IStandaloneCodeEditor | null>(null);
+  // SSE 实时事件与快照恢复可能在同一个 Tool Call 上交错到达。
+  // executing 防止并发执行，completed 则阻止首次结果已经被服务端接纳后，
+  // 迟到快照再次触发本地仓库副作用。
+  const executingRepositoryToolsRef = useRef(new Set<string>());
+  const repositoryToolResultsRef = useRef(
+    new Map<
+      string,
+      {
+        request: BrowserRepositoryClientToolRequest;
+        result: ClientToolResult;
+      }
+    >(),
+  );
+  const completedRepositoryToolsRef = useRef(new Set<string>());
+  const repositoryToolRetryTimersRef = useRef(
+    new Map<string, ReturnType<typeof setTimeout>>(),
+  );
+  const repositoryToolRetryAttemptsRef = useRef(new Map<string, number>());
+  const [repositoryToolRetryNonce, setRepositoryToolRetryNonce] = useState(0);
   const stateRef = useRef(state);
   stateRef.current = state;
+
+  useEffect(() => {
+    const retryTimers = repositoryToolRetryTimersRef.current;
+    return () => {
+      for (const timer of retryTimers.values()) {
+        clearTimeout(timer);
+      }
+      retryTimers.clear();
+    };
+  }, []);
 
   const activeFile = state.activePath
     ? (state.files[state.activePath] ?? null)
@@ -340,10 +385,22 @@ export function ProjectWorkspace({
         return;
       }
 
+      if (
+        !isPreviewClientToolRequest(request) &&
+        (executingRepositoryToolsRef.current.has(request.idempotencyKey) ||
+          completedRepositoryToolsRef.current.has(request.idempotencyKey))
+      ) {
+        // 同一幂等键已经在本页面执行或收到服务端响应，不能再次读取/修改本地仓库。
+        // 服务端 Ledger 仍然负责跨页面和跨实例的最终幂等校验。
+        return;
+      }
+
       setClientToolRequest((current) =>
         current?.toolCallId === request.toolCallId ? current : request,
       );
-      setView("preview");
+      if (isPreviewClientToolRequest(request)) {
+        setView("preview");
+      }
 
       // Tool Call 在文件 mutation 落库后才会下发。若 SSE 比工作台快照先到，
       // 主动拉取目标 revision；reducer 仍会保护用户尚未保存的本地草稿。
@@ -378,7 +435,13 @@ export function ProjectWorkspace({
         };
 
         if (!response.ok) {
-          throw new Error(body.error?.message ?? "Preview 证据提交失败。");
+          throw new ClientToolResultSubmissionError(
+            body.error?.message ?? "Client Tool 结果提交失败。",
+            response.status >= 500 ||
+              response.status === 408 ||
+              response.status === 425 ||
+              response.status === 429,
+          );
         }
 
         const disposition = body.disposition ?? "ignored";
@@ -393,19 +456,134 @@ export function ProjectWorkspace({
         }
         return disposition;
       } catch (error) {
-        const message =
-          error instanceof Error
-            ? error.message
-            : "Preview 证据提交失败，请稍后重试。";
+        const submissionError =
+          error instanceof ClientToolResultSubmissionError
+            ? error
+            : new ClientToolResultSubmissionError(
+                error instanceof Error
+                  ? error.message
+                  : "Client Tool 结果提交失败，请稍后重试。",
+                true,
+              );
         dispatch({
           type: "error",
-          message,
+          message: submissionError.message,
         });
-        throw error instanceof Error ? error : new Error(message);
+        throw submissionError;
       }
     },
     [],
   );
+
+  useEffect(() => {
+    if (
+      !clientToolRequest ||
+      isPreviewClientToolRequest(clientToolRequest) ||
+      executingRepositoryToolsRef.current.has(
+        clientToolRequest.idempotencyKey,
+      ) ||
+      completedRepositoryToolsRef.current.has(clientToolRequest.idempotencyKey)
+    ) {
+      return;
+    }
+
+    const request = clientToolRequest as BrowserRepositoryClientToolRequest;
+    executingRepositoryToolsRef.current.add(request.idempotencyKey);
+
+    async function executeRepositoryTool() {
+      try {
+        const cached = repositoryToolResultsRef.current.get(
+          request.idempotencyKey,
+        );
+        let result: ClientToolResult;
+
+        if (cached?.request.toolCallId === request.toolCallId) {
+          result = cached.result;
+        } else if (!browserGitRepository || !repositoryReady) {
+          const unavailableError = new Error(
+            repositoryUnavailable ??
+              "Browser Git 仓库尚未准备完成，无法执行 Agent 工具。",
+          );
+          result = createBrowserRepositoryToolFailure(
+            request,
+            unavailableError,
+          );
+          dispatch({
+            type: "error",
+            message: unavailableError.message,
+          });
+        } else {
+          result = await executeBrowserRepositoryClientTool({
+            repository: browserGitRepository,
+            request,
+          });
+        }
+
+        repositoryToolResultsRef.current.set(request.idempotencyKey, {
+          request,
+          result,
+        });
+        const disposition = await handleClientToolResult(request, result);
+
+        // 只要服务端已经明确返回 disposition，本次本地执行就结束。
+        // ignored 可能表示 Run 已被其他恢复路径推进；再次执行 mutation
+        // 只会让本地 revision 和服务端 Ledger 进一步分叉。
+        completedRepositoryToolsRef.current.add(request.idempotencyKey);
+        if (disposition !== "ignored") {
+          await refreshRepositorySnapshot();
+        }
+        repositoryToolRetryAttemptsRef.current.delete(request.idempotencyKey);
+      } catch (error) {
+        dispatch({
+          type: "error",
+          message:
+            error instanceof Error
+              ? error.message
+              : "Browser Repository 工具执行失败。",
+        });
+
+        // 结果提交失败时保留同一个请求和已执行结果。只有明确可重试的
+        // 网络/服务端错误才自动再次提交，409 等业务冲突必须停下来交给
+        // 服务端事实处理，避免把真正的 revision 问题变成无限重试。
+        if (
+          error instanceof ClientToolResultSubmissionError &&
+          error.retryable &&
+          repositoryToolResultsRef.current.has(request.idempotencyKey) &&
+          !repositoryToolRetryTimersRef.current.has(request.idempotencyKey)
+        ) {
+          const attempt =
+            (repositoryToolRetryAttemptsRef.current.get(
+              request.idempotencyKey,
+            ) ?? 0) + 1;
+          repositoryToolRetryAttemptsRef.current.set(
+            request.idempotencyKey,
+            attempt,
+          );
+          const delayMs = Math.min(1_000 * 2 ** (attempt - 1), 8_000);
+          const timer = setTimeout(() => {
+            repositoryToolRetryTimersRef.current.delete(request.idempotencyKey);
+            setRepositoryToolRetryNonce((current) => current + 1);
+          }, delayMs);
+          repositoryToolRetryTimersRef.current.set(
+            request.idempotencyKey,
+            timer,
+          );
+        }
+      } finally {
+        executingRepositoryToolsRef.current.delete(request.idempotencyKey);
+      }
+    }
+
+    void executeRepositoryTool();
+  }, [
+    browserGitRepository,
+    clientToolRequest,
+    handleClientToolResult,
+    refreshRepositorySnapshot,
+    repositoryReady,
+    repositoryUnavailable,
+    repositoryToolRetryNonce,
+  ]);
 
   async function submitFileOperation(value: string) {
     if (!operation || mutationPending) {
@@ -633,6 +811,12 @@ export function ProjectWorkspace({
         </ToggleGroup>
 
         <div className="workbench-actions">
+          {project.storageKind === "database" ? (
+            <BrowserGitMigrationDialog
+              dirtyPaths={dirtyPaths}
+              project={project}
+            />
+          ) : null}
           <Button asChild size="sm" variant="outline">
             <Link href={`/p/${project.id}/source-control`}>
               <GitBranch data-icon="inline-start" />
@@ -671,25 +855,14 @@ export function ProjectWorkspace({
         </section>
       ) : (
         <div className="workbench-grid">
-          {project.storageKind === "database" ? (
-            <AgentPanel
-              dirtyPaths={dirtyPaths}
-              onClientToolRequest={handleClientToolRequest}
-              onRevisionChange={handleAgentRevisionChange}
-              onRestoreComplete={handleRestoreComplete}
-              projectId={project.id}
-              revision={agentRevision}
-            />
-          ) : (
-            <aside className="agent-panel agent-panel-boundary">
-              <Bot />
-              <b>Browser Git Agent</b>
-              <p>
-                本地仓库 Agent 工具将在 7.4 接入。当前版本不会把源码回退到服务端
-                Database 执行。
-              </p>
-            </aside>
-          )}
+          <AgentPanel
+            dirtyPaths={dirtyPaths}
+            onClientToolRequest={handleClientToolRequest}
+            onRevisionChange={handleAgentRevisionChange}
+            onRestoreComplete={handleRestoreComplete}
+            projectId={project.id}
+            revision={agentRevision}
+          />
           <section className="workspace workspace-ide">
             <div className="ide-sidebar">
               <div aria-label="Explorer" className="ide-panel-heading">
@@ -799,7 +972,11 @@ export function ProjectWorkspace({
                   )
                 ) : (
                   <WebContainerPreview
-                    clientToolRequest={clientToolRequest}
+                    clientToolRequest={
+                      isPreviewClientToolRequest(clientToolRequest)
+                        ? clientToolRequest
+                        : null
+                    }
                     files={repositoryFiles}
                     onClientToolResult={handleClientToolResult}
                     projectId={project.id}

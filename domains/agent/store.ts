@@ -11,6 +11,8 @@ import type { ExtractTablesWithRelations } from "drizzle-orm/relations";
 
 import {
   BROWSER_VERIFY_TOOL_NAME,
+  type BrowserRepositoryClientToolResultRequest,
+  type BrowserRepositoryToolResult,
   type BrowserVerifyToolArguments,
   browserVerifyToolArgumentsSchema,
   type BrowserVerifyResult,
@@ -21,6 +23,12 @@ import {
   RUN_PREVIEW_TOOL_NAME,
   type RunPreviewToolArguments,
 } from "@/domains/agent/evidence";
+import {
+  FILE_TOOL_NAMES,
+  GIT_TOOL_NAMES,
+  type FileToolName,
+  type GitToolName,
+} from "@/domains/agent/tool-contracts";
 import {
   isTerminalAgentRunStatus,
   reduceAgentRunStatus,
@@ -75,9 +83,7 @@ type DatabaseTransaction<TQueryResult extends PgQueryResultHKT> = PgTransaction<
   typeof databaseSchema,
   RelationalSchema
 >;
-export type AgentTransactionRunner<
-  TQueryResult extends PgQueryResultHKT,
-> = <T>(
+export type AgentTransactionRunner<TQueryResult extends PgQueryResultHKT> = <T>(
   operation: (transaction: DatabaseTransaction<TQueryResult>) => Promise<T>,
   config?: PgTransactionConfig,
 ) => Promise<T>;
@@ -107,7 +113,56 @@ export type CreateAgentRunInput = {
   conversationTitle: string;
   userMessage: string;
   profile: FrozenAgentRunProfile;
+  startRevision?: number;
 };
+
+type SuspendForPreviewInput = {
+  ownerId: string;
+  runId: string;
+  projectId: string;
+  toolCallId: string;
+  toolName: typeof RUN_PREVIEW_TOOL_NAME;
+  argumentsJson: RunPreviewToolArguments;
+  idempotencyKey: string;
+  revision: number;
+  leaseId: string;
+};
+
+type SuspendForBrowserVerifyInput = {
+  ownerId: string;
+  runId: string;
+  projectId: string;
+  toolCallId: string;
+  toolName: typeof BROWSER_VERIFY_TOOL_NAME;
+  argumentsJson: BrowserVerifyToolArguments;
+  idempotencyKey: string;
+  revision: number;
+  leaseId: string;
+  source: "agent" | "replay";
+  replayCount: number;
+};
+
+type SuspendForBrowserRepositoryInput = {
+  ownerId: string;
+  runId: string;
+  projectId: string;
+  toolCallId: string;
+  toolName: FileToolName | GitToolName;
+  argumentsJson: Record<string, unknown>;
+  idempotencyKey: string;
+  revision: number;
+  leaseId: string;
+  readBeforeMutation?: boolean;
+  author?: {
+    name: string;
+    email: string;
+  };
+};
+
+type SuspendForClientToolInput =
+  | SuspendForPreviewInput
+  | SuspendForBrowserVerifyInput
+  | SuspendForBrowserRepositoryInput;
 
 type NewTranscriptMessage = TranscriptMessage extends infer Message
   ? Message extends TranscriptMessage
@@ -130,9 +185,7 @@ export class AgentStore<TQueryResult extends PgQueryResultHKT> {
    * runner，避免热更新导致 Drizzle 把同一事务的 SQL 分配到不同连接。
    */
   private runTransaction<T>(
-    operation: (
-      transaction: DatabaseTransaction<TQueryResult>,
-    ) => Promise<T>,
+    operation: (transaction: DatabaseTransaction<TQueryResult>) => Promise<T>,
     config?: PgTransactionConfig,
   ): Promise<T> {
     return this.options.transaction
@@ -177,6 +230,19 @@ export class AgentStore<TQueryResult extends PgQueryResultHKT> {
             AGENT_ERROR_CODES.invalidRequest,
             "冻结的 Repository capability 与项目存储类型不一致。",
             409,
+          );
+        }
+
+        const startRevision = input.startRevision ?? project.revision;
+        if (
+          project.storageKind === "database" &&
+          startRevision !== project.revision
+        ) {
+          throw new AgentError(
+            AGENT_ERROR_CODES.revisionConflict,
+            "Database Agent Run 的起始 revision 与服务端 Repository 不一致。",
+            409,
+            { startRevision, projectRevision: project.revision },
           );
         }
 
@@ -233,8 +299,8 @@ export class AgentStore<TQueryResult extends PgQueryResultHKT> {
             projectId: input.projectId,
             ownerId: input.ownerId,
             status: "queued",
-            startRevision: project.revision,
-            currentRevision: project.revision,
+            startRevision,
+            currentRevision: startRevision,
             locale: input.profile.locale,
             provider: input.profile.provider,
             model: input.profile.model,
@@ -272,11 +338,16 @@ export class AgentStore<TQueryResult extends PgQueryResultHKT> {
             correlationId,
           },
         });
-        await insertAgentStartCheckpoint(tx, {
-          projectId: run.projectId,
-          runId: run.id,
-          revision: run.startRevision,
-        });
+        if (input.profile.repositoryCapability.storageKind === "database") {
+          // Database Repository 的完整源码快照由服务端历史表管理，因此可以
+          // 在同一事务内冻结 Agent 起点。Browser Git 的 revision 和源码仅在
+          // 当前浏览器存在，服务端不能用项目索引 revision 伪造 checkpoint。
+          await insertAgentStartCheckpoint(tx, {
+            projectId: run.projectId,
+            runId: run.id,
+            revision: run.startRevision,
+          });
+        }
 
         return toAgentRunRecord(run);
       });
@@ -432,7 +503,8 @@ export class AgentStore<TQueryResult extends PgQueryResultHKT> {
     // 生产环境注入的 runner 会显式固定 Neon PoolClient，避免 Turbopack 多模块
     // 实例下 Drizzle 的 Pool 身份判断失效。数据库测试不注入 runner，继续使用
     // PGlite 自身的事务实现，领域层因此不依赖具体数据库驱动。
-    return this.runTransaction(async (tx) => {
+    return this.runTransaction(
+      async (tx) => {
         const [conversation] = await tx
           .select()
           .from(conversations)
@@ -516,9 +588,11 @@ export class AgentStore<TQueryResult extends PgQueryResultHKT> {
           verificationRuns: verificationRunRows.map(toVerificationRunRecord),
           verificationSteps: verificationStepRows,
         };
-      }, {
+      },
+      {
         isolationLevel: "repeatable read",
-      });
+      },
+    );
   }
 
   async countActiveRuns(input: {
@@ -705,9 +779,33 @@ export class AgentStore<TQueryResult extends PgQueryResultHKT> {
     ownerId: string;
     runId: string;
   }): Promise<AgentRunRecord> {
-    const row = await this.runTransaction((tx) =>
-      completeSuccessfulAgentRun(tx, input),
-    );
+    const row = await this.runTransaction(async (tx) => {
+      const [run] = await tx
+        .select({
+          repositoryCapability: agentRuns.repositoryCapability,
+        })
+        .from(agentRuns)
+        .where(
+          and(
+            eq(agentRuns.id, input.runId),
+            eq(agentRuns.ownerId, input.ownerId),
+          ),
+        );
+
+      if (!run) {
+        throw new AgentError(
+          AGENT_ERROR_CODES.runNotFound,
+          "Agent Run 不存在或不属于当前匿名工作区。",
+          404,
+        );
+      }
+
+      if (run.repositoryCapability.storageKind === "browser_git") {
+        return completeBrowserGitSuccessfulRun(tx, input);
+      }
+
+      return completeSuccessfulAgentRun(tx, input);
+    });
 
     return toAgentRunRecord(row);
   }
@@ -1073,33 +1171,9 @@ export class AgentStore<TQueryResult extends PgQueryResultHKT> {
    * 客户端工具的 Ledger、Verification、Run 状态、租约释放和 SSE 事件必须
    * 同时落库。任何一步失败都会回滚，避免刷新后出现“Run 正在等待，但没有
    * running Tool Invocation 可恢复”的永久悬空状态。
-   */
+  */
   async suspendForClientTool(
-    input:
-      | {
-          ownerId: string;
-          runId: string;
-          projectId: string;
-          toolCallId: string;
-          toolName: typeof RUN_PREVIEW_TOOL_NAME;
-          argumentsJson: RunPreviewToolArguments;
-          idempotencyKey: string;
-          revision: number;
-          leaseId: string;
-        }
-      | {
-          ownerId: string;
-          runId: string;
-          projectId: string;
-          toolCallId: string;
-          toolName: typeof BROWSER_VERIFY_TOOL_NAME;
-          argumentsJson: BrowserVerifyToolArguments;
-          idempotencyKey: string;
-          revision: number;
-          leaseId: string;
-          source: "agent" | "replay";
-          replayCount: number;
-        },
+    input: SuspendForClientToolInput,
   ): Promise<void> {
     await this.runTransaction(async (tx) => {
       const [lockedRun] = await tx
@@ -1339,6 +1413,13 @@ export class AgentStore<TQueryResult extends PgQueryResultHKT> {
                   source: input.source,
                   replayCount: input.replayCount,
                 }
+              : {}),
+            ...(input.toolName === GIT_TOOL_NAMES.commit && input.author
+              ? { author: input.author }
+              : {}),
+            ...(isBrowserRepositorySuspendInput(input) &&
+            isBrowserRepositoryFileMutation(input.toolName)
+              ? { readBeforeMutation: input.readBeforeMutation === true }
               : {}),
           },
         },
@@ -1659,6 +1740,15 @@ export class AgentStore<TQueryResult extends PgQueryResultHKT> {
           409,
           { toolCallId: input.toolCallId, toolName: input.toolName },
         );
+      }
+
+      if (isBrowserRepositoryResultRequest(input)) {
+        return this.completeBrowserRepositoryToolResult({
+          tx,
+          input,
+          invocation,
+          runRow,
+        });
       }
 
       let verificationRunRow: typeof verificationRuns.$inferSelect | null =
@@ -2064,6 +2154,215 @@ export class AgentStore<TQueryResult extends PgQueryResultHKT> {
     });
   }
 
+  /**
+   * Browser Git 的源码与 Git 状态只存在于浏览器。服务端事务负责验证请求身份、
+   * Ledger 幂等性和 Run 状态，但不会把本地仓库结果伪装成 Preview Evidence。
+   *
+   * 文件 mutation 可以推进源码 revision；Git stage/unstage/commit 只改变 index
+   * 或提交历史，必须保持源码 revision 不变。二者都由客户端返回的结构化结果
+   * 驱动，服务端项目索引中的 revision 不参与 Browser Git 的源码栅栏判断。
+   */
+  private async completeBrowserRepositoryToolResult(input: {
+    tx: DatabaseTransaction<TQueryResult>;
+    input: {
+      ownerId: string;
+      runId: string;
+    } & BrowserRepositoryClientToolResultRequest;
+    invocation: typeof toolInvocations.$inferSelect;
+    runRow: typeof agentRuns.$inferSelect;
+  }): Promise<{
+    disposition: "accepted" | "duplicate" | "ignored";
+    run: AgentRunRecord;
+  }> {
+    const { tx, invocation, runRow } = input;
+    const request = input.input;
+
+    const result: BrowserRepositoryToolResult = request.result;
+    const isFileMutation = isBrowserRepositoryFileMutation(request.toolName);
+    const expectedResultRevision =
+      result.ok && isFileMutation ? request.revision + 1 : request.revision;
+
+    if (
+      invocation.status === "succeeded" ||
+      invocation.status === "failed" ||
+      invocation.status === "cancelled"
+    ) {
+      if (
+        invocation.resultJson &&
+        isDeepStrictEqual(invocation.resultJson, result)
+      ) {
+        return {
+          disposition: "duplicate",
+          run: toAgentRunRecord(runRow),
+        };
+      }
+
+      throw new AgentError(
+        AGENT_ERROR_CODES.toolAlreadyExecuted,
+        "同一幂等键已经提交过不同的 Browser Repository Result。",
+        409,
+      );
+    }
+
+    const ignoredReason =
+      runRow.repositoryCapability.storageKind !== "browser_git"
+        ? "repository_not_browser_git"
+        : runRow.status !== "awaiting_client_tool"
+          ? "run_not_awaiting_client_tool"
+          : invocation.status !== "running"
+            ? "invocation_not_running"
+            : runRow.currentRevision !== request.revision ||
+                result.revision !== expectedResultRevision
+              ? "stale_revision"
+              : null;
+
+    if (ignoredReason) {
+      await tx.insert(agentRunEvents).values({
+        runId: request.runId,
+        type: "client_tool.result_ignored",
+        payload: {
+          toolCallId: request.toolCallId,
+          toolName: request.toolName,
+          reason: ignoredReason,
+          submittedRevision: request.revision,
+          currentRevision: runRow.currentRevision,
+          resultRevision: result.revision,
+        },
+      });
+
+      return {
+        disposition: "ignored",
+        run: toAgentRunRecord(runRow),
+      };
+    }
+
+    const nextRevision =
+      result.ok && isFileMutation ? result.revision : request.revision;
+    const now = new Date();
+    const [completedInvocation] = await tx
+      .update(toolInvocations)
+      .set({
+        status: result.ok ? "succeeded" : "failed",
+        resultJson: result,
+        revisionAfter: nextRevision,
+        errorCode: result.ok ? null : result.error.code,
+        completedAt: now,
+      })
+      .where(
+        and(
+          eq(toolInvocations.id, invocation.id),
+          eq(toolInvocations.status, "running"),
+        ),
+      )
+      .returning();
+
+    if (!completedInvocation) {
+      const [latestInvocation] = await tx
+        .select()
+        .from(toolInvocations)
+        .where(eq(toolInvocations.id, invocation.id));
+
+      if (
+        latestInvocation?.resultJson &&
+        isDeepStrictEqual(latestInvocation.resultJson, result)
+      ) {
+        return {
+          disposition: "duplicate",
+          run: toAgentRunRecord(runRow),
+        };
+      }
+
+      throw new AgentError(
+        AGENT_ERROR_CODES.toolAlreadyExecuted,
+        "Browser Repository invocation 已被其他请求完成。",
+        409,
+      );
+    }
+
+    await tx.insert(transcriptMessages).values({
+      conversationId: runRow.conversationId,
+      runId: runRow.id,
+      role: "tool",
+      kind: "tool_result",
+      payload: {
+        toolCallId: request.toolCallId,
+        toolName: request.toolName,
+        resultJson: result,
+      },
+    });
+
+    const currentUsage = normalizeAgentRunUsage(runRow.usage);
+    const nextUsage = resumeAgentExecution(
+      {
+        ...currentUsage,
+        clientResumes: currentUsage.clientResumes + 1,
+      },
+      now,
+    );
+    const [updatedRun] = await tx
+      .update(agentRuns)
+      .set({
+        status: "running",
+        currentRevision: nextRevision,
+        usage: nextUsage,
+        updatedAt: now,
+      })
+      .where(
+        and(
+          eq(agentRuns.id, request.runId),
+          eq(agentRuns.ownerId, request.ownerId),
+          eq(agentRuns.status, "awaiting_client_tool"),
+        ),
+      )
+      .returning();
+
+    if (!updatedRun) {
+      throw new AgentError(
+        AGENT_ERROR_CODES.runConflict,
+        "Browser Repository Result 提交时 Run 状态已发生变化。",
+        409,
+      );
+    }
+
+    await tx.insert(agentRunEvents).values([
+      {
+        runId: request.runId,
+        type: "tool.completed",
+        payload: {
+          toolCallId: request.toolCallId,
+          toolName: request.toolName,
+          ok: result.ok,
+          revision: nextRevision,
+          ...(result.ok ? {} : { errorCode: result.error.code }),
+        },
+      },
+      {
+        runId: request.runId,
+        type: "client_tool.completed",
+        payload: {
+          toolCallId: request.toolCallId,
+          toolName: request.toolName,
+          ok: result.ok,
+          revision: nextRevision,
+        },
+      },
+      {
+        runId: request.runId,
+        type: "run.status_changed",
+        payload: {
+          previousStatus: "awaiting_client_tool",
+          status: "running",
+          currentRevision: nextRevision,
+        },
+      },
+    ]);
+
+    return {
+      disposition: "accepted",
+      run: toAgentRunRecord(updatedRun),
+    };
+  }
+
   async findSuccessfulRead(input: {
     runId: string;
     path: string;
@@ -2124,6 +2423,129 @@ function normalizeConversationTitle(value: string): string {
   }
 
   return title;
+}
+
+const BROWSER_REPOSITORY_TOOL_NAMES = new Set<string>([
+  ...Object.values(FILE_TOOL_NAMES),
+  ...Object.values(GIT_TOOL_NAMES),
+]);
+
+const BROWSER_REPOSITORY_FILE_MUTATIONS = new Set<string>([
+  FILE_TOOL_NAMES.writeFile,
+  FILE_TOOL_NAMES.deleteFile,
+  FILE_TOOL_NAMES.renameFile,
+]);
+
+function isBrowserRepositoryToolName(value: string): boolean {
+  return BROWSER_REPOSITORY_TOOL_NAMES.has(value);
+}
+
+function isBrowserRepositoryFileMutation(value: string): boolean {
+  return BROWSER_REPOSITORY_FILE_MUTATIONS.has(value);
+}
+
+/**
+ * Browser Git 成功收尾只更新 Agent Run 事实。
+ *
+ * 源码 revision、checkpoint、HEAD 和 index 都属于浏览器本地 Repository，
+ * 服务端既没有能力验证对应 manifest，也不能用 projects.revision 伪造一份
+ * Database Change Set。客户端 Repository 会独立维护本地 checkpoint。
+ */
+async function completeBrowserGitSuccessfulRun<
+  TQueryResult extends PgQueryResultHKT,
+>(
+  tx: DatabaseTransaction<TQueryResult>,
+  input: { ownerId: string; runId: string },
+) {
+  const [run] = await tx
+    .select()
+    .from(agentRuns)
+    .where(
+      and(eq(agentRuns.id, input.runId), eq(agentRuns.ownerId, input.ownerId)),
+    )
+    .for("update");
+
+  if (!run) {
+    throw new AgentError(
+      AGENT_ERROR_CODES.runNotFound,
+      "Agent Run 不存在或不属于当前匿名工作区。",
+      404,
+    );
+  }
+
+  if (run.status === "succeeded") {
+    return run;
+  }
+
+  if (
+    run.status !== "running" ||
+    run.repositoryCapability.storageKind !== "browser_git"
+  ) {
+    throw new AgentError(
+      AGENT_ERROR_CODES.runConflict,
+      "Browser Git Agent Run 当前状态不能完成成功收尾。",
+      409,
+      { status: run.status },
+    );
+  }
+
+  const now = new Date();
+  const [updated] = await tx
+    .update(agentRuns)
+    .set({
+      status: "succeeded",
+      usage: pauseAgentExecution(normalizeAgentRunUsage(run.usage), now),
+      completedAt: now,
+      updatedAt: now,
+      errorCode: null,
+      errorMessage: null,
+      executionLeaseId: null,
+      executionLeaseExpiresAt: null,
+    })
+    .where(
+      and(
+        eq(agentRuns.id, run.id),
+        eq(agentRuns.ownerId, run.ownerId),
+        eq(agentRuns.status, "running"),
+      ),
+    )
+    .returning();
+
+  if (!updated) {
+    throw new AgentError(
+      AGENT_ERROR_CODES.runConflict,
+      "Browser Git Agent Run 成功状态写入失败。",
+      409,
+    );
+  }
+
+  await tx.insert(agentRunEvents).values({
+    runId: run.id,
+    type: "run.status_changed",
+    payload: {
+      previousStatus: "running",
+      status: "succeeded",
+      currentRevision: updated.currentRevision,
+      repositoryStorageKind: "browser_git",
+    },
+  });
+
+  return updated;
+}
+
+function isBrowserRepositorySuspendInput(
+  input: SuspendForClientToolInput,
+): input is SuspendForBrowserRepositoryInput {
+  return (
+    input.toolName !== RUN_PREVIEW_TOOL_NAME &&
+    input.toolName !== BROWSER_VERIFY_TOOL_NAME
+  );
+}
+
+function isBrowserRepositoryResultRequest(
+  input: ClientToolResultRequest,
+): input is BrowserRepositoryClientToolResultRequest {
+  return isBrowserRepositoryToolName(input.toolName);
 }
 
 function normalizeUserMessage(value: string): string {

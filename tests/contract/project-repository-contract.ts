@@ -306,7 +306,12 @@ export function describeProjectIndexRepositoryContract(
         ownerId: "owner-a",
         name: "Local project",
         storageKind: "browser_git",
-        initialFiles: [],
+        initialFiles: [
+          {
+            path: "src/index.tsx",
+            content: "export const template = true;",
+          },
+        ],
       });
 
       expect(project.status).toBe("creating");
@@ -315,13 +320,26 @@ export function describeProjectIndexRepositoryContract(
           ownerId: "owner-a",
           projectId: project.id,
         }),
-      ).resolves.toEqual({ allowCreate: true, status: "ready" });
+      ).resolves.toEqual({
+        allowCreate: true,
+        status: "ready",
+        initialFiles: [
+          {
+            path: "src/index.tsx",
+            content: "export const template = true;",
+          },
+        ],
+      });
       await expect(
         fixture.repository.claimBrowserGitProvision({
           ownerId: "owner-a",
           projectId: project.id,
         }),
-      ).resolves.toEqual({ allowCreate: false, status: "ready" });
+      ).resolves.toEqual({
+        allowCreate: false,
+        status: "ready",
+        initialFiles: [],
+      });
     });
 
     it("marks a lost Browser Git repository unavailable", async () => {

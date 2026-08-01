@@ -5,12 +5,18 @@ import { describe, expect, it } from "vitest";
 import type { BrowserVerifyResult } from "@/domains/agent/client-tools";
 import type { RunPreviewResult } from "@/domains/agent/evidence";
 import { AgentStore } from "@/domains/agent/store";
+import {
+  FILE_TOOL_NAMES,
+  GIT_TOOL_NAMES,
+} from "@/domains/agent/tool-contracts";
 import type { FrozenAgentRunProfile } from "@/domains/agent/types";
 import { DatabaseProjectRepository } from "@/domains/project/repository";
 import {
   agentRuns,
   agentRunEvents,
   agentEvidence,
+  projectChangeSets,
+  projectCheckpoints,
   toolInvocations,
   verificationRuns,
   verificationSteps,
@@ -40,6 +46,24 @@ const profile: FrozenAgentRunProfile = {
     maxFileMutations: 8,
     maxClientResumes: 6,
     maxNoProgressRepeats: 2,
+  },
+};
+
+const browserGitProfile: FrozenAgentRunProfile = {
+  ...profile,
+  promptProfile: "webpilot-system-v6",
+  toolsetProfile: "webpilot-browser-git-v4",
+  repositoryCapability: {
+    storageKind: "browser_git",
+    canRead: true,
+    canWrite: true,
+    canExecuteServerTools: false,
+    repositoryIntent: {
+      allowStage: false,
+      allowUnstage: false,
+      allowCommit: false,
+      commitAuthor: null,
+    },
   },
 };
 
@@ -285,7 +309,437 @@ async function prepareBrowserVerification(
   return verification;
 }
 
+async function prepareBrowserRepositoryTool(
+  store: AgentStore<PgQueryResultHKT>,
+  input: {
+    ownerId: string;
+    runId: string;
+    toolCallId: string;
+    toolName: string;
+    argumentsJson: Record<string, unknown>;
+    revision: number;
+  },
+) {
+  await store.registerToolInvocation({
+    runId: input.runId,
+    toolCallId: input.toolCallId,
+    toolName: input.toolName,
+    executionDomain: "client",
+    argumentsJson: input.argumentsJson,
+    idempotencyKey: `${input.runId}:${input.toolCallId}`,
+    revisionBefore: input.revision,
+  });
+  await store.markToolInvocationRunning({
+    runId: input.runId,
+    toolCallId: input.toolCallId,
+  });
+  await store.transitionRun({
+    ownerId: input.ownerId,
+    runId: input.runId,
+    status: "awaiting_client_tool",
+  });
+}
+
 describe("AgentStore", () => {
+  it("Browser Git Run 使用浏览器 revision 且不伪造数据库源码 checkpoint", async () => {
+    const testDatabase = await createTestDatabase();
+
+    try {
+      const repository = new DatabaseProjectRepository(testDatabase.database);
+      const project = await repository.createProject({
+        ownerId: "owner-1",
+        name: "Browser Git Agent",
+        storageKind: "browser_git",
+        initialFiles: [],
+      });
+      await repository.claimBrowserGitProvision({
+        ownerId: "owner-1",
+        projectId: project.id,
+      });
+      const store = new AgentStore(testDatabase.database);
+      const run = await store.createRun({
+        ownerId: "owner-1",
+        projectId: project.id,
+        conversationTitle: "浏览器仓库任务",
+        userMessage: "读取浏览器仓库",
+        profile: browserGitProfile,
+        startRevision: 9,
+      });
+      const checkpoints = await testDatabase.database
+        .select()
+        .from(projectCheckpoints)
+        .where(eq(projectCheckpoints.runId, run.id));
+
+      expect(run).toMatchObject({
+        startRevision: 9,
+        currentRevision: 9,
+        repositoryCapability: {
+          storageKind: "browser_git",
+          canExecuteServerTools: false,
+        },
+      });
+      expect(checkpoints).toEqual([]);
+    } finally {
+      await testDatabase.close();
+    }
+  });
+
+  it("Browser Git 文件 mutation 只推进一次 revision，Git 操作保持源码 revision", async () => {
+    const testDatabase = await createTestDatabase();
+
+    try {
+      const repository = new DatabaseProjectRepository(testDatabase.database);
+      const project = await repository.createProject({
+        ownerId: "owner-1",
+        name: "Browser Repository Result",
+        storageKind: "browser_git",
+        initialFiles: [],
+      });
+      await repository.claimBrowserGitProvision({
+        ownerId: "owner-1",
+        projectId: project.id,
+      });
+      const store = new AgentStore(testDatabase.database);
+      const run = await store.createRun({
+        ownerId: "owner-1",
+        projectId: project.id,
+        conversationTitle: "浏览器仓库写入",
+        userMessage: "修改文件并暂存",
+        profile: browserGitProfile,
+        startRevision: 6,
+      });
+      await store.transitionRun({
+        ownerId: run.ownerId,
+        runId: run.id,
+        status: "running",
+      });
+      await prepareBrowserRepositoryTool(store, {
+        ownerId: run.ownerId,
+        runId: run.id,
+        toolCallId: "call-browser-write",
+        toolName: FILE_TOOL_NAMES.writeFile,
+        argumentsJson: {
+          path: "src/App.tsx",
+          content: "export default function App() { return 'updated'; }",
+          expectedRevision: 6,
+        },
+        revision: 6,
+      });
+
+      const writeResult = {
+        ok: true as const,
+        toolName: FILE_TOOL_NAMES.writeFile,
+        revision: 7,
+        data: {
+          changedPaths: ["src/App.tsx"],
+          operation: "update",
+        },
+      };
+      const acceptedWrite = await store.completeClientToolResult({
+        ownerId: run.ownerId,
+        runId: run.id,
+        projectId: project.id,
+        toolCallId: "call-browser-write",
+        toolName: FILE_TOOL_NAMES.writeFile,
+        idempotencyKey: `${run.id}:call-browser-write`,
+        revision: 6,
+        result: writeResult,
+      });
+      const duplicateWrite = await store.completeClientToolResult({
+        ownerId: run.ownerId,
+        runId: run.id,
+        projectId: project.id,
+        toolCallId: "call-browser-write",
+        toolName: FILE_TOOL_NAMES.writeFile,
+        idempotencyKey: `${run.id}:call-browser-write`,
+        revision: 6,
+        result: writeResult,
+      });
+
+      await prepareBrowserRepositoryTool(store, {
+        ownerId: run.ownerId,
+        runId: run.id,
+        toolCallId: "call-browser-stage",
+        toolName: GIT_TOOL_NAMES.stage,
+        argumentsJson: { paths: ["src/App.tsx"] },
+        revision: 7,
+      });
+      const acceptedStage = await store.completeClientToolResult({
+        ownerId: run.ownerId,
+        runId: run.id,
+        projectId: project.id,
+        toolCallId: "call-browser-stage",
+        toolName: GIT_TOOL_NAMES.stage,
+        idempotencyKey: `${run.id}:call-browser-stage`,
+        revision: 7,
+        result: {
+          ok: true,
+          toolName: GIT_TOOL_NAMES.stage,
+          revision: 7,
+          data: {
+            branch: "main",
+            files: [{ path: "src/App.tsx", index: "modified" }],
+          },
+        },
+      });
+      const [evidenceRows, transcript] = await Promise.all([
+        testDatabase.database
+          .select()
+          .from(agentEvidence)
+          .where(eq(agentEvidence.runId, run.id)),
+        store.listTranscript({
+          ownerId: run.ownerId,
+          conversationId: run.conversationId,
+        }),
+      ]);
+
+      expect(acceptedWrite).toMatchObject({
+        disposition: "accepted",
+        run: { status: "running", currentRevision: 7 },
+      });
+      expect(duplicateWrite.disposition).toBe("duplicate");
+      expect(acceptedStage).toMatchObject({
+        disposition: "accepted",
+        run: { status: "running", currentRevision: 7 },
+      });
+      expect(evidenceRows).toEqual([]);
+      expect(
+        transcript.filter((message) => message.kind === "tool_result"),
+      ).toHaveLength(2);
+    } finally {
+      await testDatabase.close();
+    }
+  });
+
+  it("Browser Repository 失败结果恢复 Run，但不会伪造成 Preview Evidence", async () => {
+    const testDatabase = await createTestDatabase();
+
+    try {
+      const repository = new DatabaseProjectRepository(testDatabase.database);
+      const project = await repository.createProject({
+        ownerId: "owner-1",
+        name: "Browser Repository Failure",
+        storageKind: "browser_git",
+        initialFiles: [],
+      });
+      await repository.claimBrowserGitProvision({
+        ownerId: "owner-1",
+        projectId: project.id,
+      });
+      const store = new AgentStore(testDatabase.database);
+      const run = await store.createRun({
+        ownerId: "owner-1",
+        projectId: project.id,
+        conversationTitle: "浏览器仓库失败",
+        userMessage: "读取仓库状态",
+        profile: browserGitProfile,
+        startRevision: 3,
+      });
+      await store.transitionRun({
+        ownerId: run.ownerId,
+        runId: run.id,
+        status: "running",
+      });
+      await prepareBrowserRepositoryTool(store, {
+        ownerId: run.ownerId,
+        runId: run.id,
+        toolCallId: "call-browser-status-failed",
+        toolName: GIT_TOOL_NAMES.status,
+        argumentsJson: {},
+        revision: 3,
+      });
+
+      const completion = await store.completeClientToolResult({
+        ownerId: run.ownerId,
+        runId: run.id,
+        projectId: project.id,
+        toolCallId: "call-browser-status-failed",
+        toolName: GIT_TOOL_NAMES.status,
+        idempotencyKey: `${run.id}:call-browser-status-failed`,
+        revision: 3,
+        result: {
+          ok: false,
+          toolName: GIT_TOOL_NAMES.status,
+          revision: 3,
+          conflict: false,
+          error: {
+            code: "BROWSER_GIT_UNAVAILABLE",
+            message: "浏览器仓库当前不可用。",
+          },
+        },
+      });
+      const [ledger] = await testDatabase.database
+        .select()
+        .from(toolInvocations)
+        .where(eq(toolInvocations.toolCallId, "call-browser-status-failed"));
+      const evidenceRows = await testDatabase.database
+        .select()
+        .from(agentEvidence)
+        .where(eq(agentEvidence.runId, run.id));
+
+      expect(completion).toMatchObject({
+        disposition: "accepted",
+        run: { status: "running", currentRevision: 3 },
+      });
+      expect(ledger).toMatchObject({
+        status: "failed",
+        revisionAfter: 3,
+        errorCode: "BROWSER_GIT_UNAVAILABLE",
+      });
+      expect(evidenceRows).toEqual([]);
+    } finally {
+      await testDatabase.close();
+    }
+  });
+
+  it("Browser Repository 旧 revision 结果保持等待态且不完成 Ledger", async () => {
+    const testDatabase = await createTestDatabase();
+
+    try {
+      const repository = new DatabaseProjectRepository(testDatabase.database);
+      const project = await repository.createProject({
+        ownerId: "owner-1",
+        name: "Stale Browser Repository Result",
+        storageKind: "browser_git",
+        initialFiles: [],
+      });
+      await repository.claimBrowserGitProvision({
+        ownerId: "owner-1",
+        projectId: project.id,
+      });
+      const store = new AgentStore(testDatabase.database);
+      const run = await store.createRun({
+        ownerId: "owner-1",
+        projectId: project.id,
+        conversationTitle: "过期浏览器仓库结果",
+        userMessage: "写入文件",
+        profile: browserGitProfile,
+        startRevision: 4,
+      });
+      await store.transitionRun({
+        ownerId: run.ownerId,
+        runId: run.id,
+        status: "running",
+      });
+      await prepareBrowserRepositoryTool(store, {
+        ownerId: run.ownerId,
+        runId: run.id,
+        toolCallId: "call-browser-stale-write",
+        toolName: FILE_TOOL_NAMES.writeFile,
+        argumentsJson: {
+          path: "src/App.tsx",
+          content: "export default App",
+          expectedRevision: 4,
+        },
+        revision: 4,
+      });
+
+      // 成功的文件 mutation 必须返回 revision + 1。仍返回 4 说明客户端执行
+      // 基于旧仓库状态，Store 只能记录 ignored 事件，不能恢复模型执行。
+      const completion = await store.completeClientToolResult({
+        ownerId: run.ownerId,
+        runId: run.id,
+        projectId: project.id,
+        toolCallId: "call-browser-stale-write",
+        toolName: FILE_TOOL_NAMES.writeFile,
+        idempotencyKey: `${run.id}:call-browser-stale-write`,
+        revision: 4,
+        result: {
+          ok: true,
+          toolName: FILE_TOOL_NAMES.writeFile,
+          revision: 4,
+          data: { changedPaths: ["src/App.tsx"], operation: "update" },
+        },
+      });
+      const [latest, ledgerRows, events] = await Promise.all([
+        store.getRun({ ownerId: run.ownerId, runId: run.id }),
+        testDatabase.database
+          .select()
+          .from(toolInvocations)
+          .where(eq(toolInvocations.runId, run.id)),
+        store.listEventsAfter({ ownerId: run.ownerId, runId: run.id }),
+      ]);
+
+      expect(completion.disposition).toBe("ignored");
+      expect(latest).toMatchObject({
+        status: "awaiting_client_tool",
+        currentRevision: 4,
+      });
+      expect(ledgerRows[0]).toMatchObject({
+        status: "running",
+        resultJson: null,
+      });
+      expect(events.at(-1)).toMatchObject({
+        type: "client_tool.result_ignored",
+        payload: { reason: "stale_revision" },
+      });
+    } finally {
+      await testDatabase.close();
+    }
+  });
+
+  it("Browser Git Run 成功收尾不依赖项目 revision，也不生成 Database Change Set", async () => {
+    const testDatabase = await createTestDatabase();
+
+    try {
+      const repository = new DatabaseProjectRepository(testDatabase.database);
+      const project = await repository.createProject({
+        ownerId: "owner-1",
+        name: "Browser Git Successful Run",
+        storageKind: "browser_git",
+        initialFiles: [],
+      });
+      await repository.claimBrowserGitProvision({
+        ownerId: "owner-1",
+        projectId: project.id,
+      });
+      const store = new AgentStore(testDatabase.database);
+      const run = await store.createRun({
+        ownerId: "owner-1",
+        projectId: project.id,
+        conversationTitle: "浏览器仓库完成",
+        userMessage: "完成修改",
+        profile: browserGitProfile,
+        startRevision: 12,
+      });
+      await store.transitionRun({
+        ownerId: run.ownerId,
+        runId: run.id,
+        status: "running",
+      });
+
+      const completed = await store.completeSuccessfulRun({
+        ownerId: run.ownerId,
+        runId: run.id,
+      });
+      const [checkpointRows, changeSetRows, evidenceRows] = await Promise.all([
+        testDatabase.database
+          .select()
+          .from(projectCheckpoints)
+          .where(eq(projectCheckpoints.runId, run.id)),
+        testDatabase.database
+          .select()
+          .from(projectChangeSets)
+          .where(eq(projectChangeSets.runId, run.id)),
+        testDatabase.database
+          .select()
+          .from(agentEvidence)
+          .where(eq(agentEvidence.runId, run.id)),
+      ]);
+
+      expect(completed).toMatchObject({
+        status: "succeeded",
+        startRevision: 12,
+        currentRevision: 12,
+      });
+      expect(checkpointRows).toEqual([]);
+      expect(changeSetRows).toEqual([]);
+      expect(evidenceRows).toEqual([]);
+    } finally {
+      await testDatabase.close();
+    }
+  });
+
   it("persists a frozen Run, append-only transcript and replayable events", async () => {
     const testDatabase = await createTestDatabase();
 
@@ -1797,6 +2251,7 @@ describe("AgentStore", () => {
         userMessage: "读取一致性快照",
         profile,
       });
+      runnerCalls = 0;
 
       const snapshot = await store.getConversationSnapshot({
         ownerId: run.ownerId,

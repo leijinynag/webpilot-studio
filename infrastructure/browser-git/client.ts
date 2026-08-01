@@ -2,6 +2,7 @@
 
 import { deserializeBrowserGitError } from "@/infrastructure/browser-git/errors";
 import type {
+  BrowserGitMigrationValidation,
   BrowserGitRepositoryState,
   BrowserGitWorkerOperation,
   BrowserGitWorkerPayloadMap,
@@ -126,6 +127,49 @@ export class BrowserGitClient {
     input: BrowserGitWorkerPayloadMap["restore_checkpoint"],
   ) {
     return (await this.request(projectId, "restore_checkpoint", input)).data;
+  }
+
+  async initializeMigrationCandidate(
+    candidateRepositoryId: string,
+    input: BrowserGitWorkerPayloadMap["initialize_migration_candidate"],
+  ) {
+    return (
+      await this.request(
+        candidateRepositoryId,
+        "initialize_migration_candidate",
+        input,
+      )
+    ).data as BrowserGitMigrationValidation;
+  }
+
+  async validateMigrationCandidate(
+    candidateRepositoryId: string,
+    input: BrowserGitWorkerPayloadMap["validate_migration_candidate"],
+  ) {
+    return (
+      await this.request(
+        candidateRepositoryId,
+        "validate_migration_candidate",
+        input,
+      )
+    ).data as BrowserGitMigrationValidation;
+  }
+
+  async promoteMigrationCandidate(
+    candidateRepositoryId: string,
+    input: BrowserGitWorkerPayloadMap["promote_migration_candidate"],
+  ) {
+    return (
+      await this.request(
+        candidateRepositoryId,
+        "promote_migration_candidate",
+        input,
+      )
+    ).data as BrowserGitMigrationValidation;
+  }
+
+  async deleteRepository(repositoryId: string) {
+    await this.request(repositoryId, "delete_repository", {});
   }
 
   dispose() {

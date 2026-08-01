@@ -74,6 +74,16 @@ export type BrowserGitCheckpointRecord = {
   completedAt: string | null;
 };
 
+export type BrowserGitMigrationValidation = {
+  repositoryId: string;
+  revision: number;
+  head: string;
+  branch: "main";
+  clean: true;
+  manifestHash: string;
+  fileCount: number;
+};
+
 export type BrowserGitWorkerPayloadMap = {
   initialize: {
     projectId: string;
@@ -121,6 +131,24 @@ export type BrowserGitWorkerPayloadMap = {
     checkpointId: string;
     expectedRevision: number;
   };
+  initialize_migration_candidate: {
+    projectName: string;
+    sourceRevision: number;
+    manifestHash: string;
+    initialFiles: BrowserGitFileInput[];
+  };
+  validate_migration_candidate: {
+    sourceRevision: number;
+    manifestHash: string;
+  };
+  promote_migration_candidate: {
+    targetProjectId: string;
+    projectName: string;
+    sourceRevision: number;
+    manifestHash: string;
+    head: string;
+  };
+  delete_repository: Record<string, never>;
 };
 
 export type BrowserGitWorkerOperation = keyof BrowserGitWorkerPayloadMap;
@@ -151,6 +179,7 @@ export type BrowserGitWorkerResult = {
     | ProjectMutationResult
     | ProjectCheckpoint
     | BrowserGitCheckpointRecord
+    | BrowserGitMigrationValidation
     | { oid: string; state: BrowserGitRepositoryState }
     | { archive: string; fileCount: number };
 };

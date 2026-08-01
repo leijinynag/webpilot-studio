@@ -40,8 +40,22 @@ async function handleMessage(input: unknown) {
   runtimes.set(request.projectId, runtime);
 
   try {
-    const data = await runtime.execute(request);
-    const revision = await runtime.getRevision();
+    const data =
+      request.operation === "promote_migration_candidate"
+        ? await runtime.promoteMigrationCandidate(
+            request.payload as never,
+            (projectId) => {
+              const target =
+                runtimes.get(projectId) ?? new BrowserGitRuntime(projectId);
+              runtimes.set(projectId, target);
+              return target;
+            },
+          )
+        : await runtime.execute(request);
+    const revision =
+      request.operation === "delete_repository"
+        ? 0
+        : await runtime.getRevision();
     const response: BrowserGitWorkerResponse = {
       protocol: "webpilot.browser-git.v1",
       type: "result",
@@ -99,6 +113,10 @@ function isOperation(value: unknown): value is BrowserGitWorkerOperation {
       "export",
       "create_checkpoint",
       "restore_checkpoint",
+      "initialize_migration_candidate",
+      "validate_migration_candidate",
+      "promote_migration_candidate",
+      "delete_repository",
     ].includes(value)
   );
 }

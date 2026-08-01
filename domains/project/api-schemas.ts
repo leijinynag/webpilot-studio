@@ -63,4 +63,31 @@ export const browserGitProvisionRequestSchema = z.discriminatedUnion("action", [
     .strict(),
 ]);
 
+const migrationProofSchema = {
+  sessionId: z.uuid("迁移会话 ID 格式不正确。"),
+  token: z.string().min(20).max(200),
+};
+
+export const browserGitMigrationRequestSchema = z.discriminatedUnion(
+  "action",
+  [
+    z.object({ action: z.literal("prepare") }).strict(),
+    z
+      .object({
+        action: z.literal("finalize"),
+        ...migrationProofSchema,
+        candidateRepositoryId: z.string().trim().min(1).max(200),
+        manifestHash: z.string().regex(/^[a-f0-9]{64}$/),
+        head: z.string().trim().min(1).max(100),
+      })
+      .strict(),
+    z
+      .object({
+        action: z.literal("cancel"),
+        ...migrationProofSchema,
+      })
+      .strict(),
+  ],
+);
+
 export type CreateProjectRequest = z.infer<typeof createProjectRequestSchema>;

@@ -19,13 +19,18 @@ import type {
   FileToolResultEnvelope,
 } from "@/domains/agent/file-tools";
 import { assertFrozenProfilesAvailable } from "@/domains/agent/profiles";
+import { normalizeRepositoryIntent } from "@/domains/agent/repository-intent";
 import type { LlmProvider, ProviderEvent } from "@/domains/agent/provider";
 import type { ProviderFinishReason } from "@/domains/agent/provider";
 import type { AgentStore } from "@/domains/agent/store";
 import { assembleProviderMessages } from "@/domains/agent/transcript";
 import {
   FILE_TOOL_NAMES,
+  FILE_TOOL_SCHEMAS,
+  GIT_TOOL_NAMES,
+  GIT_TOOL_SCHEMAS,
   type FileToolName,
+  type GitToolName,
 } from "@/domains/agent/tool-contracts";
 import type {
   AgentRunRecord,
@@ -46,8 +51,10 @@ type AgentStorePort = Pick<
   | "appendEvent"
   | "appendTranscript"
   | "claimExecution"
+  | "completeToolInvocation"
   | "completeSuccessfulRun"
   | "findReplayableSmokePlan"
+  | "findSuccessfulRead"
   | "getLatestVerificationRun"
   | "hasPendingClientToolWait"
   | "registerToolInvocation"
@@ -406,6 +413,45 @@ export class AgentOrchestrator {
             continue modelLoop;
           }
 
+          if (
+            run.repositoryCapability.storageKind === "browser_git" &&
+            isBrowserRepositoryTool(toolCall.name)
+          ) {
+            if (isFileMutationTool(toolCall.name)) {
+              if (run.usage.fileMutations >= run.budget.maxFileMutations) {
+                throw new AgentError(
+                  AGENT_ERROR_CODES.budgetExhausted,
+                  "Agent 已达到文件 mutation 次数上限。",
+                  409,
+                );
+              }
+
+              // Browser Git 的源码 mutation 同样在副作用前消费预算。浏览器若
+              // 返回失败，本次高风险写入尝试仍然属于 Run 的资源使用。
+              run = await this.store.updateRunProgress({
+                ownerId: run.ownerId,
+                runId: run.id,
+                usage: {
+                  ...run.usage,
+                  fileMutations: run.usage.fileMutations + 1,
+                },
+              });
+            }
+
+            const suspended = await this.suspendForBrowserRepositoryTool({
+              run,
+              toolCall,
+              argumentsJson,
+              leaseId,
+            });
+
+            if (suspended) {
+              return;
+            }
+
+            continue modelLoop;
+          }
+
           if (isFileMutationTool(toolCall.name)) {
             if (run.usage.fileMutations >= run.budget.maxFileMutations) {
               throw new AgentError(
@@ -714,6 +760,7 @@ export class AgentOrchestrator {
     toolCall: AccumulatedToolCall;
     message: string;
     issues: readonly object[];
+    persistLedger?: boolean;
   }): Promise<void> {
     const result = {
       ok: false,
@@ -727,6 +774,36 @@ export class AgentOrchestrator {
         },
       },
     };
+
+    if (input.persistLedger) {
+      const ledger = await this.store.registerToolInvocation({
+        runId: input.run.id,
+        toolCallId: input.toolCall.id,
+        toolName: input.toolCall.name,
+        executionDomain: "client",
+        argumentsJson: asTranscriptArguments(
+          parseToolArguments(input.toolCall.argumentsText),
+          input.toolCall.argumentsText,
+        ),
+        idempotencyKey: `${input.run.id}:${input.toolCall.id}`,
+        revisionBefore: input.run.currentRevision,
+      });
+
+      if (ledger.created) {
+        await this.store.markToolInvocationRunning({
+          runId: input.run.id,
+          toolCallId: input.toolCall.id,
+        });
+        await this.store.completeToolInvocation({
+          runId: input.run.id,
+          toolCallId: input.toolCall.id,
+          status: "failed",
+          resultJson: result,
+          revisionAfter: input.run.currentRevision,
+          errorCode: AGENT_ERROR_CODES.toolInvalidArguments,
+        });
+      }
+    }
 
     await this.store.appendTranscript({
       conversationId: input.run.conversationId,
@@ -871,6 +948,138 @@ export class AgentOrchestrator {
       leaseId: input.leaseId,
       source: input.source,
       replayCount: input.replayCount,
+    });
+    return true;
+  }
+
+  /**
+   * Browser Git 的源码与 Git 历史只能由当前浏览器访问。服务端在这里验证模型
+   * 参数和冻结权限，然后创建 client Tool Ledger；真正副作用由页面中的
+   * BrowserGitProjectRepository 执行，服务端不会读取或重建本地仓库。
+   */
+  private async suspendForBrowserRepositoryTool(input: {
+    run: AgentRunRecord;
+    toolCall: AccumulatedToolCall;
+    argumentsJson: unknown;
+    leaseId: string;
+  }): Promise<boolean> {
+    const toolName = assertBrowserRepositoryToolName(input.toolCall.name);
+    const schema = isGitTool(toolName)
+      ? GIT_TOOL_SCHEMAS[toolName]
+      : FILE_TOOL_SCHEMAS[toolName];
+    const argumentsResult = schema.safeParse(input.argumentsJson);
+
+    if (!argumentsResult.success) {
+      await this.persistInvalidClientToolArguments({
+        run: input.run,
+        toolCall: input.toolCall,
+        message: `工具 ${toolName} 的参数不合法。`,
+        issues: argumentsResult.error.issues,
+      });
+      return false;
+    }
+
+    if (isFileMutationTool(toolName)) {
+      const expectedRevision = getExpectedRevision(argumentsResult.data);
+      if (expectedRevision !== input.run.currentRevision) {
+        throw new AgentError(
+          AGENT_ERROR_CODES.revisionConflict,
+          "Browser Git 文件工具必须使用 Agent 当前持有的最新 revision。",
+          409,
+          {
+            expectedRevision,
+            currentRevision: input.run.currentRevision,
+          },
+        );
+      }
+
+      const pathToRead =
+        toolName === FILE_TOOL_NAMES.renameFile
+          ? argumentsResult.data.fromPath
+          : toolName === FILE_TOOL_NAMES.writeFile ||
+              toolName === FILE_TOOL_NAMES.deleteFile
+            ? argumentsResult.data.path
+            : null;
+      const readBeforeMutation = pathToRead
+        ? await this.store.findSuccessfulRead({
+          runId: input.run.id,
+          path: pathToRead!,
+          revision: input.run.currentRevision,
+        })
+        : false;
+
+      if (
+        pathToRead &&
+        !readBeforeMutation &&
+        toolName !== FILE_TOOL_NAMES.writeFile
+      ) {
+        throw new AgentError(
+          AGENT_ERROR_CODES.toolReadRequired,
+          "修改已有文件前必须在同一 Run 和 revision 下调用 read_file。",
+          409,
+          { path: pathToRead, revision: input.run.currentRevision },
+        );
+      }
+    }
+
+    const intent = normalizeRepositoryIntent(
+      input.run.repositoryCapability.repositoryIntent,
+    );
+    const permissionError =
+      toolName === GIT_TOOL_NAMES.stage && !intent.allowStage
+        ? "原始用户消息没有明确授权 stage，本次调用已拒绝。"
+        : toolName === GIT_TOOL_NAMES.unstage && !intent.allowUnstage
+          ? "原始用户消息没有明确授权 unstage，本次调用已拒绝。"
+          : toolName === GIT_TOOL_NAMES.commit && !intent.allowCommit
+            ? "原始用户消息没有明确授权 commit，本次调用已拒绝。"
+            : toolName === GIT_TOOL_NAMES.commit && !intent.commitAuthor
+              ? "commit 必须由用户明确提供作者姓名和邮箱，本次调用已拒绝。"
+              : null;
+
+    if (permissionError) {
+      await this.persistInvalidClientToolArguments({
+        run: input.run,
+        toolCall: input.toolCall,
+        message: permissionError,
+        issues: [],
+        persistLedger: true,
+      });
+      return false;
+    }
+
+    if (input.run.usage.clientResumes >= input.run.budget.maxClientResumes) {
+      throw new AgentError(
+        AGENT_ERROR_CODES.budgetExhausted,
+        "Agent 已达到浏览器工具恢复次数上限。",
+        409,
+      );
+    }
+
+    await this.store.suspendForClientTool({
+      ownerId: input.run.ownerId,
+      runId: input.run.id,
+      projectId: input.run.projectId,
+      toolCallId: input.toolCall.id,
+      toolName,
+      argumentsJson: argumentsResult.data,
+      idempotencyKey: `${input.run.id}:${input.toolCall.id}`,
+      revision: input.run.currentRevision,
+      leaseId: input.leaseId,
+      ...(isFileMutationTool(toolName)
+        ? {
+            readBeforeMutation: await this.store.findSuccessfulRead({
+              runId: input.run.id,
+              path:
+                toolName === FILE_TOOL_NAMES.renameFile
+                  ? argumentsResult.data.fromPath
+                  : argumentsResult.data.path,
+              revision: input.run.currentRevision,
+            }),
+          }
+        : {}),
+      ...(toolName === GIT_TOOL_NAMES.commit
+        ? { author: intent.commitAuthor! }
+        : {}),
     });
     return true;
   }
@@ -1136,19 +1345,22 @@ function toJsonRecords(
 function enforceOneMutationPerTurn(
   toolCalls: readonly AccumulatedToolCall[],
 ): void {
-  const mutationNames = new Set<FileToolName>([
+  const mutationNames = new Set<string>([
     FILE_TOOL_NAMES.writeFile,
     FILE_TOOL_NAMES.deleteFile,
     FILE_TOOL_NAMES.renameFile,
+    GIT_TOOL_NAMES.stage,
+    GIT_TOOL_NAMES.unstage,
+    GIT_TOOL_NAMES.commit,
   ]);
   const mutationCount = toolCalls.filter((toolCall) =>
-    mutationNames.has(toolCall.name as FileToolName),
+    mutationNames.has(toolCall.name),
   ).length;
 
   if (mutationCount > 1) {
     throw new AgentError(
       AGENT_ERROR_CODES.toolInvalidArguments,
-      "同一模型轮次最多只能执行一个文件 mutation。",
+      "同一模型轮次最多只能执行一个 Repository mutation。",
       409,
     );
   }
@@ -1160,6 +1372,40 @@ function isFileMutationTool(toolName: string): boolean {
     toolName === FILE_TOOL_NAMES.deleteFile ||
     toolName === FILE_TOOL_NAMES.renameFile
   );
+}
+
+function isGitTool(toolName: string): toolName is GitToolName {
+  return Object.values(GIT_TOOL_NAMES).includes(toolName as GitToolName);
+}
+
+function isBrowserRepositoryTool(
+  toolName: string,
+): toolName is FileToolName | GitToolName {
+  return (
+    Object.values(FILE_TOOL_NAMES).includes(toolName as FileToolName) ||
+    isGitTool(toolName)
+  );
+}
+
+function assertBrowserRepositoryToolName(
+  toolName: string,
+): FileToolName | GitToolName {
+  if (isBrowserRepositoryTool(toolName)) {
+    return toolName;
+  }
+
+  throw new AgentError(
+    AGENT_ERROR_CODES.toolInvalidArguments,
+    `未知 Browser Repository 工具：${toolName}。`,
+    400,
+  );
+}
+
+function getExpectedRevision(argumentsJson: Record<string, unknown>): number {
+  const revision = argumentsJson.expectedRevision;
+  return typeof revision === "number" && Number.isInteger(revision)
+    ? revision
+    : -1;
 }
 
 function assertWithinWallTime(run: AgentRunRecord): void {

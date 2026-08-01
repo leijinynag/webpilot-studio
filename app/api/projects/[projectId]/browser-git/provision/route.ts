@@ -13,7 +13,8 @@ import {
 
 /**
  * Browser Git 首次创建许可由服务端项目索引一次性签发。
- * 该 API 不接收源码，也不参与本地 Git 操作，只维护创建状态和数据丢失状态。
+ * 该 API 不接收源码，也不参与本地 Git 操作；首次成功 claim 会附带创建项目时
+ * 冻结的初始快照，供当前页面写入 IndexedDB，后续 claim 不再返回源码。
  */
 export async function POST(
   request: Request,

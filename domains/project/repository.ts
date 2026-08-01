@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 
 import { and, asc, desc, eq, isNull, sql } from "drizzle-orm";
 import type { PgDatabase } from "drizzle-orm/pg-core";
@@ -9,16 +9,21 @@ import type {
 import type { ExtractTablesWithRelations } from "drizzle-orm/relations";
 
 import {
+  browserGitMigrationSessions,
   projectFileBlobs,
   projectFiles,
   projectRevisionFiles,
   projectRevisions,
   projects,
 } from "@/infrastructure/db/schema";
+import { serializeMigrationManifest } from "@/domains/project/migration-manifest";
 import { PROJECT_ERROR_CODES, ProjectError } from "@/domains/project/errors";
 import { assertValidProjectPath } from "@/domains/project/path";
 import type {
+  BrowserGitProvision,
   ProjectCheckpoint,
+  BrowserGitMigrationPreparation,
+  BrowserGitMigrationResult,
   ProjectDescription,
   ProjectFileSnapshot,
   ProjectMutationResult,
@@ -68,13 +73,29 @@ export type ProjectRepository = {
   claimBrowserGitProvision(input: {
     ownerId: string;
     projectId: string;
-  }): Promise<{
-    allowCreate: boolean;
-    status: ProjectSummary["status"];
-  }>;
+  }): Promise<BrowserGitProvision>;
   markBrowserGitUnavailable(input: {
     ownerId: string;
     projectId: string;
+  }): Promise<void>;
+  prepareBrowserGitMigration(input: {
+    ownerId: string;
+    projectId: string;
+  }): Promise<BrowserGitMigrationPreparation>;
+  finalizeBrowserGitMigration(input: {
+    ownerId: string;
+    projectId: string;
+    sessionId: string;
+    token: string;
+    candidateRepositoryId: string;
+    manifestHash: string;
+    head: string;
+  }): Promise<BrowserGitMigrationResult>;
+  cancelBrowserGitMigration(input: {
+    ownerId: string;
+    projectId: string;
+    sessionId: string;
+    token: string;
   }): Promise<void>;
   listFiles(input: {
     ownerId: string;
@@ -130,6 +151,7 @@ const DEFAULT_SEARCH_OPTIONS: Required<ProjectSearchOptions> = {
   maxExcerptCharacters: 240,
   maxTotalCharacters: 20_000,
 };
+const BROWSER_GIT_MIGRATION_TTL_MS = 15 * 60 * 1000;
 
 export class DatabaseProjectRepository<
   TQueryResult extends PgQueryResultHKT,
@@ -304,36 +326,86 @@ export class DatabaseProjectRepository<
   async claimBrowserGitProvision(input: {
     ownerId: string;
     projectId: string;
-  }): Promise<{
-    allowCreate: boolean;
-    status: ProjectSummary["status"];
-  }> {
-    const project = await this.getProject(input);
-    this.assertBrowserGitProject(project);
+  }): Promise<BrowserGitProvision> {
+    return this.db.transaction(async (tx) => {
+      const [project] = await tx
+        .select()
+        .from(projects)
+        .where(
+          and(
+            eq(projects.id, input.projectId),
+            eq(projects.ownerId, input.ownerId),
+            isNull(projects.deletedAt),
+          ),
+        );
 
-    if (project.status !== "creating") {
-      return { allowCreate: false, status: project.status };
-    }
+      if (!project) {
+        throw new ProjectError(
+          PROJECT_ERROR_CODES.projectDeleted,
+          "项目不存在、已删除或不属于当前匿名工作区。",
+          404,
+        );
+      }
+      this.assertBrowserGitProject(project);
 
-    // status 条件让 claim 具备一次性消费语义。即使两个页面同时挂载，
-    // 也只有一个请求能把 creating 原子推进到 ready 并获得创建权。
-    const [claimed] = await this.db
-      .update(projects)
-      .set({ status: "ready", updatedAt: new Date() })
-      .where(
-        and(
-          eq(projects.id, project.id),
-          eq(projects.ownerId, input.ownerId),
-          eq(projects.storageKind, "browser_git"),
-          eq(projects.status, "creating"),
-          isNull(projects.deletedAt),
-        ),
-      )
-      .returning({ status: projects.status });
+      if (project.status !== "creating") {
+        return {
+          allowCreate: false,
+          status: project.status,
+          initialFiles: [],
+        };
+      }
 
-    return claimed
-      ? { allowCreate: true, status: claimed.status }
-      : { allowCreate: false, status: "ready" };
+      // status 条件让 claim 具备一次性消费语义。即使两个页面同时挂载，
+      // 也只有一个请求能把 creating 原子推进到 ready 并获得创建权。
+      const [claimed] = await tx
+        .update(projects)
+        .set({ status: "ready", updatedAt: new Date() })
+        .where(
+          and(
+            eq(projects.id, project.id),
+            eq(projects.ownerId, input.ownerId),
+            eq(projects.storageKind, "browser_git"),
+            eq(projects.status, "creating"),
+            isNull(projects.deletedAt),
+          ),
+        )
+        .returning({ status: projects.status });
+
+      if (!claimed) {
+        return {
+          allowCreate: false,
+          status: "ready",
+          initialFiles: [],
+        };
+      }
+
+      // Browser Git 创建前，模板暂存在服务端 revision 快照中。只有真正获得
+      // 创建权的页面能读取该快照，并把它一次性写入当前浏览器的 IndexedDB。
+      const initialFiles = await tx
+        .select({
+          path: projectFiles.path,
+          content: projectFileBlobs.content,
+        })
+        .from(projectFiles)
+        .innerJoin(
+          projectFileBlobs,
+          eq(projectFiles.blobHash, projectFileBlobs.hash),
+        )
+        .where(
+          and(
+            eq(projectFiles.projectId, project.id),
+            isNull(projectFiles.deletedAt),
+          ),
+        )
+        .orderBy(asc(projectFiles.path));
+
+      return {
+        allowCreate: true,
+        status: claimed.status,
+        initialFiles,
+      };
+    });
   }
 
   async markBrowserGitUnavailable(input: {
@@ -352,6 +424,262 @@ export class DatabaseProjectRepository<
           eq(projects.ownerId, input.ownerId),
           eq(projects.storageKind, "browser_git"),
           isNull(projects.deletedAt),
+        ),
+      );
+  }
+
+  async prepareBrowserGitMigration(input: {
+    ownerId: string;
+    projectId: string;
+  }): Promise<BrowserGitMigrationPreparation> {
+    return this.db.transaction(async (tx) => {
+      // 锁住项目索引，确保随后导出的文件和 sourceRevision 属于同一份事实。
+      // 普通文件 mutation 也必须更新 projects 行，因此会等待本事务结束。
+      await tx.execute(
+        sql`select ${projects.id} from ${projects}
+            where ${projects.id} = ${input.projectId}
+              and ${projects.ownerId} = ${input.ownerId}
+              and ${projects.deletedAt} is null
+            for update`,
+      );
+      const [project] = await tx
+        .select()
+        .from(projects)
+        .where(
+          and(
+            eq(projects.id, input.projectId),
+            eq(projects.ownerId, input.ownerId),
+            isNull(projects.deletedAt),
+          ),
+        );
+
+      if (!project) {
+        throw new ProjectError(
+          PROJECT_ERROR_CODES.projectDeleted,
+          "项目不存在、已删除或不属于当前匿名工作区。",
+          404,
+        );
+      }
+      this.assertDatabaseProject(project);
+
+      const rows = await tx
+        .select({
+          path: projectFiles.path,
+          content: projectFileBlobs.content,
+          hash: projectFileBlobs.hash,
+        })
+        .from(projectFiles)
+        .innerJoin(
+          projectFileBlobs,
+          eq(projectFiles.blobHash, projectFileBlobs.hash),
+        )
+        .where(
+          and(
+            eq(projectFiles.projectId, project.id),
+            isNull(projectFiles.deletedAt),
+          ),
+        )
+        .orderBy(asc(projectFiles.path));
+      const manifestHash = hashMigrationManifest(rows);
+      const token = randomBytes(32).toString("base64url");
+      const expiresAt = new Date(Date.now() + BROWSER_GIT_MIGRATION_TTL_MS);
+      const [session] = await tx
+        .insert(browserGitMigrationSessions)
+        .values({
+          projectId: project.id,
+          ownerId: input.ownerId,
+          tokenHash: hashContent(token),
+          sourceRevision: project.revision,
+          candidateRepositoryId: `migration-${randomUUID()}`,
+          manifestHash,
+          expiresAt,
+        })
+        .returning();
+
+      if (!session) {
+        throw new Error("创建 Browser Git 迁移会话失败。");
+      }
+
+      return {
+        sessionId: session.id,
+        token,
+        projectId: project.id,
+        projectName: project.name,
+        sourceRevision: project.revision,
+        candidateRepositoryId: session.candidateRepositoryId,
+        manifestHash,
+        files: rows,
+        expiresAt: expiresAt.toISOString(),
+      };
+    });
+  }
+
+  async finalizeBrowserGitMigration(input: {
+    ownerId: string;
+    projectId: string;
+    sessionId: string;
+    token: string;
+    candidateRepositoryId: string;
+    manifestHash: string;
+    head: string;
+  }): Promise<BrowserGitMigrationResult> {
+    return this.db.transaction(async (tx) => {
+      // session 与 project 同时加锁，保证幂等 finalize 和 storageKind 切换
+      // 在并发请求下仍只有一个确定结果。
+      await tx.execute(
+        sql`select ${browserGitMigrationSessions.id}
+            from ${browserGitMigrationSessions}
+            where ${browserGitMigrationSessions.id} = ${input.sessionId}
+            for update`,
+      );
+      await tx.execute(
+        sql`select ${projects.id} from ${projects}
+            where ${projects.id} = ${input.projectId}
+            for update`,
+      );
+      const [session] = await tx
+        .select()
+        .from(browserGitMigrationSessions)
+        .where(
+          and(
+            eq(browserGitMigrationSessions.id, input.sessionId),
+            eq(browserGitMigrationSessions.projectId, input.projectId),
+            eq(browserGitMigrationSessions.ownerId, input.ownerId),
+          ),
+        );
+      const [project] = await tx
+        .select()
+        .from(projects)
+        .where(
+          and(
+            eq(projects.id, input.projectId),
+            eq(projects.ownerId, input.ownerId),
+            isNull(projects.deletedAt),
+          ),
+        );
+
+      if (!session || !project) {
+        throw new ProjectError(
+          PROJECT_ERROR_CODES.projectNotFound,
+          "迁移会话不存在或不属于当前项目。",
+          404,
+        );
+      }
+
+      assertMigrationProof(session, input);
+
+      if (session.status === "completed") {
+        if (project.storageKind !== "browser_git") {
+          throw new ProjectError(
+            PROJECT_ERROR_CODES.migrationConflict,
+            "迁移会话已完成，但项目存储状态不一致。",
+            409,
+          );
+        }
+        return {
+          project: await describeProjectInTransaction(tx, project),
+          alreadyCompleted: true,
+        };
+      }
+
+      if (session.status === "cancelled") {
+        throw new ProjectError(
+          PROJECT_ERROR_CODES.migrationConflict,
+          "迁移会话已经取消，请重新发起迁移。",
+          409,
+        );
+      }
+      if (session.expiresAt.getTime() <= Date.now()) {
+        throw new ProjectError(
+          PROJECT_ERROR_CODES.migrationExpired,
+          "迁移会话已过期，请重新发起迁移。",
+          409,
+        );
+      }
+      this.assertDatabaseProject(project);
+
+      if (project.revision !== session.sourceRevision) {
+        throwRevisionConflict(project.revision, session.sourceRevision);
+      }
+
+      const now = new Date();
+      const [updatedProject] = await tx
+        .update(projects)
+        .set({
+          storageKind: "browser_git",
+          status: "ready",
+          updatedAt: now,
+        })
+        .where(
+          and(
+            eq(projects.id, project.id),
+            eq(projects.ownerId, input.ownerId),
+            eq(projects.storageKind, "database"),
+            eq(projects.revision, session.sourceRevision),
+            isNull(projects.deletedAt),
+          ),
+        )
+        .returning();
+
+      if (!updatedProject) {
+        throw new ProjectError(
+          PROJECT_ERROR_CODES.migrationConflict,
+          "项目在迁移切换前发生变化，Database Repository 保持可用。",
+          409,
+        );
+      }
+
+      await tx
+        .update(browserGitMigrationSessions)
+        .set({
+          status: "completed",
+          expectedHead: input.head,
+          completedAt: now,
+        })
+        .where(eq(browserGitMigrationSessions.id, session.id));
+
+      return {
+        project: await describeProjectInTransaction(tx, updatedProject),
+        alreadyCompleted: false,
+      };
+    });
+  }
+
+  async cancelBrowserGitMigration(input: {
+    ownerId: string;
+    projectId: string;
+    sessionId: string;
+    token: string;
+  }): Promise<void> {
+    const [session] = await this.db
+      .select()
+      .from(browserGitMigrationSessions)
+      .where(
+        and(
+          eq(browserGitMigrationSessions.id, input.sessionId),
+          eq(browserGitMigrationSessions.projectId, input.projectId),
+          eq(browserGitMigrationSessions.ownerId, input.ownerId),
+        ),
+      );
+
+    if (!session || session.tokenHash !== hashContent(input.token)) {
+      throw new ProjectError(
+        PROJECT_ERROR_CODES.projectNotFound,
+        "迁移会话不存在或不属于当前项目。",
+        404,
+      );
+    }
+    if (session.status !== "prepared") {
+      return;
+    }
+
+    await this.db
+      .update(browserGitMigrationSessions)
+      .set({ status: "cancelled", completedAt: new Date() })
+      .where(
+        and(
+          eq(browserGitMigrationSessions.id, session.id),
+          eq(browserGitMigrationSessions.status, "prepared"),
         ),
       );
   }
@@ -916,6 +1244,59 @@ function truncateSearchExcerpt(line: string, maxCharacters: number): string {
 
 function hashContent(content: string): string {
   return createHash("sha256").update(content, "utf8").digest("hex");
+}
+
+function hashMigrationManifest(
+  files: readonly { path: string; hash: string }[],
+) {
+  return createHash("sha256")
+    .update(serializeMigrationManifest(files), "utf8")
+    .digest("hex");
+}
+
+function assertMigrationProof(
+  session: typeof browserGitMigrationSessions.$inferSelect,
+  input: {
+    token: string;
+    candidateRepositoryId: string;
+    manifestHash: string;
+    head: string;
+  },
+) {
+  const valid =
+    session.tokenHash === hashContent(input.token) &&
+    session.candidateRepositoryId === input.candidateRepositoryId &&
+    session.manifestHash === input.manifestHash &&
+    input.head.trim().length > 0 &&
+    (session.expectedHead === null || session.expectedHead === input.head);
+
+  if (!valid) {
+    throw new ProjectError(
+      PROJECT_ERROR_CODES.migrationConflict,
+      "Browser Git candidate 校验信息不匹配，未切换项目存储。",
+      409,
+    );
+  }
+}
+
+async function describeProjectInTransaction(
+  tx: TransactionLike<PgQueryResultHKT>,
+  project: typeof projects.$inferSelect,
+): Promise<ProjectDescription> {
+  const [count] = await tx
+    .select({ count: sql<number>`count(*)::int` })
+    .from(projectFiles)
+    .where(
+      and(
+        eq(projectFiles.projectId, project.id),
+        isNull(projectFiles.deletedAt),
+      ),
+    );
+
+  return {
+    ...toProjectSummary(project),
+    fileCount: count?.count ?? 0,
+  };
 }
 
 async function ensureBlob(

@@ -7,7 +7,7 @@ import {
   WebContainerPreview,
 } from "@/components/preview/webcontainer-preview";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import type { ClientToolRequest } from "@/domains/agent/client-tools";
+import type { PreviewClientToolRequest } from "@/domains/agent/client-tools";
 import type { ProjectFileSnapshot } from "@/domains/project/types";
 
 const {
@@ -114,7 +114,7 @@ vi.mock("@/infrastructure/webcontainer/browser-bridge-controller", () => ({
   },
 }));
 
-const request: ClientToolRequest = {
+const request: PreviewClientToolRequest = {
   runId: "11111111-1111-4111-8111-111111111111",
   projectId: "22222222-2222-4222-8222-222222222222",
   toolCallId: "call-preview-1",
@@ -151,10 +151,10 @@ function renderPreview({
   files,
   onClientToolResult,
 }: {
-  clientToolRequest?: ClientToolRequest | null;
+  clientToolRequest?: PreviewClientToolRequest | null;
   files: ProjectFileSnapshot[];
   onClientToolResult: (
-    request: ClientToolRequest,
+    request: PreviewClientToolRequest,
     result: Parameters<
       NonNullable<
         React.ComponentProps<typeof WebContainerPreview>["onClientToolResult"]
@@ -270,7 +270,7 @@ describe("WebContainerPreview 客户端工具执行", () => {
   it("同一 Tool Call 的对象和文件树引用变化时不会重启或切回 Repository 镜像", async () => {
     const onClientToolResult = vi.fn(
       async (
-        _request: ClientToolRequest,
+        _request: PreviewClientToolRequest,
         _result: Parameters<
           NonNullable<
             React.ComponentProps<

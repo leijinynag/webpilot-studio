@@ -3,6 +3,7 @@ import { z } from "zod";
 
 import { requireRequestOwner } from "@/domains/auth/request-owner";
 import { createFrozenAgentProfile } from "@/domains/agent/profiles";
+import { deriveRepositoryIntent } from "@/domains/agent/repository-intent";
 import { AGENT_ERROR_CODES, AgentError } from "@/domains/agent/errors";
 import { DEFAULT_MAX_AGENT_MODEL_TURNS } from "@/domains/agent/types";
 import { launchAgentRun } from "@/infrastructure/agent/runtime";
@@ -22,6 +23,7 @@ const createAgentRunSchema = z
     message: z.string().trim().min(1).max(20_000),
     conversationId: z.uuid().optional(),
     locale: z.enum(["zh-CN", "en-US"]).default("zh-CN"),
+    repositoryRevision: z.number().int().nonnegative().optional(),
   })
   .strict();
 
@@ -73,23 +75,56 @@ export async function POST(request: Request) {
       );
     }
 
-    if (project.storageKind !== "database" || project.status !== "ready") {
+    if (project.status !== "ready") {
       throw new AgentError(
         AGENT_ERROR_CODES.invalidRequest,
-        "首版 Agent 只支持 ready 状态的 Database Repository。",
+        "Agent 只支持 ready 状态的 Repository。",
         409,
+      );
+    }
+
+    const startRevision =
+      project.storageKind === "browser_git"
+        ? body.repositoryRevision
+        : project.revision;
+
+    if (startRevision === undefined) {
+      throw new AgentError(
+        AGENT_ERROR_CODES.invalidRequest,
+        "Browser Git Agent Run 必须提交浏览器仓库的真实 revision。",
+        400,
+      );
+    }
+
+    if (
+      project.storageKind === "database" &&
+      body.repositoryRevision !== undefined &&
+      body.repositoryRevision !== project.revision
+    ) {
+      throw new AgentError(
+        AGENT_ERROR_CODES.revisionConflict,
+        "Database Repository revision 以服务端为准。",
+        409,
+        {
+          requestedRevision: body.repositoryRevision,
+          currentRevision: project.revision,
+        },
       );
     }
 
     const profile = createFrozenAgentProfile({
       locale: body.locale,
       projectId: project.id,
-      revision: project.revision,
+      revision: startRevision,
       repositoryCapability: {
-        storageKind: "database",
+        storageKind: project.storageKind,
         canRead: true,
         canWrite: true,
-        canExecuteServerTools: true,
+        canExecuteServerTools: project.storageKind === "database",
+        repositoryIntent:
+          project.storageKind === "browser_git"
+            ? deriveRepositoryIntent(body.message)
+            : undefined,
       },
       provider: providerRuntime.providerName,
       model: providerRuntime.model,
@@ -104,6 +139,7 @@ export async function POST(request: Request) {
       conversationTitle: body.message.slice(0, 80),
       userMessage: body.message,
       profile,
+      startRevision,
     });
 
     after(async () => {

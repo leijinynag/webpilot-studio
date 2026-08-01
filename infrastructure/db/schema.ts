@@ -27,6 +27,11 @@ export const projectStatus = pgEnum("project_status", [
   "error",
 ]);
 
+export const browserGitMigrationStatus = pgEnum(
+  "browser_git_migration_status",
+  ["prepared", "completed", "cancelled"],
+);
+
 export const projectRevisionKind = pgEnum("project_revision_kind", [
   "initial",
   "write",
@@ -273,6 +278,63 @@ export const projectRevisionFiles = pgTable(
       columns: [table.revisionId, table.path],
     }),
     index("project_revision_files_blob_idx").on(table.blobHash),
+  ],
+);
+
+export const browserGitMigrationSessions = pgTable(
+  "browser_git_migration_sessions",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    projectId: uuid("project_id")
+      .notNull()
+      .references(() => projects.id, { onDelete: "cascade" }),
+    ownerId: text("owner_id").notNull(),
+    // 客户端只持有原始一次性 token，数据库仅保存 SHA-256 摘要。
+    tokenHash: text("token_hash").notNull(),
+    sourceRevision: integer("source_revision").notNull(),
+    candidateRepositoryId: text("candidate_repository_id").notNull(),
+    manifestHash: text("manifest_hash").notNull(),
+    expectedHead: text("expected_head"),
+    status: browserGitMigrationStatus("status")
+      .notNull()
+      .default("prepared"),
+    expiresAt: timestamp("expires_at", {
+      withTimezone: true,
+      mode: "date",
+    }).notNull(),
+    createdAt: timestamp("created_at", {
+      withTimezone: true,
+      mode: "date",
+    })
+      .notNull()
+      .defaultNow(),
+    completedAt: timestamp("completed_at", {
+      withTimezone: true,
+      mode: "date",
+    }),
+  },
+  (table) => [
+    uniqueIndex("browser_git_migrations_candidate_uidx").on(
+      table.candidateRepositoryId,
+    ),
+    index("browser_git_migrations_owner_project_idx").on(
+      table.ownerId,
+      table.projectId,
+      table.status,
+      table.createdAt,
+    ),
+    check(
+      "browser_git_migrations_source_revision_check",
+      sql`${table.sourceRevision} >= 0`,
+    ),
+    check(
+      "browser_git_migrations_token_hash_check",
+      sql`char_length(${table.tokenHash}) = 64`,
+    ),
+    check(
+      "browser_git_migrations_manifest_hash_check",
+      sql`char_length(${table.manifestHash}) = 64`,
+    ),
   ],
 );
 
@@ -797,6 +859,7 @@ export const databaseSchema = {
   projectFiles,
   projectRevisions,
   projectRevisionFiles,
+  browserGitMigrationSessions,
   projectCheckpoints,
   projectChangeSets,
   projectChangeSetFiles,

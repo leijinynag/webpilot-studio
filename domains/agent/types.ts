@@ -22,11 +22,28 @@ export const TERMINAL_AGENT_RUN_STATUSES = [
 
 export type AgentLocale = "zh-CN" | "en-US";
 
+export type RepositoryIntent = {
+  allowStage: boolean;
+  allowUnstage: boolean;
+  allowCommit: boolean;
+  commitAuthor: {
+    name: string;
+    email: string;
+  } | null;
+};
+
 export type RepositoryCapability = {
   storageKind: "database" | "browser_git";
   canRead: boolean;
   canWrite: boolean;
   canExecuteServerTools: boolean;
+  /**
+   * Git 写权限只从创建 Run 的原始用户消息中冻结。
+   *
+   * 旧 Run 没有该字段时一律按“没有 Git 写权限”处理，不能因为恢复到新版
+   * 部署而悄然获得 stage、unstage 或 commit 能力。
+   */
+  repositoryIntent?: RepositoryIntent;
 };
 
 export type AgentRunBudget = {

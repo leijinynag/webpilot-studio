@@ -6,52 +6,13 @@ import { z } from "zod";
 import { AGENT_ERROR_CODES, AgentError } from "@/domains/agent/errors";
 import type { AgentStore } from "@/domains/agent/store";
 import {
+  FILE_TOOL_SCHEMAS,
   FILE_TOOL_NAMES,
   type FileToolName,
 } from "@/domains/agent/tool-contracts";
 import type { AgentRunRecord } from "@/domains/agent/types";
 import { isProjectError, PROJECT_ERROR_CODES } from "@/domains/project/errors";
-import { assertValidProjectPath } from "@/domains/project/path";
 import type { ProjectRepository } from "@/domains/project/repository";
-
-const projectPathSchema = z
-  .string()
-  .trim()
-  .min(1)
-  .max(500)
-  .transform(assertValidProjectPath);
-const expectedRevisionSchema = z.number().int().nonnegative();
-
-export const FILE_TOOL_SCHEMAS = {
-  [FILE_TOOL_NAMES.listFiles]: z.object({}).strict(),
-  [FILE_TOOL_NAMES.searchText]: z
-    .object({
-      query: z.string().trim().min(1).max(200),
-      maxResults: z.number().int().positive().max(100).optional(),
-    })
-    .strict(),
-  [FILE_TOOL_NAMES.readFile]: z.object({ path: projectPathSchema }).strict(),
-  [FILE_TOOL_NAMES.writeFile]: z
-    .object({
-      path: projectPathSchema,
-      content: z.string().max(1_000_000),
-      expectedRevision: expectedRevisionSchema,
-    })
-    .strict(),
-  [FILE_TOOL_NAMES.deleteFile]: z
-    .object({
-      path: projectPathSchema,
-      expectedRevision: expectedRevisionSchema,
-    })
-    .strict(),
-  [FILE_TOOL_NAMES.renameFile]: z
-    .object({
-      fromPath: projectPathSchema,
-      toPath: projectPathSchema,
-      expectedRevision: expectedRevisionSchema,
-    })
-    .strict(),
-} as const;
 
 export type FileToolSuccessEnvelope = {
   ok: true;

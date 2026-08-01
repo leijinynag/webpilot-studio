@@ -412,7 +412,7 @@ export function AgentPanel({
       scheduleAgentSnapshotRefresh(
         Boolean(
           persistedEvent &&
-            IMMEDIATE_SNAPSHOT_EVENT_TYPES.has(persistedEvent.type),
+          IMMEDIATE_SNAPSHOT_EVENT_TYPES.has(persistedEvent.type),
         ),
       );
     };
@@ -555,6 +555,20 @@ export function AgentPanel({
             replayCount: verificationRun.replayCount,
           }
         : {}),
+      ...(invocation.toolName === "git_commit"
+        ? {
+            author: activeRun.repositoryCapability.repositoryIntent
+              ?.commitAuthor,
+          }
+        : {}),
+      ...(isBrowserRepositoryFileMutation(invocation.toolName)
+        ? {
+            readBeforeMutation: hasSuccessfulReadBeforeMutation({
+              invocation,
+              tools: snapshot?.tools ?? [],
+            }),
+          }
+        : {}),
     });
 
     if (requestResult.success) {
@@ -642,6 +656,7 @@ export function AgentPanel({
           conversationId: selectedConversationId ?? undefined,
           message,
           locale: "zh-CN",
+          repositoryRevision: revision,
         }),
       });
       const body = (await response.json().catch(() => ({}))) as
@@ -1537,6 +1552,41 @@ function findActiveRun(runs: readonly AgentRunRecord[]): AgentRunRecord | null {
       .slice()
       .reverse()
       .find((run) => !TERMINAL_STATUSES.has(run.status)) ?? null
+  );
+}
+
+function isBrowserRepositoryFileMutation(toolName: string): boolean {
+  return (
+    toolName === "write_file" ||
+    toolName === "delete_file" ||
+    toolName === "rename_file"
+  );
+}
+
+/**
+ * read-before-mutation 是 Run + revision 级执行事实，刷新后不能默认放行。
+ * 这里只接受同一 Run、同一 revision、同一路径且已成功的 read_file ledger。
+ */
+function hasSuccessfulReadBeforeMutation(input: {
+  invocation: ToolInvocationRecord;
+  tools: readonly ToolInvocationRecord[];
+}): boolean {
+  const path =
+    input.invocation.toolName === "rename_file"
+      ? input.invocation.argumentsJson.fromPath
+      : input.invocation.argumentsJson.path;
+
+  if (typeof path !== "string") {
+    return false;
+  }
+
+  return input.tools.some(
+    (tool) =>
+      tool.runId === input.invocation.runId &&
+      tool.toolName === "read_file" &&
+      tool.status === "succeeded" &&
+      tool.revisionBefore === input.invocation.revisionBefore &&
+      tool.argumentsJson.path === path,
   );
 }
 

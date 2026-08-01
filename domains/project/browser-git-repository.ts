@@ -43,17 +43,21 @@ export class BrowserGitProjectRepository {
   async initialize(
     initialFiles: readonly { path: string; content: string }[] = [],
   ) {
-    const allowCreate = await this.claimProvisionIfNeeded();
+    const provision = await this.claimProvisionIfNeeded();
+    const provisionFiles =
+      provision.allowCreate && provision.initialFiles.length > 0
+        ? provision.initialFiles
+        : initialFiles;
 
     try {
       this.state = await this.client.initialize({
         projectId: this.project.id,
         projectName: this.project.name,
-        initialFiles: initialFiles.map((file) => ({
+        initialFiles: provisionFiles.map((file) => ({
           path: assertValidProjectPath(file.path),
           content: file.content,
         })),
-        allowCreate,
+        allowCreate: provision.allowCreate,
       });
       return this.state;
     } catch (error) {
@@ -231,9 +235,12 @@ export class BrowserGitProjectRepository {
     return (await this.listFiles()).length;
   }
 
-  private async claimProvisionIfNeeded(): Promise<boolean> {
+  private async claimProvisionIfNeeded(): Promise<{
+    allowCreate: boolean;
+    initialFiles: Array<{ path: string; content: string }>;
+  }> {
     if (this.project.status !== "creating") {
-      return false;
+      return { allowCreate: false, initialFiles: [] };
     }
 
     const response = await fetch(
@@ -246,6 +253,7 @@ export class BrowserGitProjectRepository {
     );
     const body = (await response.json().catch(() => ({}))) as {
       allowCreate?: boolean;
+      initialFiles?: Array<{ path: string; content: string }>;
       error?: { message?: string };
     };
 
@@ -257,7 +265,10 @@ export class BrowserGitProjectRepository {
       );
     }
 
-    return body.allowCreate === true;
+    return {
+      allowCreate: body.allowCreate === true,
+      initialFiles: Array.isArray(body.initialFiles) ? body.initialFiles : [],
+    };
   }
 
   private async reportUnavailable(reason: string): Promise<void> {
