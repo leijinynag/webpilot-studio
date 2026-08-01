@@ -118,6 +118,17 @@ export const verificationStepStatus = pgEnum("verification_step_status", [
   "failed",
 ]);
 
+export const showcaseCaseStatus = pgEnum("showcase_case_status", [
+  "draft",
+  "published",
+  "revoked",
+]);
+
+export const showcaseArtifactStatus = pgEnum("showcase_artifact_status", [
+  "active",
+  "revoked",
+]);
+
 export const projects = pgTable(
   "projects",
   {
@@ -853,6 +864,115 @@ export const verificationSteps = pgTable(
   ],
 );
 
+export const showcaseCases = pgTable(
+  "showcase_cases",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    projectId: uuid("project_id").references(() => projects.id, {
+      onDelete: "set null",
+    }),
+    title: text("title").notNull(),
+    slug: text("slug").notNull(),
+    description: text("description"),
+    coverUrl: text("cover_url"),
+    sortOrder: integer("sort_order").notNull().default(0),
+    status: showcaseCaseStatus("status").notNull().default("draft"),
+    createdAt: timestamp("created_at", {
+      withTimezone: true,
+      mode: "date",
+    })
+      .notNull()
+      .defaultNow(),
+    updatedAt: timestamp("updated_at", {
+      withTimezone: true,
+      mode: "date",
+    })
+      .notNull()
+      .defaultNow(),
+    publishedAt: timestamp("published_at", {
+      withTimezone: true,
+      mode: "date",
+    }),
+    revokedAt: timestamp("revoked_at", {
+      withTimezone: true,
+      mode: "date",
+    }),
+  },
+  (table) => [
+    uniqueIndex("showcase_cases_slug_uidx").on(table.slug),
+    index("showcase_cases_public_sort_idx").on(
+      table.status,
+      table.sortOrder,
+      table.updatedAt,
+    ),
+    check(
+      "showcase_cases_title_length_check",
+      sql`char_length(${table.title}) between 1 and 160`,
+    ),
+    check(
+      "showcase_cases_slug_format_check",
+      sql`${table.slug} ~ '^[a-z0-9]+(?:-[a-z0-9]+)*$'`,
+    ),
+  ],
+);
+
+export const showcaseArtifacts = pgTable(
+  "showcase_artifacts",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    caseId: uuid("case_id")
+      .notNull()
+      .references(() => showcaseCases.id, { onDelete: "cascade" }),
+    sourceRevision: integer("source_revision").notNull(),
+    status: showcaseArtifactStatus("status").notNull().default("active"),
+    blobPrefix: text("blob_prefix").notNull(),
+    entryPath: text("entry_path").notNull().default("index.html"),
+    manifest: jsonb("manifest")
+      .$type<{
+        format: "webpilot-showcase-artifact-v1";
+        entryPath: "index.html";
+        files: Array<{
+          path: string;
+          byteLength: number;
+          hash: string;
+        }>;
+        totalBytes: number;
+        createdAt: string;
+      }>()
+      .notNull(),
+    fileCount: integer("file_count").notNull(),
+    totalBytes: bigint("total_bytes", { mode: "number" }).notNull(),
+    createdAt: timestamp("created_at", {
+      withTimezone: true,
+      mode: "date",
+    })
+      .notNull()
+      .defaultNow(),
+    revokedAt: timestamp("revoked_at", {
+      withTimezone: true,
+      mode: "date",
+    }),
+  },
+  (table) => [
+    uniqueIndex("showcase_artifacts_case_revision_uidx").on(
+      table.caseId,
+      table.sourceRevision,
+      table.createdAt,
+    ),
+    index("showcase_artifacts_case_status_idx").on(
+      table.caseId,
+      table.status,
+      table.createdAt,
+    ),
+    check(
+      "showcase_artifacts_source_revision_check",
+      sql`${table.sourceRevision} >= 0`,
+    ),
+    check("showcase_artifacts_file_count_check", sql`${table.fileCount} > 0`),
+    check("showcase_artifacts_total_bytes_check", sql`${table.totalBytes} >= 0`),
+  ],
+);
+
 export const databaseSchema = {
   projects,
   projectFileBlobs,
@@ -871,7 +991,12 @@ export const databaseSchema = {
   agentEvidence,
   verificationRuns,
   verificationSteps,
+  showcaseCases,
+  showcaseArtifacts,
 };
 
 export type ProjectRow = typeof projects.$inferSelect;
 export type ProjectFileRow = typeof projectFiles.$inferSelect;
+export type ShowcaseCaseRow = typeof showcaseCases.$inferSelect;
+export type ShowcaseArtifactManifestRow =
+  typeof showcaseArtifacts.$inferSelect;
