@@ -24,7 +24,10 @@ import type {
   ProjectFileSnapshot,
 } from "@/domains/project/types";
 import { useUiI18n } from "@/infrastructure/i18n/ui";
-import { webContainerRuntimeManager } from "@/infrastructure/webcontainer/runtime-manager";
+import {
+  type WebContainerRuntimeAsset,
+  webContainerRuntimeManager,
+} from "@/infrastructure/webcontainer/runtime-manager";
 
 export function PublishPage({
   adminMode,
@@ -52,6 +55,10 @@ export function PublishPage({
   const [repositoryFiles, setRepositoryFiles] = useState<ProjectFileSnapshot[]>(
     [],
   );
+  const [runtimeAssets, setRuntimeAssets] = useState<
+    WebContainerRuntimeAsset[]
+  >([]);
+  const [assetLoadError, setAssetLoadError] = useState<string | null>(null);
   const [repositoryRevision, setRepositoryRevision] = useState(
     project.revision,
   );
@@ -123,6 +130,53 @@ export function PublishPage({
     };
   }, [project, t]);
 
+  useEffect(() => {
+    let cancelled = false;
+
+    async function loadRuntimeAssets() {
+      try {
+        const response = await fetch(`/api/projects/${project.id}/assets`, {
+          cache: "no-store",
+        });
+        const body = (await response.json().catch(() => ({}))) as {
+          assets?: Array<WebContainerRuntimeAsset & { downloadUrl?: string }>;
+          error?: { message?: string };
+        };
+
+        if (!response.ok || !body.assets) {
+          throw new Error(body.error?.message ?? t("publish.assetLoadFailed"));
+        }
+
+        if (!cancelled) {
+          setRuntimeAssets(
+            body.assets.filter(
+              (
+                asset,
+              ): asset is WebContainerRuntimeAsset & {
+                downloadUrl: string;
+              } => typeof asset.downloadUrl === "string",
+            ),
+          );
+          setAssetLoadError(null);
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setRuntimeAssets([]);
+          setAssetLoadError(
+            error instanceof Error
+              ? error.message
+              : t("publish.assetLoadFailed"),
+          );
+        }
+      }
+    }
+
+    void loadRuntimeAssets();
+    return () => {
+      cancelled = true;
+    };
+  }, [project.id, t]);
+
   const canBuild = useMemo(
     () =>
       buildState.phase !== "building" &&
@@ -185,6 +239,7 @@ export function PublishPage({
         project.id,
         repositoryRevision,
         `showcase:${project.id}:${repositoryRevision}`,
+        runtimeAssets,
       );
       const archive = new Blob([toArrayBuffer(result.archive)], {
         type: "application/zip",
@@ -618,6 +673,12 @@ export function PublishPage({
           <b>{buildState.message}</b>
           <span>{buildState.detail}</span>
         </div>
+        {assetLoadError ? (
+          <div className="publish-build-feedback" role="alert">
+            <b>{t("publish.assetLoadFailed")}</b>
+            <span>{assetLoadError}</span>
+          </div>
+        ) : null}
         <div className="publish-actions">
           <span>
             {buildState.result

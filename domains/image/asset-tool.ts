@@ -6,11 +6,9 @@ import { AGENT_ERROR_CODES, AgentError } from "@/domains/agent/errors";
 import type { AgentStore } from "@/domains/agent/store";
 import type { AgentRunRecord } from "@/domains/agent/types";
 import { createSignedAssetUrl } from "@/domains/image/asset-url";
-import {
-  listOwnedAssetRows,
-  toAssetToolView,
-} from "@/domains/image/service";
+import { listOwnedAssetRows, toAssetToolView } from "@/domains/image/service";
 import { LIST_PROJECT_ASSETS_TOOL_NAME } from "@/domains/image/asset-tool-definition";
+import { imageExtensionForMime } from "@/domains/image/validation";
 
 export type AssetToolResultEnvelope = {
   ok: boolean;
@@ -103,7 +101,10 @@ export class AssetToolExecutor {
         ownerId: input.run.ownerId,
         runId: input.run.id,
       });
-      if (latestRun.cancellationRequestedAt || latestRun.status === "cancelled") {
+      if (
+        latestRun.cancellationRequestedAt ||
+        latestRun.status === "cancelled"
+      ) {
         throw new AgentError(
           AGENT_ERROR_CODES.cancelled,
           "Agent Run 已请求取消，资产工具不会继续执行。",
@@ -122,7 +123,7 @@ export class AssetToolExecutor {
         data: {
           assets: assets.map((asset) => ({
             ...toAssetToolView(asset),
-            assetPath: `/__webpilot/assets/${asset.id}`,
+            assetPath: `/__webpilot/assets/${asset.id}.${imageExtensionForMime(asset.mimeType)}`,
             previewUrl: createSignedAssetUrl({
               asset,
             }),

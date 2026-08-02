@@ -48,6 +48,21 @@ export type WebContainerAdapter = {
   teardown(): void;
 };
 
+/**
+ * 运行时资产只保存短期下载地址和内容摘要。
+ *
+ * assetPath 是项目代码使用的稳定路径，downloadUrl 只在宿主页面内读取，
+ * downloadedBytes 不进入 Repository，也不会被发送给 Agent。
+ */
+export type WebContainerRuntimeAsset = {
+  id: string;
+  assetPath: string;
+  downloadUrl: string;
+  mimeType: string;
+  originalFilename: string | null;
+  sha256: string;
+};
+
 // 浏览器能力检测与 boot 行为都通过依赖注入进入 Manager。
 // 生产环境使用真实实现，测试环境则可以稳定覆盖隔离失败、安装失败和超时等分支。
 export type WebContainerRuntimeDependencies = {
@@ -152,6 +167,10 @@ export class WebContainerRuntimeManager {
   private activeRuntimeKey: string | null = null;
   // mountedFiles 记录运行镜像当前内容，增量同步时据此识别新增、修改和删除。
   private mountedFiles = new Map<string, string>();
+  // 二进制资产独立于源码快照维护。这样图片变化不会被误判成源码 revision，
+  // 也不会因为重新同步代码而重复写入相同内容。
+  private mountedAssets = new Map<string, { path: string; sha256: string }>();
+  private mountedAssetsFingerprint = "";
   // generation 是轻量取消令牌。teardown 或未来的新一轮启动会递增它，
   // 旧异步任务即使晚到，也不能再把过期结果写回当前 snapshot。
   private generation = 0;
@@ -207,6 +226,7 @@ export class WebContainerRuntimeManager {
     projectKey = "default-template",
     revision: number | null = null,
     runtimeKey = `revision:${revision ?? "unknown"}`,
+    assets: readonly WebContainerRuntimeAsset[] = [],
   ): Promise<WebContainerRuntimeSnapshot> {
     if (
       this.activeProjectKey !== null &&
@@ -220,9 +240,15 @@ export class WebContainerRuntimeManager {
       this.snapshot.phase === "ready" &&
       this.activeProjectKey === projectKey
     ) {
-      return this.activeRuntimeKey === runtimeKey
-        ? Promise.resolve(this.snapshot)
-        : this.syncRevision(tree, projectKey, revision, runtimeKey);
+      if (this.activeRuntimeKey === runtimeKey) {
+        return assetsMatch(this.mountedAssetsFingerprint, assets)
+          ? Promise.resolve(this.snapshot)
+          : this.syncAssets(assets, projectKey);
+      }
+
+      return this.syncRevision(tree, projectKey, revision, runtimeKey).then(
+        () => this.syncAssets(assets, projectKey),
+      );
     }
 
     // Strict Mode、多个预览消费者或用户连续点击重试都可能同时调用 start。
@@ -231,24 +257,29 @@ export class WebContainerRuntimeManager {
     if (this.startPromise) {
       return this.startPromise.then(() => {
         if (this.activeProjectKey !== projectKey) {
-          return this.start(tree, projectKey, revision, runtimeKey);
+          return this.start(tree, projectKey, revision, runtimeKey, assets);
         }
 
         return this.activeRuntimeKey === runtimeKey
-          ? this.snapshot
-          : this.syncRevision(tree, projectKey, revision, runtimeKey);
+          ? assetsMatch(this.mountedAssetsFingerprint, assets)
+            ? this.snapshot
+            : this.syncAssets(assets, projectKey)
+          : this.start(tree, projectKey, revision, runtimeKey, assets);
       });
     }
 
     this.activeProjectKey = projectKey;
-    const currentStart = this.startRuntime(tree, revision, runtimeKey).finally(
-      () => {
-        // 旧项目的 finally 可能晚于新项目启动；只允许当前 Promise 清理自己的锁。
-        if (this.startPromise === currentStart) {
-          this.startPromise = null;
-        }
-      },
-    );
+    const currentStart = this.startRuntime(
+      tree,
+      revision,
+      runtimeKey,
+      assets,
+    ).finally(() => {
+      // 旧项目的 finally 可能晚于新项目启动；只允许当前 Promise 清理自己的锁。
+      if (this.startPromise === currentStart) {
+        this.startPromise = null;
+      }
+    });
     this.startPromise = currentStart;
 
     return currentStart;
@@ -264,14 +295,29 @@ export class WebContainerRuntimeManager {
     projectKey: string,
     revision: number | null,
     runtimeKey = `revision:${revision ?? "unknown"}`,
+    assets: readonly WebContainerRuntimeAsset[] = [],
   ): Promise<WebContainerRuntimeSnapshot> {
     if (this.activeProjectKey !== projectKey) {
-      return this.start(tree, projectKey, revision, runtimeKey);
+      return this.start(tree, projectKey, revision, runtimeKey, assets);
     }
 
     const queuedSync = this.syncTail.then(
-      () => this.performSyncRevision(tree, projectKey, revision, runtimeKey),
-      () => this.performSyncRevision(tree, projectKey, revision, runtimeKey),
+      () =>
+        this.performSyncRevision(
+          tree,
+          projectKey,
+          revision,
+          runtimeKey,
+          assets,
+        ),
+      () =>
+        this.performSyncRevision(
+          tree,
+          projectKey,
+          revision,
+          runtimeKey,
+          assets,
+        ),
     );
     // 单次同步失败仍应原样返回给调用方，但不能让队列永久停在 rejected。
     this.syncTail = queuedSync.then(
@@ -279,6 +325,28 @@ export class WebContainerRuntimeManager {
       () => undefined,
     );
 
+    return queuedSync;
+  }
+
+  /**
+   * 将项目私有资产同步到 WebContainer 的 public 目录。
+   *
+   * 下载发生在宿主页面，写入发生在 WebContainer。两者共用 syncTail，
+   * 因而不会和 Repository 文件同步交错覆盖。相同 sha256 的资产只保留
+   * 元数据，不重复发起下载或 fs.writeFile。
+   */
+  syncAssets(
+    assets: readonly WebContainerRuntimeAsset[],
+    projectKey: string,
+  ): Promise<WebContainerRuntimeSnapshot> {
+    const queuedSync = this.syncTail.then(
+      () => this.performSyncAssets(assets, projectKey),
+      () => this.performSyncAssets(assets, projectKey),
+    );
+    this.syncTail = queuedSync.then(
+      () => undefined,
+      () => undefined,
+    );
     return queuedSync;
   }
 
@@ -292,8 +360,9 @@ export class WebContainerRuntimeManager {
     projectKey = "default-template",
     revision: number | null = null,
     runtimeKey = `production:${revision ?? "unknown"}`,
+    assets: readonly WebContainerRuntimeAsset[] = [],
   ): Promise<ProductionBuildResult> {
-    await this.start(tree, projectKey, revision, runtimeKey);
+    await this.start(tree, projectKey, revision, runtimeKey, assets);
 
     if (!this.instance || this.activeProjectKey !== projectKey) {
       throw new WebContainerRuntimeError(
@@ -356,6 +425,7 @@ export class WebContainerRuntimeManager {
     projectKey: string,
     revision: number | null,
     runtimeKey: string,
+    assets: readonly WebContainerRuntimeAsset[],
   ): Promise<WebContainerRuntimeSnapshot> {
     if (this.startPromise) {
       await this.startPromise;
@@ -368,7 +438,7 @@ export class WebContainerRuntimeManager {
     }
 
     if (!this.instance || this.snapshot.phase !== "ready") {
-      return this.start(tree, projectKey, revision, runtimeKey);
+      return this.start(tree, projectKey, revision, runtimeKey, assets);
     }
 
     if (this.activeRuntimeKey === runtimeKey) {
@@ -393,7 +463,7 @@ export class WebContainerRuntimeManager {
     if ([...changedPaths].some((path) => RUNTIME_RESTART_PATHS.has(path))) {
       this.appendLog("[runtime] 依赖或构建配置已变化，正在重建运行镜像...");
       this.teardown();
-      return this.start(tree, projectKey, revision);
+      return this.start(tree, projectKey, revision, runtimeKey, assets);
     }
 
     try {
@@ -442,6 +512,84 @@ export class WebContainerRuntimeManager {
     }
   }
 
+  private async performSyncAssets(
+    assets: readonly WebContainerRuntimeAsset[],
+    projectKey: string,
+  ): Promise<WebContainerRuntimeSnapshot> {
+    if (this.activeProjectKey !== projectKey) {
+      return this.snapshot;
+    }
+
+    if (!this.instance || this.snapshot.phase !== "ready") {
+      return this.snapshot;
+    }
+
+    const nextAssets = new Map(
+      assets.map((asset) => [asset.id, asset] as const),
+    );
+    try {
+      for (const [assetId, mounted] of this.mountedAssets) {
+        if (!nextAssets.has(assetId)) {
+          await this.instance.fs.rm(mounted.path, { force: true });
+          this.appendLog(`[asset] 删除 ${mounted.path}`);
+        }
+      }
+
+      for (const asset of nextAssets.values()) {
+        const targetPath = toRuntimeAssetFilePath(asset);
+        const mounted = this.mountedAssets.get(asset.id);
+        if (mounted?.path === targetPath && mounted.sha256 === asset.sha256) {
+          continue;
+        }
+
+        const response = await fetch(asset.downloadUrl, {
+          cache: "no-store",
+        });
+        if (!response.ok) {
+          throw new WebContainerRuntimeError(
+            "asset_sync_failed",
+            `资产 ${asset.originalFilename ?? asset.id} 加载失败。`,
+            {
+              detail: `下载资产返回 HTTP ${response.status}，请刷新资产列表后重试。`,
+            },
+          );
+        }
+
+        const bytes = new Uint8Array(await response.arrayBuffer());
+        const parent = targetPath.split("/").slice(0, -1).join("/");
+        if (parent) {
+          await this.instance.fs.mkdir(parent, { recursive: true });
+        }
+        await this.instance.fs.writeFile(targetPath, bytes);
+        this.appendLog(`[asset] 写入 ${targetPath}`);
+      }
+
+      this.mountedAssets = new Map(
+        [...nextAssets.values()].map((asset) => [
+          asset.id,
+          { path: toRuntimeAssetFilePath(asset), sha256: asset.sha256 },
+        ]),
+      );
+      this.mountedAssetsFingerprint = fingerprintAssets(assets);
+      this.setSnapshot({ ...this.snapshot, diagnostic: null });
+      return this.snapshot;
+    } catch (error) {
+      const runtimeError =
+        error instanceof WebContainerRuntimeError
+          ? error
+          : new WebContainerRuntimeError(
+              "asset_sync_failed",
+              "项目图片资产未能同步到 Preview。",
+              {
+                cause: error,
+                detail: getErrorDetail(error),
+              },
+            );
+      this.fail(runtimeError);
+      throw runtimeError;
+    }
+  }
+
   /**
    * teardown 只供显式释放资源或测试使用。普通组件卸载不调用它，避免路由切换时
    * 销毁昂贵的浏览器运行时，并保证 Preview 与后续 Export 可以共享实例。
@@ -459,6 +607,8 @@ export class WebContainerRuntimeManager {
     this.activeProjectKey = null;
     this.activeRuntimeKey = null;
     this.mountedFiles = new Map();
+    this.mountedAssets = new Map();
+    this.mountedAssetsFingerprint = "";
     this.setSnapshot(createInitialRuntimeSnapshot());
   }
 
@@ -466,6 +616,7 @@ export class WebContainerRuntimeManager {
     tree: FileSystemTree,
     revision: number | null,
     runtimeKey: string,
+    assets: readonly WebContainerRuntimeAsset[] = [],
   ): Promise<WebContainerRuntimeSnapshot> {
     const generation = ++this.generation;
     const crossOriginIsolated = this.dependencies.isCrossOriginIsolated();
@@ -513,6 +664,7 @@ export class WebContainerRuntimeManager {
       this.appendLog("[runtime] 正在挂载固定 Rsbuild 项目模板...");
       await instance.mount(tree);
       this.mountedFiles = flattenRuntimeTree(tree);
+      await this.writeInitialAssets(instance, assets, generation);
       this.activeRuntimeKey = runtimeKey;
       this.assertGeneration(generation);
 
@@ -616,6 +768,49 @@ export class WebContainerRuntimeManager {
       this.fail(runtimeError);
       throw runtimeError;
     }
+  }
+
+  private async writeInitialAssets(
+    instance: WebContainerAdapter,
+    assets: readonly WebContainerRuntimeAsset[],
+    generation: number,
+  ): Promise<void> {
+    if (assets.length === 0) {
+      this.mountedAssets = new Map();
+      this.mountedAssetsFingerprint = "";
+      return;
+    }
+
+    this.appendLog(`[asset] 准备同步 ${assets.length} 个项目资产...`);
+    for (const asset of assets) {
+      this.assertGeneration(generation);
+      const targetPath = toRuntimeAssetFilePath(asset);
+      const response = await fetch(asset.downloadUrl, { cache: "no-store" });
+      if (!response.ok) {
+        throw new WebContainerRuntimeError(
+          "asset_sync_failed",
+          `资产 ${asset.originalFilename ?? asset.id} 加载失败。`,
+          {
+            detail: `下载资产返回 HTTP ${response.status}，请刷新资产列表后重试。`,
+          },
+        );
+      }
+
+      const bytes = new Uint8Array(await response.arrayBuffer());
+      const parent = targetPath.split("/").slice(0, -1).join("/");
+      if (parent) {
+        await instance.fs.mkdir(parent, { recursive: true });
+      }
+      await instance.fs.writeFile(targetPath, bytes);
+      this.appendLog(`[asset] 写入 ${targetPath}`);
+    }
+    this.mountedAssets = new Map(
+      assets.map((asset) => [
+        asset.id,
+        { path: toRuntimeAssetFilePath(asset), sha256: asset.sha256 },
+      ]),
+    );
+    this.mountedAssetsFingerprint = fingerprintAssets(assets);
   }
 
   private async getOrBootInstance(
@@ -896,6 +1091,38 @@ export const webContainerRuntimeManager = new WebContainerRuntimeManager();
 
 // 只导出项目自己的最小接口，避免上层组件依赖 WebContainer SDK 的具体实现。
 export type WebContainerInstance = WebContainerAdapter;
+
+function toRuntimeAssetFilePath(asset: WebContainerRuntimeAsset): string {
+  const normalized = asset.assetPath.replace(/^\/+/, "");
+  if (
+    !normalized.startsWith("__webpilot/assets/") ||
+    normalized.includes("..") ||
+    normalized.includes("\\")
+  ) {
+    throw new WebContainerRuntimeError(
+      "asset_sync_failed",
+      "项目资产路径不合法，无法写入 Preview。",
+    );
+  }
+
+  return `public/${normalized}`;
+}
+
+function fingerprintAssets(
+  assets: readonly WebContainerRuntimeAsset[],
+): string {
+  return assets
+    .map((asset) => `${asset.id}:${asset.assetPath}:${asset.sha256}`)
+    .sort()
+    .join("|");
+}
+
+function assetsMatch(
+  currentFingerprint: string,
+  assets: readonly WebContainerRuntimeAsset[],
+): boolean {
+  return currentFingerprint === fingerprintAssets(assets);
+}
 
 function flattenRuntimeTree(
   tree: FileSystemTree,

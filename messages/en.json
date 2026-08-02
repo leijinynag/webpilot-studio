@@ -460,6 +460,7 @@
     "candidatesNotLoaded": "Candidates not loaded",
     "waitingForAdmin": "Waiting for administrator",
     "repositoryReadFailed": "Unable to read the current Repository",
+    "assetLoadFailed": "Project image assets failed to load",
     "returnToWorkbenchRetry": "Return to the workspace and try again.",
     "unsavedDraftsBlocked": "Unsaved drafts are blocking the build",
     "noBuildFiles": "This project has no buildable files",

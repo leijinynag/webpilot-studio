@@ -460,6 +460,7 @@
     "candidatesNotLoaded": "尚未加载候选案例",
     "waitingForAdmin": "等待管理员发布",
     "repositoryReadFailed": "无法读取当前 Repository",
+    "assetLoadFailed": "项目图片资产加载失败",
     "returnToWorkbenchRetry": "请返回工作台重试。",
     "unsavedDraftsBlocked": "存在未保存草稿",
     "noBuildFiles": "当前项目没有可构建文件",

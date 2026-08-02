@@ -56,7 +56,10 @@ import { BrowserBridgeController } from "@/infrastructure/webcontainer/browser-b
 import { PreviewEvidenceCollector } from "@/infrastructure/webcontainer/evidence-collector";
 import { WEB_CONTAINER_PHASE_LABELS } from "@/infrastructure/webcontainer/lifecycle";
 import { injectRuntimeBridge } from "@/infrastructure/webcontainer/runtime-bridge";
-import { webContainerRuntimeManager } from "@/infrastructure/webcontainer/runtime-manager";
+import {
+  type WebContainerRuntimeAsset,
+  webContainerRuntimeManager,
+} from "@/infrastructure/webcontainer/runtime-manager";
 
 type WebContainerPreviewProps = {
   clientToolRequest?: PreviewClientToolRequest | null;
@@ -127,6 +130,10 @@ function ProjectWebContainerPreview({
   const [runtimeRequested, setRuntimeRequested] = useState(() =>
     webContainerRuntimeManager.isActiveProject(projectId),
   );
+  const [runtimeAssets, setRuntimeAssets] = useState<
+    WebContainerRuntimeAsset[]
+  >([]);
+  const [assetLoadError, setAssetLoadError] = useState<string | null>(null);
   const projectTree = useMemo(
     () =>
       buildProjectTemplate(
@@ -169,6 +176,57 @@ function ProjectWebContainerPreview({
   }, [projectId]);
 
   useEffect(() => {
+    let cancelled = false;
+
+    async function loadRuntimeAssets() {
+      try {
+        const response = await fetch(`/api/projects/${projectId}/assets`, {
+          cache: "no-store",
+        });
+        const body = (await response.json().catch(() => ({}))) as {
+          assets?: Array<
+            WebContainerRuntimeAsset & {
+              downloadUrl?: string;
+            }
+          >;
+          error?: { message?: string };
+        };
+
+        if (!response.ok || !body.assets) {
+          throw new Error(body.error?.message ?? "项目资产列表加载失败。");
+        }
+
+        if (!cancelled) {
+          setRuntimeAssets(
+            body.assets.filter(
+              (
+                asset,
+              ): asset is WebContainerRuntimeAsset & {
+                downloadUrl: string;
+              } => typeof asset.downloadUrl === "string",
+            ),
+          );
+          setAssetLoadError(null);
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setRuntimeAssets([]);
+          setAssetLoadError(
+            error instanceof Error
+              ? error.message
+              : "项目资产列表加载失败，请刷新后重试。",
+          );
+        }
+      }
+    }
+
+    void loadRuntimeAssets();
+    return () => {
+      cancelled = true;
+    };
+  }, [projectId]);
+
+  useEffect(() => {
     if (
       clientToolExecutionKey ||
       !runtimeRequested ||
@@ -186,6 +244,7 @@ function ProjectWebContainerPreview({
         projectId,
         revision,
         `repository:${projectId}:${revision}`,
+        runtimeAssets,
       )
       .catch(() => {
         // 错误已经写入可订阅 snapshot，由页面统一展示诊断，避免产生未处理 Promise。
@@ -196,6 +255,7 @@ function ProjectWebContainerPreview({
     projectId,
     projectTree,
     revision,
+    runtimeAssets,
     runtimeRequested,
   ]);
 
@@ -290,6 +350,7 @@ function ProjectWebContainerPreview({
           projectId,
           request.revision,
           `agent:${request.runId}:${request.toolCallId}:${request.revision}`,
+          runtimeAssets,
         );
 
         if (isStaleExecution()) {
@@ -656,7 +717,13 @@ function ProjectWebContainerPreview({
   function retryRuntime() {
     // Manager 会在可用时复用已 boot 的实例，仅重新执行失败后的项目启动链。
     void webContainerRuntimeManager
-      .start(projectTree, projectId, revision)
+      .start(
+        projectTree,
+        projectId,
+        revision,
+        `repository:${projectId}:${revision}`,
+        runtimeAssets,
+      )
       .catch(() => undefined);
   }
 
@@ -833,6 +900,12 @@ function ProjectWebContainerPreview({
               {visibleSnapshot.diagnostic.detail ? (
                 <small>{visibleSnapshot.diagnostic.detail}</small>
               ) : null}
+            </aside>
+          ) : null}
+          {assetLoadError ? (
+            <aside className="runtime-diagnostic">
+              <span>项目图片资产未能加载。</span>
+              <small>{assetLoadError} 可刷新页面后重试。</small>
             </aside>
           ) : null}
         </div>

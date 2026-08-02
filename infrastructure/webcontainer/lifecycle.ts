@@ -18,7 +18,8 @@ export type WebContainerErrorCode =
   | "boot_failed"
   | "mount_failed"
   | "install_failed"
-  | "dev_server_failed";
+  | "dev_server_failed"
+  | "asset_sync_failed";
 
 export type WebContainerDiagnostic = {
   code: WebContainerErrorCode;

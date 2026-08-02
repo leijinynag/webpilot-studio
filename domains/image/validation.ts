@@ -19,6 +19,22 @@ const MIME_TO_FORMAT = {
 type SupportedMime = keyof typeof MIME_TO_FORMAT;
 type ImageFormat = (typeof MIME_TO_FORMAT)[SupportedMime];
 
+export function imageExtensionForMime(
+  mimeType: string,
+): "png" | "jpg" | "webp" {
+  const normalized = mimeType.trim().toLowerCase().split(";")[0];
+  switch (normalized) {
+    case "image/png":
+      return "png";
+    case "image/jpeg":
+      return "jpg";
+    case "image/webp":
+      return "webp";
+    default:
+      return "png";
+  }
+}
+
 export type ValidatedImage = {
   bytes: Uint8Array;
   mimeType: SupportedMime;
