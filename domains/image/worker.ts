@@ -65,6 +65,9 @@ export async function processNextImageJob(input?: {
   expectedImageRunId?: string;
   dependencies?: ImageWorkerDependencies;
 }): Promise<void> {
+  // 先解析依赖，再领取租约。配置错误属于“当前环境不可执行”，不能让
+  // 已经领取的 job 卡在 running，等待租约过期后才被动恢复。
+  const dependencies = resolveDependencies(input?.dependencies);
   const claimed = await claimImageJob({
     expectedJobId: input?.expectedJobId,
     expectedImageRunId: input?.expectedImageRunId,
@@ -73,7 +76,6 @@ export async function processNextImageJob(input?: {
     return;
   }
 
-  const dependencies = resolveDependencies(input?.dependencies);
   const { job, run } = claimed;
   const createdAssets: Array<{
     id: string;
@@ -81,7 +83,7 @@ export async function processNextImageJob(input?: {
   }> = [];
 
   try {
-    const generated = await dependencies.provider!.generate({
+    const generated = await dependencies.provider.generate({
       prompt: run.prompt,
       count: run.requestedCount,
       size: parseImageSize(run.size),
@@ -100,7 +102,7 @@ export async function processNextImageJob(input?: {
       );
     }
 
-    const store = dependencies.blobStore!;
+    const store = dependencies.blobStore;
     const assets: Array<{
       id: string;
       pathname: string;
@@ -143,7 +145,7 @@ export async function processNextImageJob(input?: {
     const result = {
       ok: true,
       toolName: "generate_image",
-      revision: await getParentRevision(run, dependencies.agentStore!),
+      revision: await getParentRevision(run, dependencies.agentStore),
       data: {
         imageRunId: run.id,
         assetCount: assetRows.length,
@@ -154,7 +156,7 @@ export async function processNextImageJob(input?: {
     await completeSuccessfulImageTool(
       run,
       result,
-      dependencies.agentStore!,
+      dependencies.agentStore,
     );
 
     await markImageJobSucceeded({
@@ -163,24 +165,24 @@ export async function processNextImageJob(input?: {
       providerJobId: generated.providerJobId,
     });
 
-    const parent = await getParentRun(run, dependencies.agentStore!);
+    const parent = await getParentRun(run, dependencies.agentStore);
     if (
       parent &&
       parent.status === "awaiting_async_job" &&
       !parent.cancellationRequestedAt
     ) {
-      await dependencies.agentStore!.transitionRun({
+      await dependencies.agentStore.transitionRun({
         ownerId: run.ownerId,
         runId: parent.id,
         status: "running",
       });
-      await dependencies.launchAgentRun!({
+      await dependencies.launchAgentRun({
         ownerId: run.ownerId,
         runId: parent.id,
       });
     }
   } catch (error) {
-    await cleanupCreatedAssets(createdAssets, dependencies.blobStore!);
+    await cleanupCreatedAssets(createdAssets, dependencies.blobStore);
     const imageError = normalizeImageError(error);
     const retryable = isRetryableImageError(imageError);
     let outcome: { retryScheduled: boolean };
@@ -203,7 +205,7 @@ export async function processNextImageJob(input?: {
       await completeFailedImageTool(
         run,
         imageError,
-        dependencies.agentStore!,
+        dependencies.agentStore,
       );
       return;
     }
@@ -222,17 +224,10 @@ function resolveDependencies(
   agentStore: ImageWorkerAgentStore;
   launchAgentRun: typeof launchAgentRun;
 } {
-  const imageRuntime = overrides?.provider
-    ? null
-    : getImageProviderRuntime();
-  const persistence = overrides?.agentStore
-    ? null
-    : getAgentPersistence();
-
   return {
-    provider: overrides?.provider ?? imageRuntime!.provider,
+    provider: overrides?.provider ?? getImageProviderRuntime().provider,
     blobStore: overrides?.blobStore ?? getPrivateBlobStore(),
-    agentStore: overrides?.agentStore ?? persistence!.store,
+    agentStore: overrides?.agentStore ?? getAgentPersistence().store,
     launchAgentRun: overrides?.launchAgentRun ?? launchAgentRun,
   };
 }
