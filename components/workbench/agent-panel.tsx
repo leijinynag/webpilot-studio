@@ -8,6 +8,7 @@ import {
   useRef,
   useState,
 } from "react";
+import type { ChangeEvent } from "react";
 import {
   Bot,
   Check,
@@ -15,18 +16,28 @@ import {
   CircleStop,
   FileCode2,
   GitCompareArrows,
+  Image as ImageIcon,
   LoaderCircle,
   MessageSquarePlus,
+  Paperclip,
   PlayCircle,
   RefreshCw,
   RotateCcw,
   Send,
   ShieldCheck,
+  Trash2,
   TriangleAlert,
   Wrench,
 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { ChangeSetDialog } from "@/components/workbench/change-set-dialog";
 import {
   clientToolRequestSchema,
@@ -67,7 +78,43 @@ type AgentErrorResponse = {
 
 type OptimisticUserMessage = {
   content: string;
+  attachmentIds?: string[];
   status: "sending" | "queued";
+};
+
+type AttachmentView = {
+  id: string;
+  originalFilename: string;
+  mimeType: string;
+  byteLength: number;
+  width: number | null;
+  height: number | null;
+  status: string;
+  createdAt: string;
+};
+
+type AssetView = {
+  id: string;
+  kind: string;
+  source: string;
+  attachmentId: string | null;
+  imageRunId: string | null;
+  originalFilename: string | null;
+  mimeType: string;
+  byteLength: number;
+  width: number | null;
+  height: number | null;
+  createdAt: string;
+};
+
+type PendingAttachment = {
+  clientId: string;
+  file: File;
+  previewUrl: string;
+  status: "uploading" | "ready" | "failed";
+  progress: number;
+  attachment: AttachmentView | null;
+  error: string | null;
 };
 
 type Translate = (
@@ -126,6 +173,11 @@ export function AgentPanel({
   const [streamingAssistantText, setStreamingAssistantText] = useState("");
   const [optimisticUserMessage, setOptimisticUserMessage] =
     useState<OptimisticUserMessage | null>(null);
+  const [pendingAttachments, setPendingAttachments] = useState<
+    PendingAttachment[]
+  >([]);
+  const [assets, setAssets] = useState<AssetView[]>([]);
+  const [showAssets, setShowAssets] = useState(false);
   const streamRef = useRef<EventSource | null>(null);
   const streamRunIdRef = useRef<string | null>(null);
   const reconnectTimerRef = useRef<number | null>(null);
@@ -134,6 +186,7 @@ export function AgentPanel({
   const explicitConversationSelectionRef = useRef(false);
   const reconnectStreamRef = useRef<(() => void) | null>(null);
   const draftRef = useRef<HTMLTextAreaElement | null>(null);
+  const attachmentInputRef = useRef<HTMLInputElement | null>(null);
   const transcriptRef = useRef<HTMLDivElement | null>(null);
   const snapshotRequestRef = useRef(0);
   const snapshotRefreshTimerRef = useRef<number | null>(null);
@@ -141,6 +194,24 @@ export function AgentPanel({
     useRef<Promise<AgentResponse | null> | null>(null);
   const snapshotRefreshTrailingRef = useRef(false);
   const currentProjectIdRef = useRef(projectId);
+  const hasUploadingAttachment = pendingAttachments.some(
+    (attachment) => attachment.status === "uploading",
+  );
+
+  const loadAssets = useCallback(async () => {
+    try {
+      const response = await fetch(`/api/projects/${projectId}/assets`, {
+        cache: "no-store",
+      });
+      if (!response.ok) {
+        return;
+      }
+      const body = (await response.json()) as { assets?: AssetView[] };
+      setAssets(body.assets ?? []);
+    } catch {
+      // 资产面板是辅助能力，加载失败不应阻断聊天主流程。
+    }
+  }, [projectId]);
 
   const activeRun = useMemo(
     () =>
@@ -414,6 +485,14 @@ export function AgentPanel({
         }
       }
 
+      if (
+        persistedEvent?.runId === runId &&
+        persistedEvent.type === "tool.completed" &&
+        persistedEvent.payload.toolName === "generate_image"
+      ) {
+        void loadAssets();
+      }
+
       // assistant.delta 先即时投影；普通高频事件进入 160ms 合并窗口，终态、
       // 客户端工具与验证事件在下一个事件循环立即收敛。数据库仍是最终事实，
       // 但不再出现“一条 SSE 对应一次完整快照 GET”的请求风暴。
@@ -474,6 +553,7 @@ export function AgentPanel({
     activeRun?.id,
     flushAgentSnapshotRefresh,
     onClientToolRequest,
+    loadAssets,
     scheduleAgentSnapshotRefresh,
   ]);
 
@@ -633,6 +713,105 @@ export function AgentPanel({
     }
   }
 
+  function updatePendingAttachment(
+    clientId: string,
+    update: Partial<PendingAttachment>,
+  ) {
+    setPendingAttachments((current) =>
+      current.map((item) =>
+        item.clientId === clientId ? { ...item, ...update } : item,
+      ),
+    );
+  }
+
+  async function uploadAttachment(item: PendingAttachment) {
+    updatePendingAttachment(item.clientId, {
+      status: "uploading",
+      progress: 0,
+      error: null,
+    });
+    try {
+      const formData = new FormData();
+      formData.append("file", item.file);
+      if (selectedConversationId) {
+        formData.append("conversationId", selectedConversationId);
+      }
+
+      const attachment = await uploadImageFile(
+        `/api/projects/${projectId}/attachments`,
+        formData,
+        (progress) =>
+          updatePendingAttachment(item.clientId, {
+            progress,
+          }),
+      );
+
+      updatePendingAttachment(item.clientId, {
+        status: "ready",
+        progress: 100,
+        attachment,
+        error: null,
+      });
+    } catch (error) {
+      updatePendingAttachment(item.clientId, {
+        status: "failed",
+        error:
+          error instanceof Error ? error.message : t("agent.attachmentUploadFailed"),
+      });
+    }
+  }
+
+  function handleAttachmentSelection(
+    event: ChangeEvent<HTMLInputElement>,
+  ) {
+    const files = Array.from(event.target.files ?? []);
+    event.target.value = "";
+    if (!files.length) {
+      return;
+    }
+
+    const available = Math.max(0, 4 - pendingAttachments.length);
+    const nextFiles = files.slice(0, available);
+    const nextItems = nextFiles.map((file) => ({
+      clientId: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+      file,
+      previewUrl: URL.createObjectURL(file),
+      status: "uploading" as const,
+      progress: 0,
+      attachment: null,
+      error: null,
+    }));
+
+    setPendingAttachments((current) => [...current, ...nextItems]);
+    for (const item of nextItems) {
+      void uploadAttachment(item);
+    }
+  }
+
+  async function removePendingAttachment(clientId: string) {
+    const item = pendingAttachments.find(
+      (candidate) => candidate.clientId === clientId,
+    );
+    setPendingAttachments((current) => {
+      if (item) {
+        URL.revokeObjectURL(item.previewUrl);
+      }
+      return current.filter((candidate) => candidate.clientId !== clientId);
+    });
+
+    // 已经写入私有 Blob 的附件不应长期占用存储。删除失败时仍先移除
+    // 当前 Composer 项，后端的软删除清理任务可以再次回收这个孤立对象。
+    if (item?.attachment) {
+      try {
+        await fetch(`/api/attachments/${item.attachment.id}`, {
+          method: "DELETE",
+        });
+      } catch {
+        setErrorMessage(t("agent.attachmentDeleteFailed"));
+      }
+    }
+  }
+
   function selectConversation(conversationId: string) {
     // ref 必须在发请求前同步更新。setState 只会在下一次 commit 后生效，
     // 若这段窗口内 SSE 断线重拉或首屏定时器启动，旧 selectedConversationId
@@ -650,10 +829,28 @@ export function AgentPanel({
       return;
     }
 
+    const attachmentIds = pendingAttachments
+      .filter(
+        (attachment): attachment is PendingAttachment & {
+          attachment: AttachmentView;
+        } =>
+          attachment.status === "ready" && attachment.attachment !== null,
+      )
+      .map((attachment) => attachment.attachment.id);
+
+    if (hasUploadingAttachment) {
+      setErrorMessage(t("agent.waitForAttachmentUpload"));
+      return;
+    }
+
     // 用户消息先进入本地投影并立即清空输入框。网络、数据库限流检查和 Run
     // 事务都不再阻塞可见反馈；失败时再把原文恢复到编辑框供用户重试。
     setDraft("");
-    setOptimisticUserMessage({ content: message, status: "sending" });
+    setOptimisticUserMessage({
+      content: message,
+      attachmentIds,
+      status: "sending",
+    });
     setSending(true);
     setErrorMessage(null);
 
@@ -665,6 +862,7 @@ export function AgentPanel({
           projectId,
           conversationId: selectedConversationId ?? undefined,
           message,
+          attachmentIds,
           locale: toAgentLocale(locale),
           repositoryRevision: revision,
         }),
@@ -685,6 +883,12 @@ export function AgentPanel({
           ? { ...current, status: "queued" }
           : current,
       );
+      setPendingAttachments((current) => {
+        for (const item of current) {
+          URL.revokeObjectURL(item.previewUrl);
+        }
+        return [];
+      });
       // SSE 会持续收敛后续状态；这里触发一次首个持久化快照，但不让输入交互
       // 等待额外的 GET 往返。sending 只代表创建 Run 的 POST 是否仍在进行。
       void loadAgentSnapshot(body.run.conversationId, { showLoading: false });
@@ -870,6 +1074,13 @@ export function AgentPanel({
       ) : null}
 
       <form className="agent-composer-v2" onSubmit={sendMessage}>
+        {pendingAttachments.length ? (
+          <AttachmentTray
+            attachments={pendingAttachments}
+            onRemove={removePendingAttachment}
+            onRetry={(item) => void uploadAttachment(item)}
+          />
+        ) : null}
         <textarea
           aria-label={t("agent.messageLabel")}
           disabled={Boolean(activeRun) || sending}
@@ -886,7 +1097,44 @@ export function AgentPanel({
           value={draft}
         />
         <div className="agent-composer-footer">
-          <span>{t("agent.provider", { revision })}</span>
+          <div className="agent-composer-tools">
+            <input
+              accept="image/png,image/jpeg,image/webp"
+              className="sr-only"
+              multiple
+              onChange={handleAttachmentSelection}
+              ref={attachmentInputRef}
+              type="file"
+            />
+            <Button
+              aria-label={t("agent.addAttachment")}
+              disabled={
+                Boolean(activeRun) ||
+                sending ||
+                pendingAttachments.length >= 4 ||
+                hasUploadingAttachment
+              }
+              onClick={() => attachmentInputRef.current?.click()}
+              size="icon-sm"
+              type="button"
+              variant="ghost"
+            >
+              <Paperclip />
+            </Button>
+            <Button
+              aria-label={t("agent.openAssets")}
+              onClick={() => {
+                setShowAssets(true);
+                void loadAssets();
+              }}
+              size="icon-sm"
+              type="button"
+              variant="ghost"
+            >
+              <ImageIcon />
+            </Button>
+            <span>{t("agent.provider", { revision })}</span>
+          </div>
           <Button
             aria-label={t("agent.send")}
             disabled={!draft.trim() || Boolean(activeRun) || sending}
@@ -897,6 +1145,14 @@ export function AgentPanel({
           </Button>
         </div>
       </form>
+
+      {showAssets ? (
+        <AssetPanel
+          assets={assets}
+          onClose={() => setShowAssets(false)}
+          onRefresh={() => void loadAssets()}
+        />
+      ) : null}
 
       {changeSetRunId ? (
         <ChangeSetDialog
@@ -923,6 +1179,9 @@ function TranscriptItem({ message }: { message: TranscriptMessage }) {
       <article className="agent-message agent-message-user">
         <span className="agent-message-label">{t("agent.you")}</span>
         <p>{message.content}</p>
+        {message.attachmentIds?.length ? (
+          <AttachmentIdList attachmentIds={message.attachmentIds} />
+        ) : null}
       </article>
     );
   }
@@ -953,6 +1212,8 @@ function TranscriptItem({ message }: { message: TranscriptMessage }) {
   if (message.kind === "tool_result") {
     const ok = message.resultJson.ok === true;
     const preview = getPreviewResultDisplay(message);
+    const vision = getVisionResultDisplay(message);
+    const generated = getGeneratedImageResultDisplay(message);
     return (
       <article className={cn("agent-timeline-item", !ok && "is-error")}>
         <span className="agent-timeline-icon">
@@ -981,6 +1242,13 @@ function TranscriptItem({ message }: { message: TranscriptMessage }) {
                 <code>{preview.failureMessage}</code>
               ) : null}
             </>
+          ) : vision ? (
+            <VisionResultSummary summary={vision} />
+          ) : generated ? (
+            <GeneratedImageResult
+              assetIds={generated.assetIds}
+              count={generated.assetCount}
+            />
           ) : (
             <code>{formatToolResult(message.resultJson)}</code>
           )}
@@ -1021,6 +1289,9 @@ function OptimisticTranscriptItem({
           : t("agent.queuedLabel")}
       </span>
       <p>{message.content}</p>
+      {message.attachmentIds?.length ? (
+        <AttachmentIdList attachmentIds={message.attachmentIds} />
+      ) : null}
     </article>
   );
 }
@@ -1496,6 +1767,321 @@ function getPreviewResultDisplay(
       ? (failure.data.issues[0]?.message ?? failure.data.summary)
       : null,
   };
+}
+
+type VisionResultDisplay = {
+  description: string;
+  objects: string[];
+  text: string[];
+  colors: string[];
+  layout: string;
+  confidence: number;
+};
+
+function getVisionResultDisplay(
+  message: Extract<TranscriptMessage, { kind: "tool_result" }>,
+): VisionResultDisplay | null {
+  if (message.toolName !== "inspect_attachment" || message.resultJson.ok !== true) {
+    return null;
+  }
+
+  const data = asRecord(message.resultJson.data);
+  const summary = asRecord(data.summary);
+  if (
+    typeof summary.description !== "string" ||
+    !Array.isArray(summary.objects) ||
+    !Array.isArray(summary.text) ||
+    !Array.isArray(summary.colors) ||
+    typeof summary.layout !== "string" ||
+    typeof summary.confidence !== "number"
+  ) {
+    return null;
+  }
+
+  return {
+    description: summary.description,
+    objects: summary.objects.filter(
+      (item): item is string => typeof item === "string",
+    ),
+    text: summary.text.filter(
+      (item): item is string => typeof item === "string",
+    ),
+    colors: summary.colors.filter(
+      (item): item is string => typeof item === "string",
+    ),
+    layout: summary.layout,
+    confidence: summary.confidence,
+  };
+}
+
+function getGeneratedImageResultDisplay(
+  message: Extract<TranscriptMessage, { kind: "tool_result" }>,
+): { assetCount: number; assetIds: string[] } | null {
+  if (message.toolName !== "generate_image" || message.resultJson.ok !== true) {
+    return null;
+  }
+
+  const data = asRecord(message.resultJson.data);
+  const assetCount = typeof data.assetCount === "number" ? data.assetCount : 0;
+  const assetIds = Array.isArray(data.assetIds)
+    ? data.assetIds.filter(
+        (assetId): assetId is string => typeof assetId === "string",
+      )
+    : [];
+
+  return assetCount > 0 || assetIds.length > 0
+    ? { assetCount, assetIds }
+    : null;
+}
+
+function AttachmentIdList({ attachmentIds }: { attachmentIds: string[] }) {
+  const { t } = useUiI18n();
+
+  return (
+    <div className="agent-attachment-id-list" aria-label={t("agent.attachments")}>
+      {attachmentIds.map((attachmentId, index) => (
+        <a
+          className="agent-attachment-id"
+          href={`/api/attachments/${attachmentId}`}
+          key={attachmentId}
+          rel="noreferrer"
+          target="_blank"
+        >
+          <img
+            alt={t("agent.attachmentPreview", { index: index + 1 })}
+            loading="lazy"
+            src={`/api/attachments/${attachmentId}`}
+          />
+          <span>{t("agent.attachmentNumber", { number: index + 1 })}</span>
+        </a>
+      ))}
+    </div>
+  );
+}
+
+function VisionResultSummary({ summary }: { summary: VisionResultDisplay }) {
+  const { t } = useUiI18n();
+  const fields = [
+    [t("agent.visionObjects"), summary.objects],
+    [t("agent.visionText"), summary.text],
+    [t("agent.visionColors"), summary.colors],
+  ] as const;
+
+  return (
+    <div className="agent-vision-result">
+      <p>{summary.description}</p>
+      <div className="agent-vision-facts">
+        <span>
+          {t("agent.visionConfidence", {
+            confidence: Math.round(summary.confidence * 100),
+          })}
+        </span>
+        <span>{summary.layout}</span>
+      </div>
+      {fields.map(([label, values]) =>
+        values.length ? (
+          <div className="agent-vision-fact" key={label}>
+            <small>{label}</small>
+            <div>
+              {values.slice(0, 8).map((value) => (
+                <span key={value}>{value}</span>
+              ))}
+            </div>
+          </div>
+        ) : null,
+      )}
+    </div>
+  );
+}
+
+function GeneratedImageResult({
+  assetIds,
+  count,
+}: {
+  assetIds: string[];
+  count: number;
+}) {
+  const { t } = useUiI18n();
+
+  return (
+    <div className="agent-generated-result">
+      <span>{t("agent.generatedImages", { count })}</span>
+      {assetIds.length ? (
+        <div className="agent-generated-thumbnails">
+          {assetIds.slice(0, 4).map((assetId, index) => (
+            <a
+              href={`/api/project-assets/${assetId}`}
+              key={assetId}
+              rel="noreferrer"
+              target="_blank"
+            >
+              <img
+                alt={t("agent.generatedImageNumber", { number: index + 1 })}
+                loading="lazy"
+                src={`/api/project-assets/${assetId}`}
+              />
+            </a>
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function AttachmentTray({
+  attachments,
+  onRemove,
+  onRetry,
+}: {
+  attachments: PendingAttachment[];
+  onRemove: (clientId: string) => void | Promise<void>;
+  onRetry: (item: PendingAttachment) => void;
+}) {
+  const { t } = useUiI18n();
+
+  return (
+    <div className="agent-attachment-tray" aria-label={t("agent.attachments")}>
+      {attachments.map((item) => (
+        <article className="agent-attachment-card" key={item.clientId}>
+          <img alt={item.file.name} src={item.previewUrl} />
+          <div className="agent-attachment-card-body">
+            <strong title={item.file.name}>{item.file.name}</strong>
+            {item.status === "uploading" ? (
+              <div className="agent-attachment-progress">
+                <span style={{ width: `${item.progress}%` }} />
+                <small>{item.progress}%</small>
+              </div>
+            ) : item.status === "failed" ? (
+              <div className="agent-attachment-failed">
+                <small>{item.error ?? t("agent.attachmentUploadFailed")}</small>
+                <Button
+                  aria-label={t("agent.retryAttachment")}
+                  onClick={() => onRetry(item)}
+                  size="icon-xs"
+                  type="button"
+                  variant="ghost"
+                >
+                  <RefreshCw />
+                </Button>
+              </div>
+            ) : (
+              <small>{t("agent.attachmentReady")}</small>
+            )}
+          </div>
+          <Button
+            aria-label={t("agent.removeAttachment", { name: item.file.name })}
+            onClick={() => void onRemove(item.clientId)}
+            size="icon-xs"
+            type="button"
+            variant="ghost"
+          >
+            <Trash2 />
+          </Button>
+        </article>
+      ))}
+    </div>
+  );
+}
+
+function AssetPanel({
+  assets,
+  onClose,
+  onRefresh,
+}: {
+  assets: AssetView[];
+  onClose: () => void;
+  onRefresh: () => void;
+}) {
+  const { t } = useUiI18n();
+
+  return (
+    <Dialog
+      onOpenChange={(open) => {
+        if (!open) {
+          onClose();
+        }
+      }}
+      open
+    >
+      <DialogContent className="agent-assets-dialog">
+        <DialogHeader>
+          <DialogTitle>{t("agent.assetsTitle")}</DialogTitle>
+          <DialogDescription>{t("agent.assetsDescription")}</DialogDescription>
+        </DialogHeader>
+        <div className="agent-assets-toolbar">
+          <span>{t("agent.assetCount", { count: assets.length })}</span>
+          <Button onClick={onRefresh} size="sm" variant="outline">
+            <RefreshCw data-icon="inline-start" />
+            {t("agent.refreshAssets")}
+          </Button>
+        </div>
+        {assets.length ? (
+          <div className="agent-assets-grid">
+            {assets.map((asset) => (
+              <a
+                className="agent-asset-card"
+                href={`/api/project-assets/${asset.id}`}
+                key={asset.id}
+                rel="noreferrer"
+                target="_blank"
+              >
+                <img
+                  alt={asset.originalFilename ?? t("agent.generatedAsset")}
+                  loading="lazy"
+                  src={`/api/project-assets/${asset.id}`}
+                />
+                <span>
+                  <strong>
+                    {asset.originalFilename ?? t("agent.generatedAsset")}
+                  </strong>
+                  <small>
+                    {asset.kind === "uploaded_image"
+                      ? t("agent.uploadedAsset")
+                      : t("agent.generatedAsset")}
+                  </small>
+                </span>
+              </a>
+            ))}
+          </div>
+        ) : (
+          <div className="agent-assets-empty">
+            <ImageIcon />
+            <span>{t("agent.assetsEmpty")}</span>
+          </div>
+        )}
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function uploadImageFile(
+  url: string,
+  formData: FormData,
+  onProgress: (progress: number) => void,
+): Promise<AttachmentView> {
+  return new Promise((resolve, reject) => {
+    const request = new XMLHttpRequest();
+    request.open("POST", url);
+    request.responseType = "json";
+    request.upload.addEventListener("progress", (event) => {
+      if (event.lengthComputable) {
+        onProgress(Math.round((event.loaded / event.total) * 100));
+      }
+    });
+    request.addEventListener("load", () => {
+      const body = request.response as
+        | { attachments?: AttachmentView[]; error?: { message?: string } }
+        | null;
+      if (request.status < 200 || request.status >= 300 || !body?.attachments?.[0]) {
+        reject(new Error(body?.error?.message ?? "图片上传失败。"));
+        return;
+      }
+      resolve(body.attachments[0]);
+    });
+    request.addEventListener("error", () => reject(new Error("图片上传失败。")));
+    request.addEventListener("abort", () => reject(new Error("图片上传已取消。")));
+    request.send(formData);
+  });
 }
 
 function asRecord(value: unknown): Record<string, unknown> {
