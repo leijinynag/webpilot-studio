@@ -36,18 +36,14 @@ import type {
   ProjectRestoreImpact,
   ProjectRestorePreview,
 } from "@/domains/project/types";
+import { useUiI18n } from "@/infrastructure/i18n/ui";
 import { cn } from "@/lib/utils";
 
 const MonacoDiffEditor = dynamic(
   () => loadLocalMonacoReact().then((module) => module.DiffEditor),
   {
     ssr: false,
-    loading: () => (
-      <div className="change-set-diff-loading">
-        <LoaderCircle className="animate-spin" />
-        正在加载差异编辑器...
-      </div>
-    ),
+    loading: () => <DiffEditorLoading />,
   },
 );
 
@@ -73,6 +69,10 @@ type ApiErrorResponse = {
 };
 
 type MonacoTheme = "light" | "vs-dark";
+type Translate = (
+  key: string,
+  values?: Record<string, string | number>,
+) => string;
 
 export function ChangeSetDialog({
   runId,
@@ -80,6 +80,7 @@ export function ChangeSetDialog({
   onOpenChange,
   onRestoreComplete,
 }: ChangeSetDialogProps) {
+  const { t } = useUiI18n();
   const [changeSet, setChangeSet] = useState<ProjectChangeSet | null>(null);
   const [preview, setPreview] = useState<ProjectRestorePreview | null>(null);
   const [selectedFileId, setSelectedFileId] = useState<string>("all");
@@ -93,25 +94,25 @@ export function ChangeSetDialog({
     setErrorMessage(null);
 
     try {
-      const review = await fetchChangeSetReview(runId);
+      const review = await fetchChangeSetReview(runId, t);
       setChangeSet(review.changeSet);
       setPreview(review.preview);
       setSelectedFileId("all");
     } catch (error) {
       setErrorMessage(
-        error instanceof Error ? error.message : "无法加载本次 Agent 改动。",
+        error instanceof Error ? error.message : t("changeSet.loadFailed"),
       );
     } finally {
       setLoading(false);
     }
-  }, [runId]);
+  }, [runId, t]);
 
   useEffect(() => {
     let active = true;
 
     // 弹窗由父组件按 runId 独立挂载，因此初始状态天然属于当前 Run。
     // 请求完成前如果用户关闭弹窗，active 会阻止已卸载实例继续写入状态。
-    void fetchChangeSetReview(runId)
+    void fetchChangeSetReview(runId, t)
       .then((review) => {
         if (!active) {
           return;
@@ -125,7 +126,7 @@ export function ChangeSetDialog({
           return;
         }
         setErrorMessage(
-          error instanceof Error ? error.message : "无法加载本次 Agent 改动。",
+          error instanceof Error ? error.message : t("changeSet.loadFailed"),
         );
         setLoading(false);
       });
@@ -133,7 +134,7 @@ export function ChangeSetDialog({
     return () => {
       active = false;
     };
-  }, [runId]);
+  }, [runId, t]);
 
   const selectedFiles = useMemo(() => {
     if (!changeSet) {
@@ -175,14 +176,14 @@ export function ChangeSetDialog({
           await loadReview();
         }
 
-        throw new Error(readApiError(body, "恢复失败，请重新检查影响范围。"));
+        throw new Error(readApiError(body, t("changeSet.restoreFailed")));
       }
 
       await onRestoreComplete(body.result.revision);
       onOpenChange(false);
     } catch (error) {
       setErrorMessage(
-        error instanceof Error ? error.message : "恢复失败，请稍后重试。",
+        error instanceof Error ? error.message : t("changeSet.restoreRetry"),
       );
     } finally {
       setRestoring(false);
@@ -200,19 +201,17 @@ export function ChangeSetDialog({
           <div>
             <span className="change-set-eyebrow">
               <History />
-              Agent history
+              {t("changeSet.eyebrow")}
             </span>
-            <DialogTitle>审查并恢复本次改动</DialogTitle>
+            <DialogTitle>{t("changeSet.title")}</DialogTitle>
           </div>
-          <DialogDescription>
-            查看 Agent 在起点与验证成功 revision 之间产生的完整文件差异。
-          </DialogDescription>
+          <DialogDescription>{t("changeSet.description")}</DialogDescription>
         </DialogHeader>
 
         {loading ? (
           <div className="change-set-state">
             <LoaderCircle className="animate-spin" />
-            <span>正在读取 ChangeSet 与当前 Repository...</span>
+            <span>{t("changeSet.loading")}</span>
           </div>
         ) : changeSet && preview ? (
           <div className="change-set-layout">
@@ -234,7 +233,7 @@ export function ChangeSetDialog({
                   type="button"
                 >
                   <Files />
-                  <span>全部文件</span>
+                  <span>{t("changeSet.allFiles")}</span>
                   <small>{changeSet.files.length}</small>
                 </button>
                 {changeSet.files.map((file) => (
@@ -248,7 +247,7 @@ export function ChangeSetDialog({
                     type="button"
                   >
                     <FileDiff />
-                    <span>{getDisplayPath(file)}</span>
+                    <span>{getDisplayPath(file, t)}</span>
                     <OperationBadge operation={file.operation} />
                   </button>
                 ))}
@@ -257,12 +256,12 @@ export function ChangeSetDialog({
               <section className="change-set-drafts">
                 <header>
                   <FilePenLine />
-                  <strong>未保存草稿</strong>
+                  <strong>{t("changeSet.unsavedDrafts")}</strong>
                   <small>{dirtyPaths.length}</small>
                 </header>
                 {dirtyPaths.length ? (
                   <>
-                    <p>草稿只保留在编辑器中，恢复 Repository 不会覆盖它们。</p>
+                    <p>{t("changeSet.draftHint")}</p>
                     <ul>
                       {dirtyPaths.map((path) => (
                         <li key={path}>{path}</li>
@@ -270,7 +269,7 @@ export function ChangeSetDialog({
                     </ul>
                   </>
                 ) : (
-                  <p>当前没有未保存的编辑器草稿。</p>
+                  <p>{t("changeSet.noDrafts")}</p>
                 )}
               </section>
             </aside>
@@ -284,7 +283,7 @@ export function ChangeSetDialog({
                 ) : (
                   <div className="change-set-empty">
                     <Check />
-                    本次运行没有产生文件改动。
+                    {t("changeSet.noChanges")}
                   </div>
                 )}
               </div>
@@ -295,13 +294,13 @@ export function ChangeSetDialog({
         ) : (
           <div className="change-set-state is-error">
             <TriangleAlert />
-            <span>{errorMessage ?? "该 Run 暂无可审查的 ChangeSet。"}</span>
+            <span>{errorMessage ?? t("changeSet.noChangeSet")}</span>
             <Button
               onClick={() => void loadReview()}
               size="sm"
               variant="outline"
             >
-              重试
+              {t("changeSet.retry")}
             </Button>
           </div>
         )}
@@ -323,10 +322,12 @@ export function ChangeSetDialog({
             {preview?.canRestore ? <Check /> : <ShieldAlert />}
             <span>
               {preview?.canRestore
-                ? `将基于当前 r${preview.currentRevision} 创建一个新的恢复 revision`
+                ? t("changeSet.restoreBasedOn", {
+                    revision: preview.currentRevision,
+                  })
                 : preview
-                  ? "检测到后续 Repository 修改，恢复已锁定"
-                  : "加载预检后才可恢复"}
+                  ? t("changeSet.restoreLocked")
+                  : t("changeSet.restorePending")}
             </span>
           </div>
           <Button
@@ -339,7 +340,7 @@ export function ChangeSetDialog({
             ) : (
               <RotateCcw data-icon="inline-start" />
             )}
-            {restoring ? "正在恢复..." : "恢复 Agent 改动"}
+            {restoring ? t("changeSet.restoring") : t("changeSet.restore")}
           </Button>
         </DialogFooter>
       </DialogContent>
@@ -354,6 +355,7 @@ function ChangeDiff({
   file: ProjectChangeSetFile;
   theme: MonacoTheme;
 }) {
+  const { t } = useUiI18n();
   const path = file.pathAfter ?? file.pathBefore ?? "untitled";
   const lineCount = Math.max(
     countLines(file.beforeContent),
@@ -366,9 +368,9 @@ function ChangeDiff({
       <header>
         <div>
           <OperationBadge operation={file.operation} />
-          <strong>{getDisplayPath(file)}</strong>
+          <strong>{getDisplayPath(file, t)}</strong>
         </div>
-        <small>{formatHashTransition(file)}</small>
+        <small>{formatHashTransition(file, t)}</small>
       </header>
       <div className="change-set-diff-editor" style={{ height }}>
         <MonacoDiffEditor
@@ -412,6 +414,17 @@ function ChangeDiff({
   );
 }
 
+function DiffEditorLoading() {
+  const { t } = useUiI18n();
+
+  return (
+    <div className="change-set-diff-loading">
+      <LoaderCircle className="animate-spin" />
+      {t("changeSet.loadEditor")}
+    </div>
+  );
+}
+
 function useMonacoTheme(): MonacoTheme {
   const [theme, setTheme] = useState<MonacoTheme>("light");
 
@@ -444,26 +457,33 @@ function RestorePreview({
   preview: ProjectRestorePreview;
   conflictPaths: ReadonlySet<string>;
 }) {
+  const { t } = useUiI18n();
+
   return (
     <section className="restore-preview">
       <header>
         <div>
-          <strong>恢复预检</strong>
-          <span>当前 Repository r{preview.currentRevision}</span>
+          <strong>{t("changeSet.restorePreview")}</strong>
+          <span>
+            {t("changeSet.currentRepository", {
+              revision: preview.currentRevision,
+            })}
+          </span>
         </div>
         <Badge variant={preview.canRestore ? "outline" : "destructive"}>
           {preview.canRestore
-            ? `${countEffectiveImpacts(preview.impacts)} 个路径将变化`
-            : `${preview.conflicts.length} 个冲突`}
+            ? t("changeSet.pathsWillChange", {
+                count: countEffectiveImpacts(preview.impacts),
+              })
+            : t("changeSet.conflicts", {
+                count: preview.conflicts.length,
+              })}
         </Badge>
       </header>
 
       {preview.conflicts.length ? (
         <div className="restore-conflicts">
-          <p>
-            这些路径在 Agent 完成后又发生过
-            mutation。整笔恢复已拒绝，不会部分覆盖。
-          </p>
+          <p>{t("changeSet.conflictDescription")}</p>
           {preview.conflicts.map((conflict) => (
             <RestoreConflictRow conflict={conflict} key={conflict.path} />
           ))}
@@ -480,11 +500,11 @@ function RestorePreview({
             key={impact.path}
           >
             <span>{impact.path}</span>
-            <small>{getImpactLabel(impact)}</small>
+            <small>{getImpactLabel(impact, t)}</small>
           </div>
         ))}
         {!preview.impacts.length ? (
-          <p className="change-set-empty">没有需要恢复的文件。</p>
+          <p className="change-set-empty">{t("changeSet.noRestoreFiles")}</p>
         ) : null}
       </div>
     </section>
@@ -496,10 +516,11 @@ function RestoreConflictRow({
 }: {
   conflict: ProjectRestoreConflict;
 }) {
+  const { t } = useUiI18n();
   const labels: Record<ProjectRestoreConflict["reason"], string> = {
-    modified: "内容已修改",
-    created: "路径已被创建",
-    deleted: "路径已被删除",
+    modified: t("changeSet.conflictModified"),
+    created: t("changeSet.conflictCreated"),
+    deleted: t("changeSet.conflictDeleted"),
   };
 
   return (
@@ -512,14 +533,15 @@ function RestoreConflictRow({
 }
 
 function OperationBadge({ operation }: { operation: ProjectChangeOperation }) {
+  const { t } = useUiI18n();
   const copy: Record<
     ProjectChangeOperation,
     { label: string; className: string }
   > = {
-    create: { label: "新增", className: "is-create" },
-    update: { label: "修改", className: "is-update" },
-    delete: { label: "删除", className: "is-delete" },
-    rename: { label: "重命名", className: "is-rename" },
+    create: { label: t("changeSet.operationCreate"), className: "is-create" },
+    update: { label: t("changeSet.operationUpdate"), className: "is-update" },
+    delete: { label: t("changeSet.operationDelete"), className: "is-delete" },
+    rename: { label: t("changeSet.operationRename"), className: "is-rename" },
   };
 
   return (
@@ -532,7 +554,10 @@ function OperationBadge({ operation }: { operation: ProjectChangeOperation }) {
   );
 }
 
-function getDisplayPath(file: ProjectChangeSetFile): string {
+function getDisplayPath(
+  file: ProjectChangeSetFile,
+  translate: Translate,
+): string {
   if (
     file.operation === "rename" &&
     file.pathBefore &&
@@ -542,15 +567,23 @@ function getDisplayPath(file: ProjectChangeSetFile): string {
     return `${file.pathBefore} → ${file.pathAfter}`;
   }
 
-  return file.pathAfter ?? file.pathBefore ?? "未知路径";
+  return (
+    file.pathAfter ?? file.pathBefore ?? translate("changeSet.unknownPath")
+  );
 }
 
-function formatHashTransition(file: ProjectChangeSetFile): string {
-  return `${shortHash(file.beforeHash)} → ${shortHash(file.afterHash)}`;
+function formatHashTransition(
+  file: ProjectChangeSetFile,
+  translate: Translate,
+): string {
+  return `${shortHash(file.beforeHash, translate)} → ${shortHash(
+    file.afterHash,
+    translate,
+  )}`;
 }
 
-function shortHash(hash: string | null): string {
-  return hash ? hash.slice(0, 8) : "empty";
+function shortHash(hash: string | null, translate: Translate): string {
+  return hash ? hash.slice(0, 8) : translate("changeSet.emptyHash");
 }
 
 function countLines(content: string | null): number {
@@ -563,11 +596,16 @@ function countEffectiveImpacts(
   return impacts.filter((impact) => impact.action !== "none").length;
 }
 
-function getImpactLabel(impact: ProjectRestoreImpact): string {
+function getImpactLabel(
+  impact: ProjectRestoreImpact,
+  translate: Translate,
+): string {
   if (impact.action === "none") {
-    return "已是目标状态";
+    return translate("changeSet.impactNone");
   }
-  return impact.action === "write" ? "写回起点内容" : "删除 Agent 新增内容";
+  return impact.action === "write"
+    ? translate("changeSet.impactWrite")
+    : translate("changeSet.impactDelete");
 }
 
 function readApiError(
@@ -585,6 +623,7 @@ function readApiError(
 
 async function fetchChangeSetReview(
   runId: string,
+  translate: Translate,
 ): Promise<{ changeSet: ProjectChangeSet; preview: ProjectRestorePreview }> {
   // 两个查询互不依赖：ChangeSet 负责展示历史正文，preview 负责读取
   // 当前 Repository 状态。并行请求可以避免弹窗先后闪烁两次。
@@ -600,10 +639,14 @@ async function fetchChangeSetReview(
     RestorePreviewResponse | ApiErrorResponse;
 
   if (!changeSetResponse.ok || !("changeSet" in changeSetBody)) {
-    throw new Error(readApiError(changeSetBody, "无法读取 Agent 改动。"));
+    throw new Error(
+      readApiError(changeSetBody, translate("changeSet.readChangesFailed")),
+    );
   }
   if (!previewResponse.ok || !("preview" in previewBody)) {
-    throw new Error(readApiError(previewBody, "无法计算恢复影响。"));
+    throw new Error(
+      readApiError(previewBody, translate("changeSet.computeRestoreFailed")),
+    );
   }
 
   return {

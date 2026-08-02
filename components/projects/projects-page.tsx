@@ -14,6 +14,8 @@ import {
 import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { Button } from "@/components/ui/button";
+import { getLocalizedErrorMessage } from "@/infrastructure/i18n/error-messages";
+import { useUiI18n } from "@/infrastructure/i18n/ui";
 import {
   Dialog,
   DialogClose,
@@ -31,11 +33,12 @@ type ProjectListResponse = {
 
 type ApiErrorResponse = {
   error?: {
+    code?: string;
     message?: string;
   };
 };
 
-async function fetchProjects(): Promise<ProjectSummary[]> {
+async function fetchProjects(locale: "zh" | "en"): Promise<ProjectSummary[]> {
   const response = await fetch("/api/projects?includeDeleted=true", {
     cache: "no-store",
   });
@@ -43,13 +46,14 @@ async function fetchProjects(): Promise<ProjectSummary[]> {
     ProjectListResponse | ApiErrorResponse;
 
   if (!response.ok || !("projects" in body)) {
-    throw new Error(readApiMessage(body, "项目列表加载失败。"));
+    throw new Error(readApiMessage(body, locale, "projects.loadFailed"));
   }
 
   return body.projects;
 }
 
 export function ProjectsPage() {
+  const { locale, t } = useUiI18n();
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -64,22 +68,22 @@ export function ProjectsPage() {
 
     try {
       // 请求包含软删除数据，首页才能在刷新后继续提供恢复入口。
-      setProjects(await fetchProjects());
+      setProjects(await fetchProjects(locale));
     } catch (loadError) {
       setError(
-        loadError instanceof Error ? loadError.message : "项目列表加载失败。",
+        loadError instanceof Error ? loadError.message : t("projects.loadFailed"),
       );
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [locale, t]);
 
   useEffect(() => {
     let cancelled = false;
 
     // 首屏 effect 只等待外部请求结果，不在 effect 主体同步切换 state，
     // 这样 React 不会为了 loading 状态再触发一轮级联渲染。
-    void fetchProjects()
+    void fetchProjects(locale)
       .then((loadedProjects) => {
         if (!cancelled) {
           setProjects(loadedProjects);
@@ -90,7 +94,7 @@ export function ProjectsPage() {
           setError(
             loadError instanceof Error
               ? loadError.message
-              : "项目列表加载失败。",
+              : t("projects.loadFailed"),
           );
         }
       })
@@ -103,7 +107,7 @@ export function ProjectsPage() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [locale, t]);
 
   const activeProjects = useMemo(
     () => projects.filter((project) => project.deletedAt === null),
@@ -131,7 +135,10 @@ export function ProjectsPage() {
         throw new Error(
           readApiMessage(
             body,
-            action === "delete" ? "删除项目失败。" : "恢复项目失败。",
+            locale,
+            action === "delete"
+              ? "projects.operationFailed"
+              : "projects.restoreFailed",
           ),
         );
       }
@@ -142,7 +149,7 @@ export function ProjectsPage() {
       setError(
         mutationError instanceof Error
           ? mutationError.message
-          : "项目操作失败。",
+          : t("projects.operationFailed"),
       );
     } finally {
       setPendingProjectId(null);
@@ -154,44 +161,46 @@ export function ProjectsPage() {
       <section className="projects-main">
         <div className="projects-hero">
           <div>
-            <div className="eyebrow">Your workspace</div>
+            <div className="eyebrow">{t("projects.eyebrow")}</div>
             <h1 className="font-editorial projects-title">
-              Make something
-              <br />
-              worth keeping.
+              {t("projects.title")
+                .split("\n")
+                .map((line) => (
+                  <span key={line}>
+                    {line}
+                    <br />
+                  </span>
+                ))}
             </h1>
-            <p className="projects-lede">
-              从一个想法开始，WebPilot
-              会修改代码、运行项目、验证交互，并留下每一次变化的证据。
-            </p>
+            <p className="projects-lede">{t("projects.lede")}</p>
           </div>
           <Button asChild size="lg">
             <Link href="/new">
               <Plus data-icon="inline-start" />
-              New project
+              {t("projects.newProject")}
             </Link>
           </Button>
         </div>
 
         <div className="start-composer panel">
           <textarea
-            aria-label="描述你想构建的项目"
+            aria-label={t("projects.composerLabel")}
             className="composer-input"
-            defaultValue="Describe what you want to build…"
+            placeholder={t("projects.composerPlaceholder")}
           />
           <div className="composer-actions">
             <div className="composer-left">
               <Button disabled size="sm" variant="outline">
                 <Plus data-icon="inline-start" />
-                Image
+                {t("projects.image")}
               </Button>
               <Button disabled size="sm" variant="outline">
-                React + TypeScript
+                {t("projects.stack")}
               </Button>
             </div>
             <Button asChild className="app-button-accent" size="sm">
               <Link href="/new">
-                Start building
+                {t("projects.startBuilding")}
                 <Send data-icon="inline-end" />
               </Link>
             </Button>
@@ -199,18 +208,15 @@ export function ProjectsPage() {
         </div>
 
         <div className="section-heading">
-          <h2>Recent projects</h2>
-          <span>
-            {activeProjects.length}{" "}
-            {activeProjects.length === 1 ? "project" : "projects"}
-          </span>
+          <h2>{t("projects.recent")}</h2>
+          <span>{t("projects.projectCount", { count: activeProjects.length })}</span>
         </div>
 
         {error ? (
           <div className="project-state project-state-error" role="alert">
             <AlertCircle />
             <div>
-              <b>Workspace unavailable</b>
+              <b>{t("projects.workspaceUnavailable")}</b>
               <span>{error}</span>
             </div>
             <Button
@@ -219,7 +225,7 @@ export function ProjectsPage() {
               variant="outline"
             >
               <RotateCcw data-icon="inline-start" />
-              Retry
+              {t("common.retry")}
             </Button>
           </div>
         ) : null}
@@ -228,8 +234,8 @@ export function ProjectsPage() {
           <div className="project-state" aria-live="polite">
             <LoaderCircle className="project-state-spinner" />
             <div>
-              <b>Loading workspace</b>
-              <span>正在恢复当前匿名会话中的项目。</span>
+              <b>{t("projects.loadingWorkspace")}</b>
+              <span>{t("projects.restoringSession")}</span>
             </div>
           </div>
         ) : activeProjects.length > 0 ? (
@@ -248,12 +254,12 @@ export function ProjectsPage() {
             <span className="project-empty-icon">
               <Database />
             </span>
-            <h3 className="font-editorial">A clean workspace.</h3>
-            <p>创建第一个数据库项目，代码会在刷新后继续保留。</p>
+            <h3 className="font-editorial">{t("projects.emptyTitle")}</h3>
+            <p>{t("projects.emptyDescription")}</p>
             <Button asChild size="sm">
               <Link href="/new">
                 <Plus data-icon="inline-start" />
-                Create project
+                {t("projects.createProject")}
               </Link>
             </Button>
           </div>
@@ -261,20 +267,20 @@ export function ProjectsPage() {
       </section>
 
       <aside className="projects-aside">
-        <div className="eyebrow">Workspace status</div>
-        <h2 className="font-editorial aside-title">Stored with context</h2>
+        <div className="eyebrow">{t("projects.status")}</div>
+        <h2 className="font-editorial aside-title">{t("projects.statusTitle")}</h2>
         <div className="workspace-facts">
           <WorkspaceFact
-            label="Active projects"
+            label={t("projects.active")}
             value={loading ? "..." : String(activeProjects.length)}
           />
-          <WorkspaceFact label="Storage" value="PostgreSQL" />
-          <WorkspaceFact label="Session" value="Anonymous" />
+          <WorkspaceFact label={t("projects.storage")} value="PostgreSQL" />
+          <WorkspaceFact label={t("projects.session")} value={t("projects.anonymous")} />
         </div>
 
         <div className="deleted-projects">
           <div className="section-heading">
-            <h3>Recently deleted</h3>
+            <h3>{t("projects.recentlyDeleted")}</h3>
             <span>{deletedProjects.length}</span>
           </div>
           {deletedProjects.length > 0 ? (
@@ -282,10 +288,10 @@ export function ProjectsPage() {
               <div className="deleted-project-row" key={project.id}>
                 <div>
                   <b>{project.name}</b>
-                  <span>{formatRelativeTime(project.updatedAt)}</span>
+                  <span>{formatRelativeTime(project.updatedAt, locale)}</span>
                 </div>
                 <Button
-                  aria-label={`恢复 ${project.name}`}
+                  aria-label={t("projects.restore", { name: project.name })}
                   disabled={pendingProjectId === project.id}
                   onClick={() => void mutateProject(project, "restore")}
                   size="icon-sm"
@@ -300,7 +306,7 @@ export function ProjectsPage() {
               </div>
             ))
           ) : (
-            <p className="deleted-projects-empty">没有可恢复的项目。</p>
+            <p className="deleted-projects-empty">{t("projects.noRecoverable")}</p>
           )}
         </div>
       </aside>
@@ -315,15 +321,17 @@ export function ProjectsPage() {
       >
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>删除项目？</DialogTitle>
+            <DialogTitle>{t("projects.deleteTitle")}</DialogTitle>
             <DialogDescription>
-              {projectToDelete?.name} 将从项目列表移除，但仍可从右侧恢复。
+              {projectToDelete
+                ? t("projects.deleteDescription", { name: projectToDelete.name })
+                : null}
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
             <DialogClose asChild>
               <Button disabled={pendingProjectId !== null} variant="outline">
-                Cancel
+                {t("common.cancel")}
               </Button>
             </DialogClose>
             <Button
@@ -340,7 +348,7 @@ export function ProjectsPage() {
               ) : (
                 <Trash2 data-icon="inline-start" />
               )}
-              Delete
+              {t("projects.delete")}
             </Button>
           </DialogFooter>
         </DialogContent>
@@ -358,6 +366,7 @@ function ProjectRow({
   onDelete: () => void;
   project: ProjectSummary;
 }) {
+  const { locale, t } = useUiI18n();
   const thumbClass = ["finance", "notes", "store"][index % 3];
 
   return (
@@ -371,14 +380,14 @@ function ProjectRow({
         <span className="project-name">
           <b>{project.name}</b>
           <span>
-            Revision {project.revision} · {formatProjectStatus(project.status)}
+            Revision {project.revision} · {formatProjectStatus(project.status, t)}
           </span>
         </span>
         <span className="storage-badge">
-          {formatStorageKind(project.storageKind)}
+          {formatStorageKind(project.storageKind, t)}
         </span>
         <span className="project-meta">
-          {formatRelativeTime(project.updatedAt)}
+          {formatRelativeTime(project.updatedAt, locale)}
         </span>
         <ArrowUpRight className="project-arrow" />
       </Link>
@@ -404,38 +413,61 @@ function WorkspaceFact({ label, value }: { label: string; value: string }) {
   );
 }
 
-function readApiMessage(body: unknown, fallback: string): string {
+function readApiMessage(
+  body: unknown,
+  locale: "zh" | "en",
+  fallbackKey:
+    | "projects.loadFailed"
+    | "projects.operationFailed"
+    | "projects.restoreFailed",
+): string {
   if (
     typeof body === "object" &&
     body !== null &&
     "error" in body &&
     typeof body.error === "object" &&
     body.error !== null &&
-    "message" in body.error &&
-    typeof body.error.message === "string"
+    "code" in body.error &&
+    typeof body.error.code === "string"
   ) {
-    return body.error.message;
+    return getLocalizedErrorMessage(body.error.code, locale);
   }
 
-  return fallback;
+  if (fallbackKey === "projects.loadFailed") {
+    return locale === "zh"
+      ? "项目列表加载失败。"
+      : "Project list failed to load.";
+  }
+  if (fallbackKey === "projects.restoreFailed") {
+    return locale === "zh" ? "恢复项目失败。" : "Project restore failed.";
+  }
+  return locale === "zh" ? "项目操作失败。" : "Project operation failed.";
 }
 
-function formatStorageKind(storageKind: ProjectSummary["storageKind"]) {
-  return storageKind === "database" ? "Database" : "Browser Git";
+function formatStorageKind(
+  storageKind: ProjectSummary["storageKind"],
+  t: (key: string, values?: Record<string, string | number>) => string,
+) {
+  return storageKind === "database"
+    ? t("projects.database")
+    : t("projects.browserGit");
 }
 
-function formatProjectStatus(status: ProjectSummary["status"]) {
+function formatProjectStatus(
+  status: ProjectSummary["status"],
+  t: (key: string, values?: Record<string, string | number>) => string,
+) {
   const labels: Record<ProjectSummary["status"], string> = {
-    creating: "Creating",
-    ready: "Ready",
-    unavailable: "Local data missing",
-    error: "Needs attention",
+    creating: t("projects.statusCreating"),
+    ready: t("projects.statusReady"),
+    unavailable: t("projects.statusUnavailable"),
+    error: t("projects.statusError"),
   };
 
-  return labels[status];
+  return labels[status] ?? t("projects.statusError");
 }
 
-function formatRelativeTime(value: string): string {
+function formatRelativeTime(value: string, locale: "zh" | "en"): string {
   const timestamp = new Date(value).getTime();
   const elapsedSeconds = Math.max(
     0,
@@ -443,22 +475,22 @@ function formatRelativeTime(value: string): string {
   );
 
   if (elapsedSeconds < 60) {
-    return "Just now";
+    return locale === "zh" ? "刚刚" : "Just now";
   }
 
   const elapsedMinutes = Math.floor(elapsedSeconds / 60);
 
   if (elapsedMinutes < 60) {
-    return `${elapsedMinutes}m ago`;
+    return locale === "zh" ? `${elapsedMinutes} 分钟前` : `${elapsedMinutes}m ago`;
   }
 
   const elapsedHours = Math.floor(elapsedMinutes / 60);
 
   if (elapsedHours < 24) {
-    return `${elapsedHours}h ago`;
+    return locale === "zh" ? `${elapsedHours} 小时前` : `${elapsedHours}h ago`;
   }
 
-  return new Intl.DateTimeFormat("zh-CN", {
+  return new Intl.DateTimeFormat(locale === "zh" ? "zh-CN" : "en-US", {
     month: "short",
     day: "numeric",
   }).format(new Date(value));

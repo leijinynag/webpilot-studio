@@ -190,7 +190,7 @@ describe("AgentPanel", () => {
 
     expect(await screen.findByText("执行中", { exact: true })).toBeVisible();
     expect(screen.getByRole("button", { name: "停止" })).toBeVisible();
-    expect(MockEventSource.instances).toHaveLength(1);
+    await waitFor(() => expect(MockEventSource.instances).toHaveLength(1));
     expect(String(MockEventSource.instances[0]?.url)).toContain("?cursor=12");
 
     await act(async () => {
@@ -296,7 +296,7 @@ describe("AgentPanel", () => {
     );
 
     expect(await screen.findByText("正在请求模型规划下一步")).toBeVisible();
-    expect(screen.getByText(/1\/12 turns/)).toBeVisible();
+    expect(screen.getByText(/1\/12 轮次/)).toBeVisible();
 
     await act(async () => {
       MockEventSource.instances[0]?.emit(
@@ -538,7 +538,7 @@ describe("AgentPanel", () => {
     expect(screen.getByTestId("optimistic-user-message")).toHaveTextContent(
       "从空项目创建一个计数器",
     );
-    expect(screen.getByText("You · 发送中")).toBeVisible();
+    expect(screen.getByText("你 · 发送中")).toBeVisible();
     expect(composer).toHaveValue("");
     expect(fetchMock).toHaveBeenCalledTimes(2);
 
@@ -553,7 +553,7 @@ describe("AgentPanel", () => {
       );
     });
 
-    expect(await screen.findByText("You · 已排队")).toBeVisible();
+    expect(await screen.findByText("你 · 已排队")).toBeVisible();
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
   });
 

@@ -29,17 +29,17 @@ import {
   type BrowserGitMigrationStage,
 } from "@/domains/project/browser-git-migration-client";
 import type { ProjectDescription } from "@/domains/project/types";
+import { useUiI18n } from "@/infrastructure/i18n/ui";
 import { cn } from "@/lib/utils";
 
 const MIGRATION_STEPS: {
   stage: BrowserGitMigrationStage;
-  label: string;
 }[] = [
-  { stage: "preparing", label: "冻结 Database revision 并导出源码" },
-  { stage: "creating_candidate", label: "创建本地 candidate 与 initial commit" },
-  { stage: "validating_candidate", label: "校验文件清单、HEAD 与 clean 状态" },
-  { stage: "promoting", label: "复制为当前项目的正式 Browser Git 仓库" },
-  { stage: "finalizing", label: "原子切换项目存储类型" },
+  { stage: "preparing" },
+  { stage: "creating_candidate" },
+  { stage: "validating_candidate" },
+  { stage: "promoting" },
+  { stage: "finalizing" },
 ];
 
 type DialogStatus = "idle" | "running" | "success" | "error";
@@ -54,6 +54,7 @@ export function BrowserGitMigrationDialog({
   controller?: BrowserGitMigrationController;
 }) {
   const router = useRouter();
+  const { t } = useUiI18n();
   const controllerRef = useRef(
     controller ?? createBrowserGitMigrationController(),
   );
@@ -101,7 +102,7 @@ export function BrowserGitMigrationDialog({
       setErrorMessage(
         error instanceof Error
           ? error.message
-          : "迁移失败，Database Repository 仍保持可用。",
+          : t("workbench.browserGitMigration.failed"),
       );
     }
   }
@@ -133,7 +134,7 @@ export function BrowserGitMigrationDialog({
         variant="outline"
       >
         <GitBranch data-icon="inline-start" />
-        Migrate
+        {t("workbench.browserGitMigration.open")}
       </Button>
 
       <Dialog onOpenChange={handleOpenChange} open={open}>
@@ -148,36 +149,40 @@ export function BrowserGitMigrationDialog({
                 <span />
                 <GitBranch />
               </div>
-              <Badge variant="outline">Database to Browser Git</Badge>
+              <Badge variant="outline">
+                {t("workbench.browserGitMigration.badge")}
+              </Badge>
             </div>
-            <DialogTitle>迁移到 Browser Git</DialogTitle>
+            <DialogTitle>
+              {t("workbench.browserGitMigration.title")}
+            </DialogTitle>
             <DialogDescription>
-              源码将从服务端 Database 复制到当前浏览器的 IndexedDB，并创建可
-              stage、commit 和查看历史的本地 Git 仓库。
+              {t("workbench.browserGitMigration.description")}
             </DialogDescription>
           </DialogHeader>
 
           <section
-            aria-label="Browser Git 本地存储风险"
+            aria-label={t("workbench.browserGitMigration.riskLabel")}
             className="browser-git-migration-risk"
           >
             <AlertTriangle />
             <div>
-              <b>迁移后源码只保存在这个浏览器</b>
-              <p>
-                清理站点数据或更换设备会丢失本地仓库。迁移不会自动配置 remote，
-                也不会执行 push、pull 或 fetch。
-              </p>
+              <b>{t("workbench.browserGitMigration.riskTitle")}</b>
+              <p>{t("workbench.browserGitMigration.riskDescription")}</p>
             </div>
           </section>
 
           {hasDirtyDrafts ? (
             <section
-              aria-label="未保存草稿阻止迁移"
+              aria-label={t("workbench.browserGitMigration.draftsLabel")}
               className="browser-git-migration-drafts"
             >
-              <b>{dirtyPaths.length} 个 Monaco 草稿尚未保存</b>
-              <p>请先保存或放弃这些草稿，再开始迁移。</p>
+              <b>
+                {t("workbench.browserGitMigration.draftsTitle", {
+                  count: dirtyPaths.length,
+                })}
+              </b>
+              <p>{t("workbench.browserGitMigration.draftsDescription")}</p>
               <ul>
                 {dirtyPaths.slice(0, 4).map((path) => (
                   <li key={path}>{path}</li>
@@ -214,7 +219,9 @@ export function BrowserGitMigrationDialog({
                     ) : (
                       <CircleDashed />
                     )}
-                    <span>{item.label}</span>
+                    <span>
+                      {t(`workbench.browserGitMigration.steps.${item.stage}`)}
+                    </span>
                   </li>
                 );
               })}
@@ -224,7 +231,9 @@ export function BrowserGitMigrationDialog({
           {errorMessage ? (
             <div className="browser-git-migration-result is-error" role="alert">
               <b>
-                {recoveryRequired ? "需要确认迁移状态" : "迁移未完成"}
+                {recoveryRequired
+                  ? t("workbench.browserGitMigration.recoveryTitle")
+                  : t("workbench.browserGitMigration.errorTitle")}
               </b>
               <p>{errorMessage}</p>
             </div>
@@ -237,8 +246,8 @@ export function BrowserGitMigrationDialog({
             >
               <Check />
               <div>
-                <b>迁移完成</b>
-                <p>工作台正在切换到当前浏览器中的 Browser Git 仓库。</p>
+                <b>{t("workbench.browserGitMigration.successTitle")}</b>
+                <p>{t("workbench.browserGitMigration.successDescription")}</p>
               </div>
             </div>
           ) : null}
@@ -250,7 +259,9 @@ export function BrowserGitMigrationDialog({
               type="button"
               variant="outline"
             >
-              {status === "success" ? "完成" : "取消"}
+              {status === "success"
+                ? t("workbench.browserGitMigration.done")
+                : t("common.cancel")}
             </Button>
             {status !== "success" ? (
               <Button
@@ -265,13 +276,13 @@ export function BrowserGitMigrationDialog({
                 )}
                 {pending
                   ? stage === "recovering"
-                    ? "正在确认状态"
-                    : "正在迁移"
+                    ? t("workbench.browserGitMigration.confirming")
+                    : t("workbench.browserGitMigration.migrating")
                   : recoveryRequired
-                    ? "重试确认"
+                    ? t("workbench.browserGitMigration.retryConfirm")
                     : status === "error"
-                      ? "重新迁移"
-                      : "开始迁移"}
+                      ? t("workbench.browserGitMigration.retry")
+                      : t("workbench.browserGitMigration.start")}
               </Button>
             ) : null}
           </DialogFooter>

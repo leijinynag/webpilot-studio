@@ -3998,6 +3998,34 @@ html[data-theme="dark"] .piece-art.travel {
   scrollbar-width: thin;
 }
 
+.file-tree-empty {
+  display: grid;
+  justify-items: center;
+  gap: 8px;
+  min-height: 180px;
+  padding: 36px 18px;
+  color: var(--muted-foreground);
+  text-align: center;
+}
+
+.file-tree-empty svg {
+  width: 20px;
+  height: 20px;
+  color: var(--accent);
+}
+
+.file-tree-empty strong {
+  color: var(--foreground);
+  font-size: 0.78rem;
+  font-weight: 650;
+}
+
+.file-tree-empty span {
+  max-width: 180px;
+  font-size: 0.68rem;
+  line-height: 1.55;
+}
+
 .file-tree-row {
   display: flex;
   align-items: center;

@@ -9,6 +9,7 @@ import {
   File,
   FileCode2,
   FileJson,
+  FilePlus2,
   FileText,
   Folder,
   FolderOpen,
@@ -32,6 +33,7 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import type { WorkspaceFile } from "@/domains/project/workspace";
+import { useUiI18n } from "@/infrastructure/i18n/ui";
 import { cn } from "@/lib/utils";
 
 type TreeDirectory = {
@@ -65,6 +67,7 @@ export function FileTree({
 }) {
   const tree = useMemo(() => buildFileTree(Object.values(files)), [files]);
   const [collapsed, setCollapsed] = useState<Set<string>>(() => new Set());
+  const { t } = useUiI18n();
 
   function toggleDirectory(path: string) {
     setCollapsed((current) => {
@@ -81,20 +84,33 @@ export function FileTree({
   }
 
   return (
-    <div aria-label="项目文件" className="file-tree" role="tree">
-      {tree.map((node) => (
-        <FileTreeNode
-          activePath={activePath}
-          collapsed={collapsed}
-          depth={0}
-          key={node.path}
-          node={node}
-          onDelete={onDelete}
-          onOpen={onOpen}
-          onRename={onRename}
-          onToggle={toggleDirectory}
-        />
-      ))}
+    <div
+      aria-label={t("workbench.projectFiles")}
+      className="file-tree"
+      role="tree"
+    >
+      {tree.length > 0 ? (
+        tree.map((node) => (
+          <FileTreeNode
+            activePath={activePath}
+            collapsed={collapsed}
+            depth={0}
+            key={node.path}
+            node={node}
+            onDelete={onDelete}
+            onOpen={onOpen}
+            onRename={onRename}
+            onToggle={toggleDirectory}
+          />
+        ))
+      ) : (
+        // 空 Repository 需要明确反馈，但这里不能偷偷创建示例文件或触发运行环境准备。
+        <div className="file-tree-empty" role="status">
+          <FilePlus2 aria-hidden="true" />
+          <strong>{t("workbench.emptyFiles")}</strong>
+          <span>{t("workbench.emptyFilesHint")}</span>
+        </div>
+      )}
     </div>
   );
 }
@@ -118,6 +134,7 @@ function FileTreeNode({
   onRename: (path: string) => void;
   onToggle: (path: string) => void;
 }) {
+  const { t } = useUiI18n();
   const paddingLeft = 10 + depth * 14;
 
   if (node.type === "directory") {
@@ -174,7 +191,7 @@ function FileTreeNode({
         {getFileIcon(node.path)}
         <span>{node.name}</span>
         {node.file.dirty ? (
-          <span aria-label="未保存" className="dirty-dot" />
+          <span aria-label={t("workbench.unsaved")} className="dirty-dot" />
         ) : null}
       </button>
       <DropdownMenu>
@@ -182,7 +199,7 @@ function FileTreeNode({
           <TooltipTrigger asChild>
             <DropdownMenuTrigger asChild>
               <Button
-                aria-label={`${node.path} 文件操作`}
+                aria-label={`${node.path} ${t("workbench.fileActions")}`}
                 className="file-tree-more"
                 size="icon-xs"
                 variant="ghost"
@@ -191,20 +208,20 @@ function FileTreeNode({
               </Button>
             </DropdownMenuTrigger>
           </TooltipTrigger>
-          <TooltipContent>文件操作</TooltipContent>
+          <TooltipContent>{t("workbench.fileActions")}</TooltipContent>
         </Tooltip>
         <DropdownMenuContent align="start">
           <DropdownMenuGroup>
             <DropdownMenuItem onSelect={() => onRename(node.path)}>
               <Pencil />
-              重命名
+              {t("workbench.renameFile")}
             </DropdownMenuItem>
             <DropdownMenuItem
               variant="destructive"
               onSelect={() => onDelete(node.path)}
             >
               <Trash2 />
-              删除
+              {t("workbench.deleteFile")}
             </DropdownMenuItem>
           </DropdownMenuGroup>
         </DropdownMenuContent>

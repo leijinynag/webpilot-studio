@@ -50,12 +50,21 @@ export class FakeWebContainer implements WebContainerAdapter {
       void options;
       this.calls.push(`readdir:${path}`);
       if (path === "dist") {
-        return [{ name: "index.html", isDirectory: () => false }];
+        return [
+          { name: "index.html", isDirectory: () => false },
+          { name: "static", isDirectory: () => true },
+        ];
+      }
+      if (path === "dist/static") {
+        return [{ name: "app.js", isDirectory: () => false }];
       }
       return [];
     },
     readFile: async (path: string): Promise<Uint8Array> => {
       this.calls.push(`read:${path}`);
+      if (path === "dist/static/app.js") {
+        return new TextEncoder().encode("console.log('built')");
+      }
       return new TextEncoder().encode("<html><body>built</body></html>");
     },
     mkdir: async (path: string) => {

@@ -34,6 +34,7 @@ import type {
   BrowserGitChangedFile,
   BrowserGitRepositoryState,
 } from "@/infrastructure/browser-git/protocol";
+import { useUiI18n } from "@/infrastructure/i18n/ui";
 import type { ProjectDescription } from "@/domains/project/types";
 
 type DiffMode = "staged" | "working";
@@ -43,6 +44,7 @@ export function SourceControlPage({
 }: {
   project: ProjectDescription;
 }) {
+  const { t } = useUiI18n();
   const isBrowserGit = project.storageKind === "browser_git";
   const repository = useMemo(
     () => (isBrowserGit ? new BrowserGitProjectRepository(project) : null),
@@ -81,12 +83,12 @@ export function SourceControlPage({
       setError(
         refreshError instanceof Error
           ? refreshError.message
-          : "Browser Git 仓库无法恢复。",
+          : t("sourceControl.repositoryRestoreFailed"),
       );
     } finally {
       setLoading(false);
     }
-  }, [repository]);
+  }, [repository, t]);
 
   useEffect(() => {
     // 延后一帧启动 IndexedDB/Worker 恢复，避免 effect 执行阶段触发级联渲染。
@@ -159,7 +161,7 @@ export function SourceControlPage({
       setError(
         actionError instanceof Error
           ? actionError.message
-          : "Source Control 操作失败。",
+          : t("sourceControl.sourceControlFailed"),
       );
     } finally {
       setPendingAction(null);
@@ -189,13 +191,12 @@ export function SourceControlPage({
     return (
       <div className="source-empty page-in">
         <GitBranch />
-        <h1 className="font-editorial">Source Control is local-first.</h1>
-        <p>
-          当前项目使用 Database Repository。Browser Git 项目才会在当前浏览器中
-          提供 stage、commit、历史和备份导出。
-        </p>
+        <h1 className="font-editorial">{t("sourceControl.localFirstTitle")}</h1>
+        <p>{t("sourceControl.databaseDescription")}</p>
         <Button asChild variant="outline">
-          <Link href={`/p/${project.id}`}>返回 Agent 工作台</Link>
+          <Link href={`/p/${project.id}`}>
+            {t("sourceControl.backToWorkbench")}
+          </Link>
         </Button>
       </div>
     );
@@ -207,19 +208,16 @@ export function SourceControlPage({
     return (
       <div className="source-empty source-unavailable page-in" role="alert">
         <AlertTriangle />
-        <h1 className="font-editorial">本地仓库不可用</h1>
+        <h1 className="font-editorial">{t("sourceControl.unavailable")}</h1>
         <p>{error}</p>
-        <p>
-          WebPilot Studio 不会自动创建空仓库覆盖原项目。若只是浏览器临时故障，
-          可以重试恢复；若站点数据已被清理，请返回项目列表处理该项目。
-        </p>
+        <p>{t("sourceControl.unavailableDescription")}</p>
         <div className="source-unavailable-actions">
           <Button onClick={() => void refresh()} variant="outline">
             <RefreshCw data-icon="inline-start" />
-            重试恢复
+            {t("sourceControl.retryRestore")}
           </Button>
           <Button asChild variant="ghost">
-            <Link href="/">返回项目列表</Link>
+            <Link href="/">{t("sourceControl.backToProjects")}</Link>
           </Button>
         </div>
       </div>
@@ -231,13 +229,13 @@ export function SourceControlPage({
       <aside className="source-sidebar">
         <div className="source-heading">
           <div>
-            <b>Source Control</b>
+            <b>{t("sourceControl.title")}</b>
             <span className="source-project-label">{project.name}</span>
           </div>
           <Tooltip>
             <TooltipTrigger asChild>
               <Button
-                aria-label="刷新变更"
+                aria-label={t("sourceControl.refreshChanges")}
                 disabled={loading}
                 onClick={() => void refresh()}
                 size="icon-sm"
@@ -246,27 +244,27 @@ export function SourceControlPage({
                 <RefreshCw className={loading ? "source-spin" : undefined} />
               </Button>
             </TooltipTrigger>
-            <TooltipContent>刷新变更</TooltipContent>
+            <TooltipContent>{t("sourceControl.refreshChanges")}</TooltipContent>
           </Tooltip>
         </div>
 
         <div className="source-repository-summary">
           <div>
-            <span>Branch</span>
+            <span>{t("sourceControl.branch")}</span>
             <b>
               <GitBranch />
               {state?.branch ?? "main"}
             </b>
           </div>
           <div>
-            <span>Revision</span>
+            <span>{t("sourceControl.revision")}</span>
             <b>r{state?.revision ?? project.revision}</b>
           </div>
         </div>
 
         <div className="source-local-warning">
           <Archive />
-          <span>仅保存在当前浏览器。清理站点数据前请先导出备份。</span>
+          <span>{t("sourceControl.localWarning")}</span>
         </div>
 
         {error ? (
@@ -279,18 +277,19 @@ export function SourceControlPage({
         {loading ? (
           <div className="source-loading" role="status">
             <LoaderCircle className="source-spin" />
-            <span>正在恢复本地仓库...</span>
+            <span>{t("sourceControl.restoring")}</span>
           </div>
         ) : (
           <div className="file-groups">
             <ChangeGroup
               files={groups.staged}
-              label="Staged changes"
+              label={t("sourceControl.stagedChanges")}
+              translate={t}
               onBulkAction={() =>
                 void unstage(groups.staged.map((file) => file.path))
               }
               onFileAction={(path) => void unstage([path])}
-              actionLabel="取消暂存"
+              actionLabel={t("sourceControl.unstage")}
               actionIcon={<Upload />}
               selectedPath={selectedPath}
               onSelect={(path) => {
@@ -301,12 +300,13 @@ export function SourceControlPage({
             />
             <ChangeGroup
               files={groups.unstaged}
-              label="Changes"
+              label={t("sourceControl.changes")}
+              translate={t}
               onBulkAction={() =>
                 void stage(groups.unstaged.map((file) => file.path))
               }
               onFileAction={(path) => void stage([path])}
-              actionLabel="暂存"
+              actionLabel={t("sourceControl.stage")}
               actionIcon={<Check />}
               selectedPath={selectedPath}
               onSelect={(path) => {
@@ -317,12 +317,13 @@ export function SourceControlPage({
             />
             <ChangeGroup
               files={groups.untracked}
-              label="Untracked"
+              label={t("sourceControl.untracked")}
+              translate={t}
               onBulkAction={() =>
                 void stage(groups.untracked.map((file) => file.path))
               }
               onFileAction={(path) => void stage([path])}
-              actionLabel="暂存"
+              actionLabel={t("sourceControl.stage")}
               actionIcon={<Check />}
               selectedPath={selectedPath}
               onSelect={(path) => {
@@ -337,7 +338,7 @@ export function SourceControlPage({
         {!loading && changedCount === 0 ? (
           <div className="source-clean">
             <Check />
-            <span>Working tree clean</span>
+            <span>{t("sourceControl.workingTreeClean")}</span>
           </div>
         ) : null}
       </aside>
@@ -345,10 +346,12 @@ export function SourceControlPage({
       <section className="source-diff">
         <div className="diff-header">
           <div>
-            <b>{selectedFile?.path ?? "No file selected"}</b>
+            <b>{selectedFile?.path ?? t("sourceControl.noFileSelected")}</b>
             {selectedFile ? (
               <span className="diff-context">
-                {diffMode === "staged" ? "Staged diff" : "Working tree diff"}
+                {diffMode === "staged"
+                  ? t("sourceControl.stagedDiff")
+                  : t("sourceControl.workingDiff")}
               </span>
             ) : null}
           </div>
@@ -360,7 +363,7 @@ export function SourceControlPage({
               size="xs"
               variant={diffMode === "staged" ? "secondary" : "ghost"}
             >
-              Staged
+              {t("sourceControl.staged")}
             </Button>
             <Button
               className="diff-mode-button"
@@ -369,7 +372,7 @@ export function SourceControlPage({
               size="xs"
               variant={diffMode === "working" ? "secondary" : "ghost"}
             >
-              Working tree
+              {t("sourceControl.workingTree")}
             </Button>
           </div>
         </div>
@@ -378,7 +381,7 @@ export function SourceControlPage({
         ) : (
           <div className="source-diff-empty">
             <FileCode2 />
-            <span>选择一个文件查看差异</span>
+            <span>{t("sourceControl.selectFile")}</span>
           </div>
         )}
       </section>
@@ -386,11 +389,15 @@ export function SourceControlPage({
       <aside className="source-commit">
         <div className="source-commit-topline">
           <div>
-            <span className="source-kicker">Repository status</span>
-            <strong>{changedCount} changed</strong>
+            <span className="source-kicker">
+              {t("sourceControl.repositoryStatus")}
+            </span>
+            <strong>
+              {t("sourceControl.changed", { count: changedCount })}
+            </strong>
           </div>
           <Button
-            aria-label="导出 Browser Git 备份"
+            aria-label={t("sourceControl.exportBackup")}
             disabled={pendingAction !== null}
             onClick={() => void exportBackup()}
             size="icon-sm"
@@ -399,35 +406,35 @@ export function SourceControlPage({
             <Download />
           </Button>
         </div>
-        <h2 className="font-editorial">Commit changes</h2>
-        <p>只提交已经暂存并检查过的内容。Agent 不会自动创建 commit。</p>
+        <h2 className="font-editorial">{t("sourceControl.commitChanges")}</h2>
+        <p>{t("sourceControl.commitHint")}</p>
         <label className="field-label" htmlFor="commit-message">
-          Message
+          {t("sourceControl.message")}
         </label>
         <textarea
           className="field"
           onChange={(event) => setCommitMessage(event.target.value)}
-          placeholder="Describe this change..."
+          placeholder={t("sourceControl.messagePlaceholder")}
           value={commitMessage}
         />
         <div className="commit-summary">
           <div className="summary-cell">
             <b>{stagedCount}</b>
-            <span>staged</span>
+            <span>{t("sourceControl.stagedCount")}</span>
           </div>
           <div className="summary-cell">
             <b>+{sumChanges(stagedFiles, "additions")}</b>
-            <span>added</span>
+            <span>{t("sourceControl.added")}</span>
           </div>
           <div className="summary-cell">
             <b>-{sumChanges(stagedFiles, "deletions")}</b>
-            <span>removed</span>
+            <span>{t("sourceControl.removed")}</span>
           </div>
         </div>
         <div className="author-row">
           <div>
             <label className="field-label" htmlFor="author">
-              Author
+              {t("sourceControl.author")}
             </label>
             <input
               className="field"
@@ -438,7 +445,7 @@ export function SourceControlPage({
           </div>
           <div>
             <label className="field-label" htmlFor="email">
-              Email
+              {t("sourceControl.email")}
             </label>
             <input
               className="field"
@@ -461,12 +468,12 @@ export function SourceControlPage({
           ) : (
             <GitBranch data-icon="inline-start" />
           )}
-          Commit staged changes
+          {t("sourceControl.commitStaged")}
         </Button>
 
         <div className="history">
           <div className="history-heading">
-            <h3>History</h3>
+            <h3>{t("sourceControl.history")}</h3>
             <span>{state?.commits.length ?? 0}</span>
           </div>
           {state?.commits.length ? (
@@ -490,13 +497,17 @@ export function SourceControlPage({
               </button>
             ))
           ) : (
-            <span className="history-empty">还没有 commit。</span>
+            <span className="history-empty">
+              {t("sourceControl.noCommits")}
+            </span>
           )}
         </div>
 
         {selectedCommit ? (
           <div className="commit-detail">
-            <span className="source-kicker">Selected commit</span>
+            <span className="source-kicker">
+              {t("sourceControl.selectedCommit")}
+            </span>
             <b>{selectedCommit.message}</b>
             <span>
               {selectedCommit.author.name} &lt;{selectedCommit.author.email}&gt;
@@ -506,7 +517,7 @@ export function SourceControlPage({
         ) : null}
 
         <Link className="back-to-workbench" href={`/p/${project.id}`}>
-          返回 Agent 工作台
+          {t("sourceControl.backToWorkbench")}
         </Link>
       </aside>
     </div>
@@ -518,6 +529,7 @@ function ChangeGroup({
   actionLabel,
   files,
   label,
+  translate,
   onBulkAction,
   onFileAction,
   onSelect,
@@ -528,6 +540,7 @@ function ChangeGroup({
   actionLabel: string;
   files: readonly BrowserGitChangedFile[];
   label: string;
+  translate: (key: string, values?: Record<string, string | number>) => string;
   onBulkAction: () => void;
   onFileAction: (path: string) => void;
   onSelect: (path: string) => void;
@@ -545,7 +558,7 @@ function ChangeGroup({
         <div>
           <Badge variant="outline">{files.length}</Badge>
           <button
-            aria-label={`${actionLabel}全部${label}`}
+            aria-label={translate("sourceControl.stageAll", { label })}
             className="group-action"
             disabled={pendingAction !== null}
             onClick={onBulkAction}

@@ -7,6 +7,7 @@ import * as React from "react";
 
 import { ThemeToggle } from "@/components/theme/theme-toggle";
 import { Button } from "@/components/ui/button";
+import { useUiI18n } from "@/infrastructure/i18n/ui";
 import { cn } from "@/lib/utils";
 
 const primaryLinks = [
@@ -16,6 +17,7 @@ const primaryLinks = [
 
 export function GlobalNav() {
   const pathname = usePathname();
+  const { locale, setLocale, t } = useUiI18n();
   const [mobileMenuPath, setMobileMenuPath] = React.useState<string | null>(
     null,
   );
@@ -23,7 +25,7 @@ export function GlobalNav() {
   const isMobileMenuOpen = mobileMenuPath === pathname;
 
   return (
-    <nav className="global-nav" aria-label="主导航">
+    <nav className="global-nav" aria-label={t("nav.aria.main")}>
       <Link className="brand-lockup" href="/">
         <span aria-hidden="true" className="brand-mark" />
         <span>WebPilot Studio</span>
@@ -41,26 +43,33 @@ export function GlobalNav() {
             }
             href={link.href}
           >
-            {link.label}
+            {t(`nav.primary.${link.href === "/" ? "projects" : "showcase"}`)}
           </Link>
         ))}
         <span className="muted" aria-disabled="true">
-          Docs
+          {t("nav.primary.docs")}
         </span>
       </div>
 
       <div className="nav-tools">
-        <Button aria-label="切换语言" size="icon" variant="ghost">
-          中
+        <Button
+          aria-label={t("nav.aria.language")}
+          onClick={() => setLocale(locale === "zh" ? "en" : "zh")}
+          size="icon"
+          variant="ghost"
+        >
+          {t(`nav.language.${locale}`)}
         </Button>
         <ThemeToggle />
         <span className="guest-workspace">
           <span className="guest-avatar">G</span>
-          <span>Guest workspace</span>
+          <span>{t("nav.workspace")}</span>
         </span>
         <Button
           aria-expanded={isMobileMenuOpen}
-          aria-label={isMobileMenuOpen ? "关闭导航菜单" : "打开导航菜单"}
+          aria-label={t(
+            isMobileMenuOpen ? "nav.aria.closeMenu" : "nav.aria.openMenu",
+          )}
           className="mobile-menu-trigger"
           onClick={() => setMobileMenuPath(isMobileMenuOpen ? null : pathname)}
           size="icon"
@@ -79,10 +88,10 @@ export function GlobalNav() {
               className={cn(pathname === link.href && "active")}
               href={link.href}
             >
-              {link.label}
+              {t(`nav.primary.${link.href === "/" ? "projects" : "showcase"}`)}
             </Link>
           ))}
-          <span className="muted">Docs</span>
+          <span className="muted">{t("nav.primary.docs")}</span>
         </div>
       ) : null}
     </nav>

@@ -12,6 +12,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
+import { useUiI18n } from "@/infrastructure/i18n/ui";
 
 export function FileOperationDialog({
   initialValue,
@@ -28,23 +29,26 @@ export function FileOperationDialog({
   open: boolean;
   pending: boolean;
 }) {
+  const { t } = useUiI18n();
   const [value, setValue] = useState(initialValue);
 
   const copy = {
     create: {
-      title: "新建文件",
-      description: "输入项目内的完整相对路径。",
-      confirm: "创建",
+      title: t("workbench.fileOperation.createTitle"),
+      description: t("workbench.fileOperation.createDescription"),
+      confirm: t("workbench.fileOperation.createConfirm"),
     },
     rename: {
-      title: "重命名文件",
-      description: "修改完整相对路径，目录不存在时会由运行镜像自动创建。",
-      confirm: "重命名",
+      title: t("workbench.fileOperation.renameTitle"),
+      description: t("workbench.fileOperation.renameDescription"),
+      confirm: t("workbench.fileOperation.renameConfirm"),
     },
     delete: {
-      title: "删除文件",
-      description: `确认删除 ${initialValue}？此操作会创建新的 Repository revision。`,
-      confirm: "删除",
+      title: t("workbench.fileOperation.deleteTitle"),
+      description: t("workbench.fileOperation.deleteDescription", {
+        path: initialValue,
+      }),
+      confirm: t("workbench.fileOperation.deleteConfirm"),
     },
   }[mode];
 
@@ -63,7 +67,7 @@ export function FileOperationDialog({
           </DialogHeader>
           {mode !== "delete" ? (
             <Input
-              aria-label="文件路径"
+              aria-label={t("workbench.fileOperation.pathLabel")}
               autoFocus
               className="file-dialog-input"
               onChange={(event) => setValue(event.target.value)}
@@ -78,14 +82,14 @@ export function FileOperationDialog({
               type="button"
               variant="outline"
             >
-              取消
+              {t("common.cancel")}
             </Button>
             <Button
               disabled={pending || (mode !== "delete" && value.trim() === "")}
               type="submit"
               variant={mode === "delete" ? "destructive" : "default"}
             >
-              {pending ? "处理中..." : copy.confirm}
+              {pending ? t("workbench.fileOperation.processing") : copy.confirm}
             </Button>
           </DialogFooter>
         </form>

@@ -15,19 +15,20 @@ import {
   type ThemePreference,
 } from "@/components/theme/theme-provider";
 import { Button } from "@/components/ui/button";
-
-const themeOptions: Array<{
-  value: ThemePreference;
-  label: string;
-  icon: typeof Sun;
-}> = [
-  { value: "system", label: "跟随系统", icon: Laptop },
-  { value: "light", label: "浅色主题", icon: Sun },
-  { value: "dark", label: "暗色主题", icon: Moon },
-];
+import { useUiI18n } from "@/infrastructure/i18n/ui";
 
 export function ThemeToggle() {
   const { preference, setPreference } = useTheme();
+  const { t } = useUiI18n();
+  const themeOptions: Array<{
+    value: ThemePreference;
+    label: string;
+    icon: typeof Sun;
+  }> = [
+    { value: "system", label: t("theme.system"), icon: Laptop },
+    { value: "light", label: t("theme.light"), icon: Sun },
+    { value: "dark", label: t("theme.dark"), icon: Moon },
+  ];
   const currentOption =
     themeOptions.find((option) => option.value === preference) ??
     themeOptions[0];
@@ -37,7 +38,7 @@ export function ThemeToggle() {
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
         <Button
-          aria-label="切换主题"
+          aria-label={t("theme.toggle")}
           className="theme-toggle"
           size="sm"
           variant="outline"
@@ -47,7 +48,7 @@ export function ThemeToggle() {
         </Button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="end" className="min-w-36">
-        <DropdownMenuLabel>外观</DropdownMenuLabel>
+        <DropdownMenuLabel>{t("theme.label")}</DropdownMenuLabel>
         <DropdownMenuRadioGroup
           value={preference}
           onValueChange={(value) => setPreference(value as ThemePreference)}

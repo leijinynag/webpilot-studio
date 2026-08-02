@@ -57,6 +57,7 @@ import {
   projectWorkspaceReducer,
   selectDirtyPaths,
 } from "@/domains/project/workspace";
+import { useUiI18n } from "@/infrastructure/i18n/ui";
 import { cn } from "@/lib/utils";
 
 type WorkspaceView = "code" | "preview";
@@ -99,6 +100,7 @@ export function ProjectWorkspace({
   initialFiles: readonly ProjectFileSnapshot[];
   project: ProjectDescription;
 }) {
+  const { t } = useUiI18n();
   const [state, dispatch] = useReducer(
     projectWorkspaceReducer,
     createProjectWorkspaceState(initialFiles, project.revision),
@@ -122,9 +124,7 @@ export function ProjectWorkspace({
   const [repositoryUnavailable, setRepositoryUnavailable] = useState<
     string | null
   >(
-    project.status === "unavailable"
-      ? "当前浏览器中的本地仓库数据已经丢失。"
-      : null,
+    project.status === "unavailable" ? t("workbench.repositoryDataLost") : null,
   );
   const editorRef = useRef<editor.IStandaloneCodeEditor | null>(null);
   // SSE 实时事件与快照恢复可能在同一个 Tool Call 上交错到达。
@@ -229,7 +229,7 @@ export function ProjectWorkspace({
           const message =
             error instanceof Error
               ? error.message
-              : "Browser Git 仓库无法恢复。";
+              : t("workbench.repositoryRestoreFailed");
           setRepositoryUnavailable(message);
           dispatch({
             type: "error",
@@ -243,7 +243,7 @@ export function ProjectWorkspace({
     return () => {
       cancelled = true;
     };
-  }, [browserGitRepository]);
+  }, [browserGitRepository, t]);
 
   async function saveActiveFile() {
     const current = stateRef.current;
@@ -299,7 +299,7 @@ export function ProjectWorkspace({
       // 否则按钮会永久禁用，而 Monaco 中的草稿仍应完整保留以便重试。
       dispatch({
         type: "error",
-        message: "网络连接中断，本地草稿已保留，请稍后重试。",
+        message: t("workbench.networkDraftPreserved"),
       });
     }
   }
@@ -309,14 +309,14 @@ export function ProjectWorkspace({
     expectedRevision: number,
   ) {
     const body = (await response.json().catch(() => ({}))) as ApiErrorBody;
-    const message = body.error?.message ?? "文件操作失败，请稍后重试。";
+    const message = body.error?.message ?? t("workbench.fileOperationFailed");
 
     if (body.error?.code === PROJECT_ERROR_CODES.revisionConflict) {
       dispatch({
         type: "conflict",
         actualRevision: body.error.details?.actualRevision ?? null,
         expectedRevision,
-        message: "Repository 已有更新，本地草稿仍被保留。",
+        message: t("workbench.repositoryUpdated"),
       });
       await refreshRepositorySnapshot();
       return;
@@ -349,7 +349,7 @@ export function ProjectWorkspace({
       if (!projectResponse.ok || !filesResponse.ok) {
         dispatch({
           type: "error",
-          message: "无法读取最新 Repository，请刷新页面后重试。",
+          message: t("workbench.repositoryReadFailed"),
         });
         return;
       }
@@ -368,10 +368,10 @@ export function ProjectWorkspace({
     } catch {
       dispatch({
         type: "error",
-        message: "无法连接 Repository，本地草稿仍被保留。",
+        message: t("workbench.repositoryConnectionFailed"),
       });
     }
-  }, [browserGitRepository, project.id]);
+  }, [browserGitRepository, project.id, t]);
 
   function handleAgentRevisionChange(nextRevision: number) {
     setAgentRevision(nextRevision);
@@ -448,7 +448,7 @@ export function ProjectWorkspace({
 
         if (!response.ok) {
           throw new ClientToolResultSubmissionError(
-            body.error?.message ?? "Client Tool 结果提交失败。",
+            body.error?.message ?? t("workbench.clientToolResultFailed"),
             response.status >= 500 ||
               response.status === 408 ||
               response.status === 425 ||
@@ -474,7 +474,7 @@ export function ProjectWorkspace({
             : new ClientToolResultSubmissionError(
                 error instanceof Error
                   ? error.message
-                  : "Client Tool 结果提交失败，请稍后重试。",
+                  : t("workbench.clientToolResultRetry"),
                 true,
               );
         dispatch({
@@ -484,7 +484,7 @@ export function ProjectWorkspace({
         throw submissionError;
       }
     },
-    [],
+    [t],
   );
 
   useEffect(() => {
@@ -513,8 +513,7 @@ export function ProjectWorkspace({
           result = cached.result;
         } else if (!browserGitRepository || !repositoryReady) {
           const unavailableError = new Error(
-            repositoryUnavailable ??
-              "Browser Git 仓库尚未准备完成，无法执行 Agent 工具。",
+            repositoryUnavailable ?? t("workbench.browserGitNotReady"),
           );
           result = createBrowserRepositoryToolFailure(
             request,
@@ -551,7 +550,7 @@ export function ProjectWorkspace({
           message:
             error instanceof Error
               ? error.message
-              : "Browser Repository 工具执行失败。",
+              : t("workbench.browserRepositoryToolFailed"),
         });
 
         // 结果提交失败时保留同一个请求和已执行结果。只有明确可重试的
@@ -595,6 +594,7 @@ export function ProjectWorkspace({
     repositoryReady,
     repositoryUnavailable,
     repositoryToolRetryNonce,
+    t,
   ]);
 
   async function submitFileOperation(value: string) {
@@ -606,10 +606,7 @@ export function ProjectWorkspace({
     const dirtyTarget =
       operation.mode !== "create" && current.files[operation.path]?.dirty;
 
-    if (
-      dirtyTarget &&
-      !window.confirm("该文件有未保存修改，继续会丢弃这份本地草稿。")
-    ) {
+    if (dirtyTarget && !window.confirm(t("workbench.discardDraft"))) {
       return;
     }
 
@@ -739,7 +736,7 @@ export function ProjectWorkspace({
       // 网络失败时不提前修改本地树，避免 UI 展示从未成功落库的结构。
       dispatch({
         type: "error",
-        message: "网络连接中断，文件操作尚未写入 Repository。",
+        message: t("workbench.fileMutationNetworkFailed"),
       });
     } finally {
       setMutationPending(false);
@@ -760,10 +757,7 @@ export function ProjectWorkspace({
   function closeFile(path: string) {
     const file = state.files[path];
 
-    if (
-      file?.dirty &&
-      !window.confirm("关闭标签不会删除文件，但会保留未保存草稿。继续关闭？")
-    ) {
+    if (file?.dirty && !window.confirm(t("workbench.closeTab"))) {
       return;
     }
 
@@ -777,7 +771,7 @@ export function ProjectWorkspace({
     if (
       link &&
       hasDirtyFiles(stateRef.current) &&
-      !window.confirm("仍有未保存文件，确认离开当前项目？")
+      !window.confirm(t("workbench.leaveProject"))
     ) {
       event.preventDefault();
     }
@@ -790,7 +784,7 @@ export function ProjectWorkspace({
     >
       <header className="workbench-top">
         <div className="project-crumb">
-          <Link href="/">Projects</Link>
+          <Link href="/">{t("workbench.projects")}</Link>
           <span>/</span>
           <b>{project.name}</b>
           <span
@@ -802,7 +796,7 @@ export function ProjectWorkspace({
         </div>
 
         <ToggleGroup
-          aria-label="工作台视图"
+          aria-label={t("workbench.view")}
           className="workbench-tabs"
           onValueChange={(value) => {
             if (value === "code" || value === "preview") {
@@ -814,11 +808,11 @@ export function ProjectWorkspace({
         >
           <ToggleGroupItem value="preview">
             <Play />
-            Preview
+            {t("workbench.preview")}
           </ToggleGroupItem>
           <ToggleGroupItem value="code">
             <Code2 />
-            Code
+            {t("workbench.code")}
           </ToggleGroupItem>
         </ToggleGroup>
 
@@ -832,13 +826,13 @@ export function ProjectWorkspace({
           <Button asChild size="sm" variant="outline">
             <Link href={`/p/${project.id}/source-control`}>
               <GitBranch data-icon="inline-start" />
-              Source Control
+              {t("workbench.sourceControl")}
             </Link>
           </Button>
           <Button asChild className="app-button-accent" size="sm">
             <Link href={`/p/${project.id}/publish`}>
               <ExternalLink data-icon="inline-start" />
-              Publish
+              {t("workbench.publish")}
             </Link>
           </Button>
         </div>
@@ -846,7 +840,7 @@ export function ProjectWorkspace({
 
       {!repositoryReady && !repositoryUnavailable ? (
         <div className="workspace-repository-loading" role="status">
-          正在恢复浏览器仓库。源码和 Git 状态准备完成后才会显示。
+          {t("workbench.restoringRepository")}
         </div>
       ) : null}
 
@@ -854,15 +848,12 @@ export function ProjectWorkspace({
         <section className="workspace-repository-unavailable" role="alert">
           <GitBranch />
           <div>
-            <b>本地 Browser Git 仓库不可用</b>
+            <b>{t("workbench.repositoryUnavailable")}</b>
             <p>{repositoryUnavailable}</p>
-            <p>
-              WebPilot Studio 不会自动创建空仓库覆盖原项目。你仍可返回项目列表，
-              或前往 Source Control 查看可用的导出与恢复信息。
-            </p>
+            <p>{t("workbench.repositoryUnavailableDescription")}</p>
           </div>
           <Button asChild variant="outline">
-            <Link href="/">返回项目列表</Link>
+            <Link href="/">{t("workbench.backToProjects")}</Link>
           </Button>
         </section>
       ) : (
@@ -885,7 +876,7 @@ export function ProjectWorkspace({
                 <Tooltip>
                   <TooltipTrigger asChild>
                     <Button
-                      aria-label="新建文件"
+                      aria-label={t("workbench.createFile")}
                       onClick={() => setOperation({ mode: "create", path: "" })}
                       size="icon-sm"
                       variant="ghost"
@@ -893,7 +884,7 @@ export function ProjectWorkspace({
                       <FilePlus2 />
                     </Button>
                   </TooltipTrigger>
-                  <TooltipContent>新建文件</TooltipContent>
+                  <TooltipContent>{t("workbench.createFile")}</TooltipContent>
                 </Tooltip>
               </div>
               <FileTree
@@ -923,7 +914,7 @@ export function ProjectWorkspace({
                       <Tooltip>
                         <TooltipTrigger asChild>
                           <Button
-                            aria-label="格式化当前文件"
+                            aria-label={t("workbench.formatFile")}
                             disabled={!activeFile}
                             onClick={formatActiveFile}
                             size="icon-sm"
@@ -932,7 +923,9 @@ export function ProjectWorkspace({
                             <WandSparkles />
                           </Button>
                         </TooltipTrigger>
-                        <TooltipContent>格式化当前文件</TooltipContent>
+                        <TooltipContent>
+                          {t("workbench.formatFile")}
+                        </TooltipContent>
                       </Tooltip>
                       <Button
                         disabled={
@@ -942,13 +935,15 @@ export function ProjectWorkspace({
                         size="sm"
                       >
                         <Save data-icon="inline-start" />
-                        {state.saveStatus === "saving" ? "Saving" : "Save"}
+                        {state.saveStatus === "saving"
+                          ? t("workbench.saving")
+                          : t("workbench.save")}
                       </Button>
                     </div>
                   </>
                 ) : (
                   <div className="preview-heading">
-                    <span>Live preview</span>
+                    <span>{t("workbench.livePreview")}</span>
                     <small>r{Math.max(state.revision, agentRevision)}</small>
                   </div>
                 )}
@@ -979,7 +974,7 @@ export function ProjectWorkspace({
                   ) : (
                     <div className="editor-empty">
                       <Code2 />
-                      <span>从文件树中打开一个文件</span>
+                      <span>{t("workbench.openFileHint")}</span>
                     </div>
                   )
                 ) : (
@@ -1007,8 +1002,12 @@ export function ProjectWorkspace({
                 <span>
                   {state.statusMessage ||
                     (dirtyPaths.length > 0
-                      ? `${dirtyPaths.length} 个文件未保存`
-                      : `Repository revision ${state.revision}`)}
+                      ? t("workbench.unsavedFiles", {
+                          count: dirtyPaths.length,
+                        })
+                      : t("workbench.repositoryRevision", {
+                          revision: state.revision,
+                        }))}
                 </span>
                 {activeFile ? <span>{activeFile.path}</span> : null}
               </footer>

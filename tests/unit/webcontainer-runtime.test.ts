@@ -151,10 +151,13 @@ describe("WebContainerRuntimeManager", () => {
     );
 
     expect(result.manifest.entryPath).toBe("index.html");
-    expect(result.manifest.files).toHaveLength(1);
+    expect(result.manifest.files).toHaveLength(2);
     expect(runtime.calls).toContain("npm run build");
     expect(runtime.calls).toContain("readdir:dist");
+    expect(runtime.calls).toContain("readdir:dist/static");
     expect(runtime.calls).toContain("read:dist/index.html");
+    expect(runtime.calls).toContain("read:dist/static/app.js");
+    expect(runtime.calls).not.toContain("read:dist/static/index.html");
   });
 
   it("相同 revision 的不同运行镜像 key 仍会触发同步", async () => {

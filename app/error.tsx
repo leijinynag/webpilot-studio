@@ -3,6 +3,7 @@
 import { AlertTriangle, RefreshCw } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { useUiI18n } from "@/infrastructure/i18n/ui";
 
 export default function GlobalError({
   reset,
@@ -10,17 +11,19 @@ export default function GlobalError({
   error: Error & { digest?: string };
   reset: () => void;
 }) {
+  const { t } = useUiI18n();
+
   return (
     <main className="error-page">
       <div className="error-panel panel">
         <AlertTriangle />
         <div>
-          <div className="eyebrow">Something went wrong</div>
-          <h1 className="font-editorial">The workspace needs a reset.</h1>
-          <p>当前页面没有完成渲染，可以尝试重新加载这一段工作区。</p>
+          <div className="eyebrow">{t("errors.somethingWrong")}</div>
+          <h1 className="font-editorial">{t("errors.errorTitle")}</h1>
+          <p>{t("errors.errorDescription")}</p>
           <Button onClick={reset} variant="outline">
             <RefreshCw />
-            Try again
+            {t("errors.tryAgain")}
           </Button>
         </div>
       </div>

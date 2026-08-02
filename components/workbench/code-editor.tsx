@@ -6,14 +6,20 @@ import type { editor } from "monaco-editor";
 
 import type { WorkspaceFile } from "@/domains/project/workspace";
 import { loadLocalMonacoReact } from "@/components/workbench/monaco-client";
+import { useUiI18n } from "@/infrastructure/i18n/ui";
 
 const MonacoEditor = dynamic(
   () => loadLocalMonacoReact().then((module) => module.Editor),
   {
     ssr: false,
-    loading: () => <div className="editor-loading">正在加载编辑器...</div>,
+    loading: () => <EditorLoading />,
   },
 );
+
+function EditorLoading() {
+  const { t } = useUiI18n();
+  return <div className="editor-loading">{t("workbench.editorLoading")}</div>;
+}
 
 export function CodeEditor({
   file,

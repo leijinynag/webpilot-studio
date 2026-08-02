@@ -43,6 +43,8 @@ import type {
   VerificationStepRecord,
 } from "@/domains/agent/types";
 import { projectPendingAssistantText } from "@/domains/agent/transcript";
+import { toAgentLocale } from "@/infrastructure/i18n/locale";
+import { useUiI18n } from "@/infrastructure/i18n/ui";
 import { cn } from "@/lib/utils";
 
 type AgentPanelProps = {
@@ -67,6 +69,11 @@ type OptimisticUserMessage = {
   content: string;
   status: "sending" | "queued";
 };
+
+type Translate = (
+  key: string,
+  values?: Record<string, string | number>,
+) => string;
 
 const TERMINAL_STATUSES = new Set([
   "succeeded",
@@ -100,6 +107,7 @@ export function AgentPanel({
   onRevisionChange,
   onRestoreComplete,
 }: AgentPanelProps) {
+  const { locale, t } = useUiI18n();
   const [conversations, setConversations] = useState<ConversationRecord[]>([]);
   const [snapshot, setSnapshot] = useState<AgentConversationSnapshot | null>(
     null,
@@ -240,7 +248,7 @@ export function AgentPanel({
           requestedProjectId === currentProjectIdRef.current
         ) {
           setErrorMessage(
-            error instanceof Error ? error.message : "无法加载 Agent 会话。",
+            error instanceof Error ? error.message : t("agent.unableToLoad"),
           );
         }
         return null;
@@ -253,7 +261,7 @@ export function AgentPanel({
         }
       }
     },
-    [applySnapshot, projectId],
+    [applySnapshot, projectId, t],
   );
 
   const scheduleAgentSnapshotRefresh = useCallback(
@@ -557,8 +565,8 @@ export function AgentPanel({
         : {}),
       ...(invocation.toolName === "git_commit"
         ? {
-            author: activeRun.repositoryCapability.repositoryIntent
-              ?.commitAuthor,
+            author:
+              activeRun.repositoryCapability.repositoryIntent?.commitAuthor,
           }
         : {}),
       ...(isBrowserRepositoryFileMutation(invocation.toolName)
@@ -597,7 +605,7 @@ export function AgentPanel({
       const response = await fetch(`/api/projects/${projectId}/agent`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ title: "新会话" }),
+        body: JSON.stringify({ title: t("agent.createConversation") }),
       });
       const body = (await response.json().catch(() => ({}))) as
         { conversation?: ConversationRecord } | AgentErrorResponse;
@@ -605,8 +613,8 @@ export function AgentPanel({
       if (!response.ok || !("conversation" in body) || !body.conversation) {
         throw new Error(
           "error" in body
-            ? (body.error?.message ?? "创建会话失败。")
-            : "创建会话失败。",
+            ? (body.error?.message ?? t("agent.createConversationFailed"))
+            : t("agent.createConversationFailed"),
         );
       }
 
@@ -616,7 +624,9 @@ export function AgentPanel({
       draftRef.current?.focus();
     } catch (error) {
       setErrorMessage(
-        error instanceof Error ? error.message : "创建会话失败。",
+        error instanceof Error
+          ? error.message
+          : t("agent.createConversationFailed"),
       );
     } finally {
       setCreatingConversation(false);
@@ -655,7 +665,7 @@ export function AgentPanel({
           projectId,
           conversationId: selectedConversationId ?? undefined,
           message,
-          locale: "zh-CN",
+          locale: toAgentLocale(locale),
           repositoryRevision: revision,
         }),
       });
@@ -665,8 +675,8 @@ export function AgentPanel({
       if (!response.ok || !("run" in body) || !body.run) {
         throw new Error(
           "error" in body
-            ? (body.error?.message ?? "Agent Run 创建失败。")
-            : "Agent Run 创建失败。",
+            ? (body.error?.message ?? t("agent.runCreateFailed"))
+            : t("agent.runCreateFailed"),
         );
       }
 
@@ -684,7 +694,7 @@ export function AgentPanel({
       );
       setDraft((current) => (current.trim() ? current : message));
       setErrorMessage(
-        error instanceof Error ? error.message : "Agent Run 创建失败。",
+        error instanceof Error ? error.message : t("agent.runCreateFailed"),
       );
     } finally {
       setSending(false);
@@ -703,12 +713,12 @@ export function AgentPanel({
         method: "POST",
       });
       if (!response.ok) {
-        throw new Error("停止 Agent Run 失败。");
+        throw new Error(t("agent.stopFailed"));
       }
       await loadAgentSnapshot(selectedConversationId, { showLoading: false });
     } catch (error) {
       setErrorMessage(
-        error instanceof Error ? error.message : "停止 Agent Run 失败。",
+        error instanceof Error ? error.message : t("agent.stopFailed"),
       );
     } finally {
       setStopping(false);
@@ -725,18 +735,20 @@ export function AgentPanel({
     );
 
   return (
-    <aside className="agent-panel-v2" aria-label="Agent">
+    <aside className="agent-panel-v2" aria-label={t("agent.aria")}>
       <div className="agent-panel-header">
         <div>
           <span className="agent-eyebrow">
             <Bot size={14} />
-            Agent workspace
+            {t("agent.workspace")}
           </span>
-          <strong>{snapshot?.conversation.title ?? "Agent"}</strong>
+          <strong>
+            {snapshot?.conversation.title ?? t("agent.assistant")}
+          </strong>
         </div>
         <div className="agent-header-actions">
           <Button
-            aria-label="新建会话"
+            aria-label={t("agent.newConversation")}
             disabled={creatingConversation}
             onClick={() => void createConversation()}
             size="icon-sm"
@@ -749,7 +761,7 @@ export function AgentPanel({
             )}
           </Button>
           <Button
-            aria-label="刷新 Agent 状态"
+            aria-label={t("agent.refresh")}
             onClick={() => void loadAgentSnapshot(selectedConversationId)}
             size="icon-sm"
             variant="ghost"
@@ -768,8 +780,8 @@ export function AgentPanel({
         >
           <span>
             {conversations.length
-              ? `${conversations.length} 个会话`
-              : "暂无会话"}
+              ? t("agent.conversationCount", { count: conversations.length })
+              : t("agent.noConversations")}
           </span>
           <ChevronDown className={cn(showHistory && "rotate-180")} />
         </button>
@@ -798,7 +810,7 @@ export function AgentPanel({
               ))
             ) : (
               <span className="agent-menu-empty">
-                发送第一条消息后会自动创建会话
+                {t("agent.conversationEmpty")}
               </span>
             )}
           </div>
@@ -809,7 +821,7 @@ export function AgentPanel({
         {loading ? (
           <div className="agent-empty-state">
             <LoaderCircle className="animate-spin" />
-            <span>正在恢复 Agent 状态...</span>
+            <span>{t("agent.restoreStatus")}</span>
           </div>
         ) : transcript.length ||
           showOptimisticUserMessage ||
@@ -831,8 +843,8 @@ export function AgentPanel({
         ) : (
           <div className="agent-empty-state">
             <Bot />
-            <strong>让 Agent 直接修改项目</strong>
-            <span>它会先读取文件，再按 revision 安全写入。</span>
+            <strong>{t("agent.emptyTitle")}</strong>
+            <span>{t("agent.emptyDescription")}</span>
           </div>
         )}
       </div>
@@ -859,7 +871,7 @@ export function AgentPanel({
 
       <form className="agent-composer-v2" onSubmit={sendMessage}>
         <textarea
-          aria-label="给 Agent 的消息"
+          aria-label={t("agent.messageLabel")}
           disabled={Boolean(activeRun) || sending}
           onChange={(event) => setDraft(event.target.value)}
           onKeyDown={(event) => {
@@ -868,15 +880,15 @@ export function AgentPanel({
               event.currentTarget.form?.requestSubmit();
             }
           }}
-          placeholder="描述你想修改的内容..."
+          placeholder={t("agent.placeholder")}
           ref={draftRef}
           rows={3}
           value={draft}
         />
         <div className="agent-composer-footer">
-          <span>DeepSeek · revision {revision}</span>
+          <span>{t("agent.provider", { revision })}</span>
           <Button
-            aria-label="发送消息"
+            aria-label={t("agent.send")}
             disabled={!draft.trim() || Boolean(activeRun) || sending}
             size="icon-sm"
             type="submit"
@@ -904,10 +916,12 @@ export function AgentPanel({
 }
 
 function TranscriptItem({ message }: { message: TranscriptMessage }) {
+  const { t } = useUiI18n();
+
   if (message.kind === "user_message") {
     return (
       <article className="agent-message agent-message-user">
-        <span className="agent-message-label">You</span>
+        <span className="agent-message-label">{t("agent.you")}</span>
         <p>{message.content}</p>
       </article>
     );
@@ -916,7 +930,7 @@ function TranscriptItem({ message }: { message: TranscriptMessage }) {
   if (message.kind === "assistant_message") {
     return (
       <article className="agent-message agent-message-assistant">
-        <span className="agent-message-label">Agent</span>
+        <span className="agent-message-label">{t("agent.assistant")}</span>
         <p>{message.content}</p>
       </article>
     );
@@ -947,10 +961,12 @@ function TranscriptItem({ message }: { message: TranscriptMessage }) {
         <div>
           <strong>
             {preview
-              ? `Preview r${preview.revision} · ${ok ? "验证通过" : "验证失败"}`
+              ? t(ok ? "agent.previewPassed" : "agent.previewFailed", {
+                  revision: preview.revision,
+                })
               : ok
-                ? `${message.toolName} completed`
-                : `${message.toolName} failed`}
+                ? t("agent.toolCompleted", { tool: message.toolName })
+                : t("agent.toolFailed", { tool: message.toolName })}
           </strong>
           {preview ? (
             <>
@@ -979,7 +995,7 @@ function TranscriptItem({ message }: { message: TranscriptMessage }) {
         <FileCode2 />
       </span>
       <div>
-        <strong>{message.eventType || "System event"}</strong>
+        <strong>{message.eventType || t("agent.systemEvent")}</strong>
         <code>{formatToolArguments(message.data)}</code>
       </div>
     </article>
@@ -991,13 +1007,18 @@ function OptimisticTranscriptItem({
 }: {
   message: OptimisticUserMessage;
 }) {
+  const { t } = useUiI18n();
+
   return (
     <article
       className="agent-message agent-message-user is-pending"
       data-testid="optimistic-user-message"
     >
       <span className="agent-message-label">
-        You · {message.status === "sending" ? "发送中" : "已排队"}
+        {t("agent.you")} ·{" "}
+        {message.status === "sending"
+          ? t("agent.sendingLabel")
+          : t("agent.queuedLabel")}
       </span>
       <p>{message.content}</p>
     </article>
@@ -1005,11 +1026,13 @@ function OptimisticTranscriptItem({
 }
 
 function StreamingAssistantMessage({ content }: { content: string }) {
+  const { t } = useUiI18n();
+
   return (
     <article className="agent-message agent-message-assistant is-streaming">
       <span className="agent-message-label">
         <LoaderCircle className="animate-spin" />
-        Agent
+        {t("agent.assistant")}
       </span>
       <p>{content}</p>
     </article>
@@ -1035,8 +1058,9 @@ function AgentRunStatus({
   verificationRuns: VerificationRunRecord[];
   verificationSteps: VerificationStepRecord[];
 }) {
+  const { t } = useUiI18n();
   const elapsed = formatElapsed(run);
-  const status = getRunStatusCopy(run);
+  const status = getRunStatusCopy(run, t);
   const isActive = !TERMINAL_STATUSES.has(run.status);
   const isFailure = status.tone === "error";
   const displayedModelTurns =
@@ -1044,9 +1068,9 @@ function AgentRunStatus({
       ? Math.min(run.usage.modelTurns + 1, run.budget.maxModelTurns)
       : run.usage.modelTurns;
   const activeDetail = activeTool
-    ? `正在执行 ${activeTool.toolName}`
+    ? t("agent.executingTool", { tool: activeTool.toolName })
     : run.status === "running" && hasStreamingAssistantText
-      ? "模型已响应，正在完成当前步骤"
+      ? t("agent.modelResponding")
       : status.detail;
 
   return (
@@ -1073,23 +1097,24 @@ function AgentRunStatus({
       <div className="agent-run-status-detail">
         <span>{activeDetail}</span>
         <span>
-          {displayedModelTurns}/{run.budget.maxModelTurns} turns · r
-          {run.currentRevision}
+          {displayedModelTurns}/{run.budget.maxModelTurns} {t("agent.turns")} ·
+          r{run.currentRevision}
         </span>
       </div>
-      <div className="agent-run-metrics" aria-label="Agent 运行指标">
+      <div className="agent-run-metrics" aria-label={t("agent.runMetrics")}>
         <span>
           <PlayCircle />
           <b>{run.usage.clientResumes}</b>/{run.budget.maxClientResumes}{" "}
-          previews
+          {t("agent.previews")}
         </span>
         <span>
           <RotateCcw />
-          <b>{run.usage.repairRounds}</b> repairs
+          <b>{run.usage.repairRounds}</b> {t("agent.repairs")}
         </span>
         <span>
           <Wrench />
-          <b>{run.usage.fileMutations}</b>/{run.budget.maxFileMutations} writes
+          <b>{run.usage.fileMutations}</b>/{run.budget.maxFileMutations}{" "}
+          {t("agent.writes")}
         </span>
       </div>
       {run.usage.latestVerificationRevision !== null ? (
@@ -1102,12 +1127,18 @@ function AgentRunStatus({
           {run.usage.latestVerificationOk ? <ShieldCheck /> : <TriangleAlert />}
           <span>
             {run.usage.latestVerificationOk
-              ? `r${run.usage.latestVerificationRevision} 已通过运行验证`
-              : `r${run.usage.latestVerificationRevision} 验证失败，正在依据证据修复`}
+              ? t("agent.verifiedRevision", {
+                  revision: run.usage.latestVerificationRevision,
+                })
+              : t("agent.verificationFailed", {
+                  revision: run.usage.latestVerificationRevision,
+                })}
           </span>
           {run.usage.firstPreviewDurationMs !== null ? (
             <small>
-              首次预览 {formatDuration(run.usage.firstPreviewDurationMs)}
+              {t("agent.firstPreview", {
+                duration: formatDuration(run.usage.firstPreviewDurationMs),
+              })}
             </small>
           ) : null}
         </div>
@@ -1126,7 +1157,7 @@ function AgentRunStatus({
           variant="outline"
         >
           <CircleStop data-icon="inline-start" />
-          {stopping ? "正在停止..." : "停止"}
+          {stopping ? t("agent.stopping") : t("agent.stop")}
         </Button>
       ) : (
         <>
@@ -1134,7 +1165,7 @@ function AgentRunStatus({
           {run.status === "succeeded" ? (
             <Button onClick={onReviewChanges} size="sm" variant="outline">
               <GitCompareArrows data-icon="inline-start" />
-              查看改动
+              {t("agent.reviewChanges")}
             </Button>
           ) : null}
         </>
@@ -1169,6 +1200,7 @@ function VerificationHistory({
   runs: VerificationRunRecord[];
   steps: VerificationStepRecord[];
 }) {
+  const { t } = useUiI18n();
   const stepsByRun = new Map<string, VerificationStepRecord[]>();
   for (const step of steps) {
     const current = stepsByRun.get(step.verificationRunId) ?? [];
@@ -1186,8 +1218,8 @@ function VerificationHistory({
       open={visibleRuns[0]?.status === "failed"}
     >
       <summary>
-        <span>Browser Verify</span>
-        <small>{runs.length} 次记录</small>
+        <span>{t("agent.verificationHistory")}</span>
+        <small>{t("agent.verificationCount", { count: runs.length })}</small>
       </summary>
       <div className="agent-verification-runs">
         {visibleRuns.map((verification) => {
@@ -1195,7 +1227,9 @@ function VerificationHistory({
             .slice()
             .sort((left, right) => left.stepIndex - right.stepIndex);
           const sourceLabel =
-            verification.source === "replay" ? "自动回放" : "Agent";
+            verification.source === "replay"
+              ? t("agent.replay")
+              : t("agent.assistant");
 
           return (
             <article
@@ -1226,7 +1260,9 @@ function VerificationHistory({
               </header>
 
               <div
-                aria-label={`revision ${verification.revision} 验证门禁`}
+                aria-label={t("agent.verificationGate", {
+                  revision: verification.revision,
+                })}
                 className="agent-verification-checks"
               >
                 {VERIFICATION_CHECKS.map(([field, label]) => {
@@ -1261,7 +1297,7 @@ function VerificationHistory({
                     >
                       <span>{step.stepIndex + 1}</span>
                       <div>
-                        <strong>{formatBrowserAction(step.action)}</strong>
+                        <strong>{formatBrowserAction(step.action, t)}</strong>
                         <small>
                           {step.message} · {formatDuration(step.durationMs)}
                         </small>
@@ -1271,7 +1307,7 @@ function VerificationHistory({
                 </ol>
               ) : (
                 <p className="agent-verification-pending">
-                  等待浏览器返回步骤证据...
+                  {t("agent.waitingEvidence")}
                 </p>
               )}
 
@@ -1279,7 +1315,10 @@ function VerificationHistory({
                 <p className="agent-verification-summary">
                   {verification.failedStep === null
                     ? verification.summary
-                    : `失败步骤 ${verification.failedStep + 1}：${verification.summary}`}
+                    : t("agent.failureStep", {
+                        step: verification.failedStep + 1,
+                        summary: verification.summary,
+                      })}
                 </p>
               ) : null}
             </article>
@@ -1290,16 +1329,16 @@ function VerificationHistory({
   );
 }
 
-function formatBrowserAction(action: string): string {
+function formatBrowserAction(action: string, t: Translate): string {
   const labels: Record<string, string> = {
-    click: "点击",
-    fill: "填写",
-    select: "选择",
-    press: "按键",
-    wait_for: "等待",
-    assert_text: "断言文本",
-    assert_visible: "断言可见",
-    assert_url: "断言 URL",
+    click: t("agent.actionClick"),
+    fill: t("agent.actionFill"),
+    select: t("agent.actionSelect"),
+    press: t("agent.actionPress"),
+    wait_for: t("agent.actionWait"),
+    assert_text: t("agent.actionAssertText"),
+    assert_visible: t("agent.actionAssertVisible"),
+    assert_url: t("agent.actionAssertUrl"),
   };
   return labels[action] ?? action;
 }
@@ -1333,7 +1372,10 @@ function toTimestamp(value: Date | string | null | undefined): number | null {
   return Number.isFinite(timestamp) ? timestamp : null;
 }
 
-function getRunStatusCopy(run: AgentRunRecord): {
+function getRunStatusCopy(
+  run: AgentRunRecord,
+  t: Translate,
+): {
   title: string;
   detail: string;
   message: string;
@@ -1342,72 +1384,72 @@ function getRunStatusCopy(run: AgentRunRecord): {
   switch (run.status) {
     case "queued":
       return {
-        title: "排队中",
-        detail: "等待执行器接管",
-        message: "Agent 即将开始处理这条请求。",
+        title: t("agent.statusQueued"),
+        detail: t("agent.statusQueuedDetail"),
+        message: t("agent.statusQueuedMessage"),
         tone: "neutral",
       };
     case "running":
       return {
-        title: "执行中",
-        detail: "正在请求模型规划下一步",
-        message: "Agent 正在读取项目并准备下一步操作。",
+        title: t("agent.statusRunning"),
+        detail: t("agent.statusRunningDetail"),
+        message: t("agent.statusRunningMessage"),
         tone: "neutral",
       };
     case "awaiting_client_tool":
       return {
-        title: "等待工具",
-        detail: "等待浏览器工具",
-        message: "Agent 正在等待浏览器工具返回结果。",
+        title: t("agent.statusAwaitingTool"),
+        detail: t("agent.statusAwaitingToolDetail"),
+        message: t("agent.statusAwaitingToolMessage"),
         tone: "neutral",
       };
     case "awaiting_async_job":
       return {
-        title: "等待任务",
-        detail: "等待异步任务",
-        message: "Agent 正在等待异步任务完成。",
+        title: t("agent.statusAwaitingJob"),
+        detail: t("agent.statusAwaitingJobDetail"),
+        message: t("agent.statusAwaitingJobMessage"),
         tone: "neutral",
       };
     case "succeeded":
       return {
-        title: "已完成",
-        detail: "修改已写入 Repository",
-        message: "代码修改已经写入 Repository。",
+        title: t("agent.statusSucceeded"),
+        detail: t("agent.statusSucceededDetail"),
+        message: t("agent.statusSucceededMessage"),
         tone: "success",
       };
     case "cancelled":
       return {
-        title: "已停止",
-        detail: "后续文件修改已阻断",
-        message: "本次运行已停止，没有继续执行后续文件修改。",
+        title: t("agent.statusCancelled"),
+        detail: t("agent.statusCancelledDetail"),
+        message: t("agent.statusCancelledMessage"),
         tone: "warning",
       };
     case "conflicted":
       return {
-        title: "发生冲突",
-        detail: `Repository 已更新到 r${run.currentRevision}，已保留用户修改`,
-        message:
-          "检测到 Repository 有新版本，Agent 已停止，最新的用户修改没有被覆盖。",
+        title: t("agent.statusConflicted"),
+        detail: t("agent.statusConflictedDetail", {
+          revision: run.currentRevision,
+        }),
+        message: t("agent.statusConflictedMessage"),
         tone: "warning",
       };
     case "budget_exhausted":
       if (run.errorCode === "AGENT_NO_PROGRESS") {
         return {
-          title: "无进展，已停止",
-          detail: "相同失败在同一 revision 上重复出现",
-          message:
-            "Agent 没有产生新的代码 revision，且重复得到相同 Preview 失败，已停止循环。",
+          title: t("agent.statusNoProgress"),
+          detail: t("agent.statusNoProgressDetail"),
+          message: t("agent.statusNoProgressMessage"),
           tone: "warning",
         };
       }
       return {
-        title: "达到预算上限",
-        detail: "已达到本次运行预算，未继续执行",
-        message: "本次任务使用的模型轮次已达上限，可以拆分任务后重新尝试。",
+        title: t("agent.statusBudget"),
+        detail: t("agent.statusBudgetDetail"),
+        message: t("agent.statusBudgetMessage"),
         tone: "warning",
       };
     case "failed":
-      return getFailedRunStatusCopy(run.errorCode);
+      return getFailedRunStatusCopy(run.errorCode, t);
   }
 }
 
@@ -1469,7 +1511,10 @@ function formatDuration(milliseconds: number): string {
   return `${(milliseconds / 1_000).toFixed(1)}s`;
 }
 
-function getFailedRunStatusCopy(errorCode: string | null): {
+function getFailedRunStatusCopy(
+  errorCode: string | null,
+  t: Translate,
+): {
   title: string;
   detail: string;
   message: string;
@@ -1478,45 +1523,44 @@ function getFailedRunStatusCopy(errorCode: string | null): {
   switch (errorCode) {
     case "AGENT_PROVIDER_NOT_CONFIGURED":
       return {
-        title: "配置缺失",
-        detail: "模型服务尚未配置",
-        message: "服务端还没有配置可用的 DeepSeek Key，请检查部署环境变量。",
+        title: t("agent.statusProviderConfig"),
+        detail: t("agent.statusProviderConfigDetail"),
+        message: t("agent.statusProviderConfigMessage"),
         tone: "error",
       };
     case "AGENT_PROVIDER_TIMEOUT":
       return {
-        title: "模型超时",
-        detail: "模型响应时间过长",
-        message: "模型响应超时，Agent 没有继续写入文件。",
+        title: t("agent.statusProviderTimeout"),
+        detail: t("agent.statusProviderTimeoutDetail"),
+        message: t("agent.statusProviderTimeoutMessage"),
         tone: "error",
       };
     case "AGENT_PROVIDER_RATE_LIMITED":
       return {
-        title: "模型限流",
-        detail: "模型服务暂时不可用",
-        message: "模型服务暂时限制了请求，请稍后重试。",
+        title: t("agent.statusProviderRateLimit"),
+        detail: t("agent.statusProviderRateLimitDetail"),
+        message: t("agent.statusProviderRateLimitMessage"),
         tone: "error",
       };
     case "AGENT_PROVIDER_INVALID_STREAM":
       return {
-        title: "模型响应异常",
-        detail: "无法解析模型返回内容",
-        message: "模型返回了无法识别的结果，Agent 没有继续写入文件。",
+        title: t("agent.statusProviderInvalidStream"),
+        detail: t("agent.statusProviderInvalidStreamDetail"),
+        message: t("agent.statusProviderInvalidStreamMessage"),
         tone: "error",
       };
     case "AGENT_PROFILE_UNAVAILABLE":
       return {
-        title: "运行配置失效",
-        detail: "当前 Agent 配置版本不可用",
-        message: "本次运行依赖的 Prompt 或工具配置不可用，请重新发起任务。",
+        title: t("agent.statusProfileUnavailable"),
+        detail: t("agent.statusProfileUnavailableDetail"),
+        message: t("agent.statusProfileUnavailableMessage"),
         tone: "error",
       };
     default:
       return {
-        title: "执行失败",
-        detail: "Agent 未继续写入项目",
-        message:
-          "Agent 执行过程中发生错误，已停止后续文件修改。请查看运行记录后重试。",
+        title: t("agent.statusFailed"),
+        detail: t("agent.statusFailedDetail"),
+        message: t("agent.statusFailedMessage"),
         tone: "error",
       };
   }

@@ -1,7 +1,10 @@
+"use client";
+
 import { ArrowLeft, ExternalLink } from "lucide-react";
 import Link from "next/link";
 
 import type { ShowcaseCaseView } from "@/infrastructure/showcase/repository";
+import { useUiI18n } from "@/infrastructure/i18n/ui";
 
 export function ShowcaseDetailPage({
   item,
@@ -10,6 +13,7 @@ export function ShowcaseDetailPage({
   item: ShowcaseCaseView;
   runtimeOrigin?: string;
 }) {
+  const { t } = useUiI18n();
   const runtimeUrl = item.artifact
     ? `${runtimeOrigin ?? ""}/showcase/runtime/${item.artifact.id}/`
     : null;
@@ -19,18 +23,24 @@ export function ShowcaseDetailPage({
       <div className="showcase-detail-head">
         <Link className="back-to-workbench" href="/showcase">
           <ArrowLeft data-icon="inline-start" />
-          返回 Showcase
+          {t("showcase.back")}
         </Link>
-        <span className="eyebrow">Built with WebPilot</span>
+        <span className="eyebrow">{t("showcase.eyebrow")}</span>
       </div>
 
       <section className="showcase-detail-hero">
         <div className="showcase-detail-copy">
           <h1 className="font-editorial showcase-detail-title">{item.title}</h1>
-          <p>{item.description ?? "一个经过构建和验证的 WebPilot 项目。"}</p>
+          <p>{item.description ?? t("showcase.webProject")}</p>
           <div className="showcase-detail-meta">
-            <span>{item.artifact?.fileCount ?? 0} assets</span>
-            <span>revision {item.artifact?.sourceRevision ?? "-"}</span>
+            <span>
+              {t("showcase.assets", { count: item.artifact?.fileCount ?? 0 })}
+            </span>
+            <span>
+              {t("showcase.revision", {
+                revision: item.artifact?.sourceRevision ?? "-",
+              })}
+            </span>
             <span>{item.slug}</span>
           </div>
           {runtimeUrl ? (
@@ -41,7 +51,7 @@ export function ShowcaseDetailPage({
               target="_blank"
             >
               <ExternalLink data-icon="inline-start" />
-              在新窗口打开预览
+              {t("showcase.openPreview")}
             </a>
           ) : null}
         </div>
@@ -53,10 +63,10 @@ export function ShowcaseDetailPage({
               className="showcase-runtime-frame"
               loading="eager"
               src={runtimeUrl}
-              title={`${item.title} 预览`}
+              title={t("showcase.previewTitle", { title: item.title })}
             />
           ) : (
-            <div className="showcase-empty">当前案例暂无可用 artifact。</div>
+            <div className="showcase-empty">{t("showcase.noArtifact")}</div>
           )}
         </div>
       </section>

@@ -69,7 +69,7 @@ describe("BrowserGitMigrationDialog", () => {
       />,
     );
 
-    await user.click(screen.getByRole("button", { name: "Migrate" }));
+    await user.click(screen.getByRole("button", { name: "迁移" }));
 
     expect(
       screen.getByRole("heading", { name: "迁移到 Browser Git" }),
@@ -102,7 +102,7 @@ describe("BrowserGitMigrationDialog", () => {
       />,
     );
 
-    await user.click(screen.getByRole("button", { name: "Migrate" }));
+    await user.click(screen.getByRole("button", { name: "迁移" }));
     await user.click(screen.getByRole("button", { name: "开始迁移" }));
 
     expect(await screen.findByText("迁移完成")).toBeVisible();
@@ -148,7 +148,7 @@ describe("BrowserGitMigrationDialog", () => {
       />,
     );
 
-    await user.click(screen.getByRole("button", { name: "Migrate" }));
+    await user.click(screen.getByRole("button", { name: "迁移" }));
     await user.click(screen.getByRole("button", { name: "开始迁移" }));
 
     expect(await screen.findByText("需要确认迁移状态")).toBeVisible();

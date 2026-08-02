@@ -7,6 +7,7 @@ import { FormEvent, useState } from "react";
 
 import { Button } from "@/components/ui/button";
 import type { ProjectDescription } from "@/domains/project/types";
+import { useUiI18n } from "@/infrastructure/i18n/ui";
 
 const templates = [
   { name: "Blank", className: "blank", available: true },
@@ -24,6 +25,7 @@ type CreateProjectResponse = {
 
 export function NewProjectPage() {
   const router = useRouter();
+  const { t } = useUiI18n();
   const [name, setName] = useState("Untitled project");
   const [storageKind, setStorageKind] = useState<"database" | "browser_git">(
     "database",
@@ -49,7 +51,7 @@ export function NewProjectPage() {
       const body = (await response.json()) as CreateProjectResponse;
 
       if (!response.ok || !body.project) {
-        throw new Error(body.error?.message ?? "项目创建失败，请稍后重试。");
+        throw new Error(body.error?.message ?? t("newProject.createFailed"));
       }
 
       // 使用服务端生成的 UUID 只导航一次；Browser Git 首次 provision claim
@@ -59,7 +61,7 @@ export function NewProjectPage() {
       setError(
         creationError instanceof Error
           ? creationError.message
-          : "项目创建失败，请稍后重试。",
+          : t("newProject.createFailed"),
       );
       setSubmitting(false);
     }
@@ -69,17 +71,20 @@ export function NewProjectPage() {
     <div className="create-page page-in">
       <section className="create-intro">
         <div>
-          <div className="eyebrow">New project / 01</div>
+          <div className="eyebrow">{t("newProject.eyebrow")}</div>
           <h1 className="font-editorial create-title">
-            Give the idea
-            <br />a place to live.
+            {t("newProject.title")
+              .split("\n")
+              .map((line) => (
+                <span key={line}>
+                  {line}
+                  <br />
+                </span>
+              ))}
           </h1>
-          <p className="create-lede">
-            创建一份干净的 Repository，再由你或 Agent 写入第一版代码。Preview
-            只会在需要运行时准备环境。
-          </p>
+          <p className="create-lede">{t("newProject.lede")}</p>
         </div>
-        <div className="create-steps" aria-label="创建进度">
+        <div className="create-steps" aria-label={t("newProject.steps")}>
           <i className="active" />
           <i />
           <i />
@@ -89,11 +94,11 @@ export function NewProjectPage() {
       <form className="create-form" onSubmit={createProject}>
         <div className="form-heading">
           <div>
-            <h2 className="font-editorial">Project setup</h2>
-            <p>选择一种 Repository。Browser Git 只保存在当前浏览器中。</p>
+            <h2 className="font-editorial">{t("newProject.setup")}</h2>
+            <p>{t("newProject.repositoryHint")}</p>
           </div>
           <Button
-            aria-label="关闭新建项目"
+            aria-label={t("newProject.close")}
             asChild
             size="icon-sm"
             variant="ghost"
@@ -106,7 +111,7 @@ export function NewProjectPage() {
 
         <div className="form-section">
           <label className="field-label" htmlFor="project-name">
-            Project name
+            {t("newProject.name")}
           </label>
           <input
             autoFocus
@@ -121,7 +126,7 @@ export function NewProjectPage() {
         </div>
 
         <div className="form-section">
-          <span className="field-label">Repository</span>
+          <span className="field-label">{t("newProject.repository")}</span>
           <div className="storage-options">
             <button
               aria-pressed={storageKind === "database"}
@@ -134,11 +139,11 @@ export function NewProjectPage() {
               <div className="storage-option-head">
                 <b>
                   <Database />
-                  Database
+                  {t("newProject.database")}
                 </b>
                 <span className="radio" />
               </div>
-              <p>代码保存在 PostgreSQL，刷新和跨会话访问时可恢复当前项目。</p>
+              <p>{t("newProject.databaseHint")}</p>
             </button>
             <button
               aria-pressed={storageKind === "browser_git"}
@@ -153,17 +158,17 @@ export function NewProjectPage() {
                   <GitBranch />
                   Browser Git
                 </b>
-                <span className="storage-coming-soon">Local only</span>
+                <span className="storage-coming-soon">
+                  {t("newProject.localOnly")}
+                </span>
               </div>
-              <p>
-                完整 Git 暂存、提交和历史保存在当前浏览器，清理站点数据会丢失。
-              </p>
+              <p>{t("newProject.browserGitHint")}</p>
             </button>
           </div>
         </div>
 
         <div className="form-section">
-          <span className="field-label">Starting point</span>
+          <span className="field-label">{t("newProject.startingPoint")}</span>
           <div className="template-strip">
             {templates.map((template) => (
               <button
@@ -177,25 +182,23 @@ export function NewProjectPage() {
                 <div className={`template-preview ${template.className}`} />
                 <span>
                   {template.name}
-                  {!template.available ? " · Later" : ""}
+                  {!template.available ? ` · ${t("newProject.later")}` : ""}
                 </span>
               </button>
             ))}
           </div>
-          <p className="field-hint">
-            Blank 不会预置示例文件；第一笔保存或 Agent 修改将创建 revision 1。
-          </p>
+          <p className="field-hint">{t("newProject.blankHint")}</p>
         </div>
 
         <div className="form-section">
           <label className="field-label" htmlFor="first-request">
-            First request
+            {t("newProject.firstRequest")}
           </label>
           <textarea
             className="field"
             disabled
             id="first-request"
-            placeholder="Agent workflow will be connected in a later milestone."
+            placeholder={t("newProject.firstRequestPlaceholder")}
           />
         </div>
 
@@ -207,7 +210,7 @@ export function NewProjectPage() {
 
         <div className="create-actions">
           <Button asChild variant="outline">
-            <Link href="/">Cancel</Link>
+            <Link href="/">{t("newProject.cancel")}</Link>
           </Button>
           <Button
             className="app-button-accent"
@@ -217,7 +220,7 @@ export function NewProjectPage() {
             {submitting ? (
               <LoaderCircle className="project-state-spinner" />
             ) : null}
-            {submitting ? "Creating..." : "Create project"}
+            {submitting ? t("newProject.creating") : t("newProject.create")}
             {!submitting ? <ArrowRight data-icon="inline-end" /> : null}
           </Button>
         </div>

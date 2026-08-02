@@ -9,6 +9,7 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import type { WorkspaceFile } from "@/domains/project/workspace";
+import { useUiI18n } from "@/infrastructure/i18n/ui";
 import { cn } from "@/lib/utils";
 
 export function EditorTabs({
@@ -24,8 +25,14 @@ export function EditorTabs({
   onClose: (path: string) => void;
   onSelect: (path: string) => void;
 }) {
+  const { t } = useUiI18n();
+
   return (
-    <div aria-label="已打开文件" className="editor-tabs" role="tablist">
+    <div
+      aria-label={t("workbench.openedFiles")}
+      className="editor-tabs"
+      role="tablist"
+    >
       {openPaths.map((path) => {
         const file = files[path];
 
@@ -42,12 +49,12 @@ export function EditorTabs({
           >
             <button onClick={() => onSelect(path)} type="button">
               <span>{path.split("/").at(-1)}</span>
-              {file.dirty ? <i aria-label="未保存" /> : null}
+              {file.dirty ? <i aria-label={t("workbench.unsaved")} /> : null}
             </button>
             <Tooltip>
               <TooltipTrigger asChild>
                 <Button
-                  aria-label={`关闭 ${path}`}
+                  aria-label={t("workbench.closeFile", { path })}
                   onClick={() => onClose(path)}
                   size="icon-xs"
                   variant="ghost"
@@ -55,7 +62,7 @@ export function EditorTabs({
                   <X />
                 </Button>
               </TooltipTrigger>
-              <TooltipContent>关闭标签</TooltipContent>
+              <TooltipContent>{t("workbench.closeTabTooltip")}</TooltipContent>
             </Tooltip>
           </div>
         );

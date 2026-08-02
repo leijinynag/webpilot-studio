@@ -2,7 +2,11 @@ allowBuilds:
   # Vite 仅把 esbuild 作为可选开发能力；当前构建链使用 Rolldown/Turbopack，
   # 明确禁止脚本可以让全新 CI 安装通过，同时避免执行不需要的二进制下载逻辑。
   esbuild: false
+  # Next 的 SWC 编译器和文件监听器需要在 Vercel 安装阶段完成原生二进制准备。
+  # 只允许这两个确定的构建依赖执行脚本，其他依赖继续保持默认拒绝。
+  "@parcel/watcher": true
   sharp: true
+  "@swc/core": true
   unrs-resolver: true
 minimumReleaseAgeExclude:
   - "@radix-ui/react-accessible-icon@1.1.15"

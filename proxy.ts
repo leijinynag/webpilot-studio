@@ -6,7 +6,15 @@ import {
   getAnonymousSessionCookieOptions,
   verifyAnonymousSession,
 } from "@/domains/auth/anonymous-session";
+import {
+  LOCALE_COOKIE_NAME,
+  resolveLocale,
+} from "@/infrastructure/i18n/locale";
 import { isShowcaseRuntimeOnlyPath } from "@/infrastructure/showcase/runtime-policy";
+import {
+  buildShowcaseRuntimeLandingHtml,
+  getShowcaseRuntimeLandingHeaders,
+} from "@/infrastructure/showcase/runtime-policy";
 
 /**
  * 页面首次访问即签发匿名会话，使后续客户端 API 请求可以直接恢复工作区。
@@ -19,21 +27,16 @@ export function proxy(request: NextRequest) {
     process.env.SHOWCASE_RUNTIME_ONLY === "true" &&
     !isShowcaseRuntimeOnlyPath(request.nextUrl.pathname)
   ) {
-    return NextResponse.json(
-      {
-        error: {
-          code: "SHOWCASE_RUNTIME_ONLY",
-          message: "该部署仅提供 Showcase Runtime。",
-        },
-      },
-      {
-        status: 404,
-        headers: {
-          "Cache-Control": "no-store",
-          "X-Content-Type-Options": "nosniff",
-        },
-      },
-    );
+    const locale = resolveLocale({
+      cookie: request.cookies.get(LOCALE_COOKIE_NAME)?.value,
+      acceptLanguage: request.headers.get("accept-language"),
+    });
+    const siteUrl = process.env.NEXT_PUBLIC_SITE_URL;
+
+    return new NextResponse(buildShowcaseRuntimeLandingHtml(locale, siteUrl), {
+      status: 404,
+      headers: getShowcaseRuntimeLandingHeaders(),
+    });
   }
 
   // Showcase Runtime 使用独立域名部署，不需要匿名 owner 身份。主站 host-only

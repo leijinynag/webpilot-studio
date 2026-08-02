@@ -23,6 +23,7 @@ import type {
   ProjectDescription,
   ProjectFileSnapshot,
 } from "@/domains/project/types";
+import { useUiI18n } from "@/infrastructure/i18n/ui";
 import { webContainerRuntimeManager } from "@/infrastructure/webcontainer/runtime-manager";
 
 export function PublishPage({
@@ -32,9 +33,10 @@ export function PublishPage({
   adminMode: boolean;
   project: ProjectDescription;
 }) {
+  const { t } = useUiI18n();
   const [buildState, setBuildState] = useState<BuildState>({
     phase: "idle",
-    message: "尚未构建",
+    message: t("publish.notBuilt"),
     detail: "",
   });
   const [dirtyPaths] = useState<string[]>(() => {
@@ -67,12 +69,12 @@ export function PublishPage({
   );
   const [candidateState, setCandidateState] = useState<CandidateState>({
     phase: "idle",
-    message: "尚未加载候选案例",
+    message: t("publish.candidatesNotLoaded"),
     detail: "",
   });
   const [publishState, setPublishState] = useState<PublishState>({
     phase: "idle",
-    message: "等待管理员发布",
+    message: t("publish.waitingForAdmin"),
     detail: "",
   });
 
@@ -84,7 +86,7 @@ export function PublishPage({
         const snapshot =
           project.storageKind === "browser_git"
             ? await loadBrowserGitSnapshot(project)
-            : await loadDatabaseSnapshot(project.id);
+            : await loadDatabaseSnapshot(project.id, t);
 
         if (!cancelled) {
           setRepositoryFiles(snapshot.files);
@@ -93,7 +95,10 @@ export function PublishPage({
             current.phase === "idle"
               ? {
                   ...current,
-                  detail: `${snapshot.files.length} 个文件 · revision ${snapshot.revision}`,
+                  detail: t("publish.repositorySnapshotDetail", {
+                    count: snapshot.files.length,
+                    revision: snapshot.revision,
+                  }),
                 }
               : current,
           );
@@ -102,9 +107,11 @@ export function PublishPage({
         if (!cancelled) {
           setBuildState({
             phase: "failed",
-            message: "无法读取当前 Repository",
+            message: t("publish.repositoryReadFailed"),
             detail:
-              error instanceof Error ? error.message : "请返回工作台重试。",
+              error instanceof Error
+                ? error.message
+                : t("publish.returnToWorkbenchRetry"),
           });
         }
       }
@@ -114,7 +121,7 @@ export function PublishPage({
     return () => {
       cancelled = true;
     };
-  }, [project]);
+  }, [project, t]);
 
   const canBuild = useMemo(
     () =>
@@ -146,7 +153,7 @@ export function PublishPage({
     if (dirtyPaths.length > 0) {
       setBuildState({
         phase: "blocked",
-        message: "存在未保存草稿",
+        message: t("publish.unsavedDraftsBlocked"),
         detail: dirtyPaths.join("、"),
       });
       return;
@@ -155,16 +162,16 @@ export function PublishPage({
     if (repositoryFiles.length === 0) {
       setBuildState({
         phase: "blocked",
-        message: "当前项目没有可构建文件",
-        detail: "请先在工作台创建并保存代码。",
+        message: t("publish.noBuildFiles"),
+        detail: t("publish.createAndSaveCode"),
       });
       return;
     }
 
     setBuildState({
       phase: "building",
-      message: "正在准备 production build",
-      detail: "仅在你点击此按钮后启动 WebContainer。",
+      message: t("publish.preparingBuild"),
+      detail: t("publish.buildOnlyAfterClick"),
     });
 
     try {
@@ -191,18 +198,20 @@ export function PublishPage({
 
       setBuildState({
         phase: "success",
-        message: "ZIP 已生成",
-        detail: `${result.manifest.files.length} 个文件 · ${formatBytes(
-          result.manifest.totalBytes,
-        )} · ${result.buildDurationMs}ms`,
+        message: t("publish.zipGenerated"),
+        detail: t("publish.buildResultDetail", {
+          count: result.manifest.files.length,
+          size: formatBytes(result.manifest.totalBytes),
+          duration: result.buildDurationMs,
+        }),
         result,
       });
     } catch (error) {
       setBuildState({
         phase: "failed",
-        message: "生产构建失败",
+        message: t("publish.productionBuildFailed"),
         detail:
-          error instanceof Error ? error.message : "请查看运行日志后重试。",
+          error instanceof Error ? error.message : t("publish.checkLogsRetry"),
       });
     }
   }
@@ -211,16 +220,16 @@ export function PublishPage({
     if (!buildState.result || !canPublish) {
       setPublishState({
         phase: "blocked",
-        message: "暂时不能发布",
-        detail: "请先完成 production build，并确认管理员设置有效。",
+        message: t("publish.cannotPublish"),
+        detail: t("publish.completeBuildAndCheckAdmin"),
       });
       return;
     }
 
     setPublishState({
       phase: "publishing",
-      message: "正在发布 Showcase",
-      detail: "正在上传不可变 artifact 并写入发布元数据。",
+      message: t("publish.publishing"),
+      detail: t("publish.uploadingArtifact"),
     });
 
     try {
@@ -253,25 +262,27 @@ export function PublishPage({
       };
 
       if (!response.ok || !body.case) {
-        throw new Error(body.error?.message ?? "Showcase 发布失败。");
+        throw new Error(body.error?.message ?? t("publish.publishFailed"));
       }
 
       setPublishState({
         phase: "success",
-        message: "Showcase 已发布",
-        detail: `公开地址：/showcase/${body.case.slug}`,
+        message: t("publish.published"),
+        detail: t("publish.publicAddress", { slug: body.case.slug }),
       });
       setPublishCaseId(body.case.id);
       setCandidateState((current) => ({
         ...current,
-        message: "候选案例已更新",
+        message: t("publish.candidatesUpdated"),
       }));
     } catch (error) {
       setPublishState({
         phase: "failed",
-        message: "Showcase 发布失败",
+        message: t("publish.publishFailed"),
         detail:
-          error instanceof Error ? error.message : "请检查管理 token 后重试。",
+          error instanceof Error
+            ? error.message
+            : t("publish.checkAdminTokenRetry"),
       });
     }
   }
@@ -281,16 +292,16 @@ export function PublishPage({
     if (!adminMode || !token) {
       setCandidateState({
         phase: "blocked",
-        message: "需要管理员 token",
-        detail: "候选案例接口不会接受匿名请求。",
+        message: t("publish.adminTokenRequired"),
+        detail: t("publish.candidatesAnonymousBlocked"),
       });
       return;
     }
 
     setCandidateState({
       phase: "loading",
-      message: "正在读取管理员候选",
-      detail: "只读取发布元数据，不读取其他项目源码。",
+      message: t("publish.loadingCandidates"),
+      detail: t("publish.metadataOnly"),
     });
 
     try {
@@ -306,7 +317,9 @@ export function PublishPage({
       };
 
       if (!response.ok || !body.cases) {
-        throw new Error(body.error?.message ?? "管理员候选读取失败。");
+        throw new Error(
+          body.error?.message ?? t("publish.candidatesLoadFailed"),
+        );
       }
 
       setAdminCandidates(body.cases);
@@ -328,18 +341,18 @@ export function PublishPage({
       setCandidateState({
         phase: "success",
         message: currentCase
-          ? "已找到当前项目的 Showcase 案例"
-          : "已加载候选案例",
-        detail: `${body.cases.length} 个案例可管理。`,
+          ? t("publish.currentCaseFound")
+          : t("publish.candidatesLoaded"),
+        detail: t("publish.casesManageable", { count: body.cases.length }),
       });
     } catch (error) {
       setCandidateState({
         phase: "failed",
-        message: "候选案例读取失败",
+        message: t("publish.candidatesLoadFailed"),
         detail:
           error instanceof Error
             ? error.message
-            : "请检查管理员 token 后重试。",
+            : t("publish.checkAdminTokenRetry"),
       });
     }
   }
@@ -348,16 +361,16 @@ export function PublishPage({
     if (!publishCaseId || !adminToken.trim()) {
       setCandidateState({
         phase: "blocked",
-        message: "暂时不能撤销",
-        detail: "请先加载当前项目的 Showcase 案例。",
+        message: t("publish.cannotRevoke"),
+        detail: t("publish.loadCurrentCaseFirst"),
       });
       return;
     }
 
     setCandidateState({
       phase: "loading",
-      message: "正在撤销 Showcase",
-      detail: "撤销后，公开列表、详情页和 Runtime 会立即停止新增访问。",
+      message: t("publish.revoking"),
+      detail: t("publish.revokeEffect"),
     });
 
     try {
@@ -375,7 +388,7 @@ export function PublishPage({
       };
 
       if (!response.ok) {
-        throw new Error(body.error?.message ?? "Showcase 撤销失败。");
+        throw new Error(body.error?.message ?? t("publish.revokeFailed"));
       }
 
       setAdminCandidates((current) =>
@@ -387,17 +400,17 @@ export function PublishPage({
       );
       setCandidateState({
         phase: "success",
-        message: "Showcase 已撤销",
-        detail: "重新发布时会创建新的不可变 artifact。",
+        message: t("publish.revoked"),
+        detail: t("publish.republishCreatesArtifact"),
       });
     } catch (error) {
       setCandidateState({
         phase: "failed",
-        message: "Showcase 撤销失败",
+        message: t("publish.revokeFailed"),
         detail:
           error instanceof Error
             ? error.message
-            : "请检查管理员 token 后重试。",
+            : t("publish.checkAdminTokenRetry"),
       });
     }
   }
@@ -406,17 +419,23 @@ export function PublishPage({
     <div className="publish-page page-in">
       <section className="publish-preview">
         <div className="publish-preview-head">
-          <b>Publish preview</b>
+          <b>{t("publish.preview")}</b>
           <ToggleGroup
-            aria-label="预览设备"
+            aria-label={t("publish.previewDevice")}
             className="device-switch"
             defaultValue="desktop"
             type="single"
           >
-            <ToggleGroupItem aria-label="桌面预览" value="desktop">
+            <ToggleGroupItem
+              aria-label={t("publish.desktopPreview")}
+              value="desktop"
+            >
               <span className="desktop-device-icon" />
             </ToggleGroupItem>
-            <ToggleGroupItem aria-label="移动端预览" value="mobile">
+            <ToggleGroupItem
+              aria-label={t("publish.mobilePreview")}
+              value="mobile"
+            >
               <Smartphone />
             </ToggleGroupItem>
           </ToggleGroup>
@@ -425,20 +444,27 @@ export function PublishPage({
           <PreviewSite />
         </div>
         <div className="build-status">
-          <BuildStep label="Production build" state={buildState.phase} />
+          <BuildStep
+            label={t("publish.productionBuild")}
+            state={buildState.phase}
+          />
           <BuildStep
             label={
               buildState.result
-                ? `${buildState.result.manifest.files.length} assets collected`
-                : "Assets collected"
+                ? t("publish.assetsCollectedCount", {
+                    count: buildState.result.manifest.files.length,
+                  })
+                : t("publish.assetsCollected")
             }
             state={buildState.result ? "success" : "idle"}
           />
           <BuildStep
             label={
               buildState.result
-                ? `${formatBytes(buildState.result.manifest.totalBytes)} ZIP`
-                : "ZIP export"
+                ? t("publish.zipSize", {
+                    size: formatBytes(buildState.result.manifest.totalBytes),
+                  })
+                : t("publish.zipExport")
             }
             state={buildState.result ? "success" : "idle"}
           />
@@ -446,20 +472,18 @@ export function PublishPage({
       </section>
 
       <section className="publish-settings">
-        <div className="eyebrow">Showcase / Publish</div>
+        <div className="eyebrow">{t("publish.eyebrow")}</div>
         <h1 className="font-editorial publish-title">
-          Ready for
+          {t("publish.title").split("\n")[0]}
           <br />
-          the outside world.
+          {t("publish.title").split("\n")[1]}
         </h1>
-        <p>
-          发布的是经过生产构建的静态产物，不会在服务端执行项目源码。发布后可以随时撤销或更新。
-        </p>
+        <p>{t("publish.description")}</p>
 
         <div className="publish-form-grid">
           <div className="wide">
             <label className="field-label" htmlFor="publish-title">
-              Title
+              {t("publish.titleLabel")}
             </label>
             <input
               className="field"
@@ -470,7 +494,7 @@ export function PublishPage({
           </div>
           <div className="wide">
             <label className="field-label" htmlFor="publish-description">
-              Description
+              {t("publish.descriptionLabel")}
             </label>
             <textarea
               className="field"
@@ -481,7 +505,7 @@ export function PublishPage({
           </div>
           <div className="wide">
             <label className="field-label" htmlFor="public-url">
-              Public URL
+              {t("publish.publicUrl")}
             </label>
             <div className="slug-field">
               <span className="slug-prefix">webpilot.studio/showcase/</span>
@@ -494,22 +518,20 @@ export function PublishPage({
             </div>
           </div>
           <div className="wide">
-            <span className="field-label">Cover</span>
+            <span className="field-label">{t("publish.cover")}</span>
             <div className="cover-picker">
               <div className="cover-thumb" />
               <div className="cover-copy">
-                <b>Current preview capture</b>
-                <span>
-                  1440 × 900 · Captured after the latest successful browser run.
-                </span>
+                <b>{t("publish.coverCapture")}</b>
+                <span>{t("publish.coverCaptureDetail")}</span>
               </div>
             </div>
             {adminMode ? (
               <input
-                aria-label="Showcase cover URL"
+                aria-label={t("publish.coverUrl")}
                 className="field cover-url-field"
                 onChange={(event) => setPublishCoverUrl(event.target.value)}
-                placeholder="可选：公开封面图片 URL"
+                placeholder={t("publish.coverUrlPlaceholder")}
                 type="url"
                 value={publishCoverUrl}
               />
@@ -519,7 +541,7 @@ export function PublishPage({
             <>
               <div>
                 <label className="field-label" htmlFor="publish-sort-order">
-                  Sort order
+                  {t("publish.sortOrder")}
                 </label>
                 <input
                   className="field"
@@ -532,19 +554,19 @@ export function PublishPage({
               </div>
               <div>
                 <label className="field-label" htmlFor="showcase-admin-token">
-                  Admin token
+                  {t("publish.adminToken")}
                 </label>
                 <div className="admin-token-row">
                   <input
                     className="field"
                     id="showcase-admin-token"
                     onChange={(event) => setAdminToken(event.target.value)}
-                    placeholder="仅本次请求使用"
+                    placeholder={t("publish.adminTokenPlaceholder")}
                     type="password"
                     value={adminToken}
                   />
                   <Button
-                    aria-label="加载 Showcase 候选"
+                    aria-label={t("publish.loadCandidates")}
                     className="app-button-quiet"
                     disabled={
                       candidateState.phase === "loading" ||
@@ -552,7 +574,7 @@ export function PublishPage({
                     }
                     onClick={() => void handleLoadCandidates()}
                     size="icon"
-                    title="加载 Showcase 候选"
+                    title={t("publish.loadCandidates")}
                   >
                     {candidateState.phase === "loading" ? (
                       <LoaderCircle className="animate-spin" />
@@ -568,21 +590,28 @@ export function PublishPage({
 
         <div className="publish-checks">
           <CheckRow
-            label="Repository snapshot"
+            label={t("publish.repositorySnapshot")}
             value={
-              repositoryFiles.length > 0 ? `r${repositoryRevision}` : "Loading"
+              repositoryFiles.length > 0
+                ? `r${repositoryRevision}`
+                : t("publish.loading")
             }
           />
           <CheckRow
-            label="Unsaved Monaco drafts"
+            label={t("publish.unsavedDrafts")}
             value={
-              dirtyPaths.length === 0 ? "0" : `${dirtyPaths.length} blocked`
+              dirtyPaths.length === 0
+                ? "0"
+                : t("publish.blockedDrafts", { count: dirtyPaths.length })
             }
           />
-          <CheckRow label="Build status" value={buildState.message} />
           <CheckRow
-            label="Entry file"
-            value={buildState.result ? "index.html" : "Pending"}
+            label={t("publish.buildStatus")}
+            value={buildState.message}
+          />
+          <CheckRow
+            label={t("publish.entryFile")}
+            value={buildState.result ? "index.html" : t("publish.pending")}
           />
         </div>
         <div className="publish-build-feedback" role="status">
@@ -592,8 +621,8 @@ export function PublishPage({
         <div className="publish-actions">
           <span>
             {buildState.result
-              ? "ZIP ready to review"
-              : "Explicit build required"}
+              ? t("publish.zipReady")
+              : t("publish.explicitBuild")}
           </span>
           <Button
             className="app-button-accent"
@@ -609,10 +638,10 @@ export function PublishPage({
               <ExternalLink data-icon="inline-start" />
             )}
             {buildState.phase === "building"
-              ? "Building..."
+              ? t("publish.building")
               : buildState.result
-                ? "Build again"
-                : "Build & download ZIP"}
+                ? t("publish.buildAgain")
+                : t("publish.buildDownload")}
           </Button>
         </div>
         {adminMode ? (
@@ -620,14 +649,11 @@ export function PublishPage({
             <div className="showcase-admin-panel-head">
               <span>
                 <LockKeyhole aria-hidden="true" />
-                Showcase admin mode
+                {t("publish.adminMode")}
               </span>
-              <small>普通匿名访问不会显示此区域</small>
+              <small>{t("publish.adminHint")}</small>
             </div>
-            <p>
-              发布会复用当前已完成的 production
-              artifact，不会重新安装依赖或执行第二次构建。
-            </p>
+            <p>{t("publish.adminDescription")}</p>
             <Button
               className="app-button-accent"
               disabled={!canPublish}
@@ -645,10 +671,10 @@ export function PublishPage({
                 <Send data-icon="inline-start" />
               )}
               {publishState.phase === "publishing"
-                ? "Publishing..."
+                ? t("publish.publishing")
                 : publishState.phase === "success"
-                  ? "Published"
-                  : "Publish Showcase"}
+                  ? t("publish.published")
+                  : t("publish.publish")}
             </Button>
             <div className="publish-build-feedback" role="status">
               <b>{publishState.message}</b>
@@ -661,8 +687,10 @@ export function PublishPage({
             {adminCandidates.length > 0 ? (
               <div className="showcase-candidate-list">
                 <div className="showcase-candidate-list-head">
-                  <span>Candidate cases</span>
-                  <small>{adminCandidates.length} total</small>
+                  <span>{t("publish.candidateCases")}</span>
+                  <small>
+                    {t("publish.total", { count: adminCandidates.length })}
+                  </small>
                 </div>
                 {adminCandidates.map((item) => (
                   <button
@@ -693,7 +721,7 @@ export function PublishPage({
                     <span className="showcase-candidate-revision">
                       {item.artifact
                         ? `r${item.artifact.sourceRevision}`
-                        : "no artifact"}
+                        : t("publish.noArtifact")}
                     </span>
                   </button>
                 ))}
@@ -711,13 +739,13 @@ export function PublishPage({
                 variant="outline"
               >
                 <Ban data-icon="inline-start" />
-                Revoke current Showcase
+                {t("publish.revoke")}
               </Button>
             ) : null}
           </div>
         ) : null}
         <Link className="back-to-workbench" href={`/p/${project.id}`}>
-          返回 Agent 工作台
+          {t("publish.backToWorkbench")}
         </Link>
       </section>
     </div>
@@ -754,7 +782,10 @@ type BuildState = {
   >;
 };
 
-async function loadDatabaseSnapshot(projectId: string) {
+async function loadDatabaseSnapshot(
+  projectId: string,
+  translate: (key: string) => string,
+) {
   const response = await fetch(`/api/projects/${projectId}/files`, {
     cache: "no-store",
   });
@@ -764,12 +795,14 @@ async function loadDatabaseSnapshot(projectId: string) {
   };
 
   if (!response.ok || !body.files) {
-    throw new Error(body.error?.message ?? "数据库 Repository 读取失败。");
+    throw new Error(
+      body.error?.message ?? translate("publish.databaseRepositoryReadFailed"),
+    );
   }
 
   return {
     files: body.files,
-    revision: await loadProjectRevision(projectId),
+    revision: await loadProjectRevision(projectId, translate),
   };
 }
 
@@ -783,7 +816,10 @@ async function loadBrowserGitSnapshot(project: ProjectDescription) {
   return { files, revision: description.revision };
 }
 
-async function loadProjectRevision(projectId: string): Promise<number> {
+async function loadProjectRevision(
+  projectId: string,
+  translate: (key: string) => string,
+): Promise<number> {
   const response = await fetch(`/api/projects/${projectId}`, {
     cache: "no-store",
   });
@@ -793,7 +829,9 @@ async function loadProjectRevision(projectId: string): Promise<number> {
   };
 
   if (!response.ok || !body.project) {
-    throw new Error(body.error?.message ?? "项目 revision 读取失败。");
+    throw new Error(
+      body.error?.message ?? translate("publish.projectRevisionReadFailed"),
+    );
   }
 
   return body.project.revision;

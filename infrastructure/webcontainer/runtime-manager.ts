@@ -928,10 +928,20 @@ async function readDirectoryTree(
   parentPath = "",
   files: Array<{ path: string; content: Uint8Array }> = [],
 ): Promise<Array<{ path: string; content: Uint8Array }>> {
-  const entries = await instance.fs.readdir(directory, { withFileTypes: true });
+  // WebContainer 的 readdir 不会携带父级上下文。递归进入子目录时必须读取
+  // 当前绝对目录，否则会重复读取 dist 根目录，并把 index.html 等根文件错误地
+  // 拼成 dist/static/index.html。
+  const currentDirectory = parentPath
+    ? `${directory}/${parentPath}`
+    : directory;
+  const entries = await instance.fs.readdir(currentDirectory, {
+    withFileTypes: true,
+  });
 
   for (const entry of entries) {
-    const relativePath = parentPath ? `${parentPath}/${entry.name}` : entry.name;
+    const relativePath = parentPath
+      ? `${parentPath}/${entry.name}`
+      : entry.name;
     const absolutePath = `${directory}/${relativePath}`;
 
     if (entry.isDirectory()) {

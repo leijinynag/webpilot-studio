@@ -29,8 +29,12 @@ SHOWCASE_RUNTIME_ONLY=true
 - `SHOWCASE_ADMIN_TOKEN`
 
 `SHOWCASE_RUNTIME_ONLY=true` 是第二个 Vercel Project 的强制边界。它会让
-`/showcase/runtime/:artifactId/*` 和 `/_next/*` 之外的请求返回 404，因此不会
+`/showcase/runtime/:artifactId/*`、`/health` 和 `/_next/*` 之外的请求返回 404，因此不会
 把主站页面、Agent API 或管理员发布接口一起部署成第二个公开入口。
+
+部署验收可以访问 `/health`：主站应返回
+`deployment: "primary"`，Showcase 项目应返回
+`deployment: "showcase-runtime"`。该接口不访问数据库和 Blob，也不会暴露密钥。
 
 `DATABASE_URL` 应使用只允许读取 `showcase_cases` 和
 `showcase_artifacts` 的 PostgreSQL 角色。Vercel Blob SDK 的私有读取仍使用

@@ -1,9 +1,14 @@
 import type { Metadata } from "next";
 import { Geist, Instrument_Serif } from "next/font/google";
 import Script from "next/script";
+import { NextIntlClientProvider } from "next-intl";
 
 import { ThemeProvider } from "@/components/theme/theme-provider";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { UiI18nProvider } from "@/infrastructure/i18n/ui";
+import { localeToHtmlLang } from "@/infrastructure/i18n/locale";
+import { getRequestLocale } from "@/infrastructure/i18n/request-locale";
+import { getMessages } from "@/infrastructure/i18n/messages";
 
 import "./globals.css";
 
@@ -23,14 +28,17 @@ export const metadata: Metadata = {
   description: "An agentic web IDE for building and verifying React projects.",
 };
 
-export default function RootLayout({
+export default async function RootLayout({
   children,
 }: Readonly<{
   children: React.ReactNode;
 }>) {
+  const locale = await getRequestLocale();
+  const messages = getMessages(locale);
+
   return (
     <html
-      lang="zh-CN"
+      lang={localeToHtmlLang(locale)}
       className={`${geist.variable} ${instrumentSerif.variable}`}
       suppressHydrationWarning
     >
@@ -60,9 +68,13 @@ export default function RootLayout({
         </Script>
       </head>
       <body>
-        <ThemeProvider>
-          <TooltipProvider>{children}</TooltipProvider>
-        </ThemeProvider>
+        <NextIntlClientProvider locale={locale} messages={messages}>
+          <UiI18nProvider locale={locale} messages={messages}>
+            <ThemeProvider>
+              <TooltipProvider>{children}</TooltipProvider>
+            </ThemeProvider>
+          </UiI18nProvider>
+        </NextIntlClientProvider>
       </body>
     </html>
   );
