@@ -1,6 +1,6 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 
-import { and, asc, desc, eq, isNull, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, sql } from "drizzle-orm";
 import type { PgDatabase } from "drizzle-orm/pg-core";
 import type {
   PgQueryResultHKT,
@@ -10,11 +10,18 @@ import type { ExtractTablesWithRelations } from "drizzle-orm/relations";
 
 import {
   browserGitMigrationSessions,
+  agentRunEvents,
+  agentRuns,
+  chatAttachments,
+  imageJobs,
+  imageRuns,
   projectFileBlobs,
+  projectAssets,
   projectFiles,
   projectRevisionFiles,
   projectRevisions,
   projects,
+  toolInvocations,
 } from "@/infrastructure/db/schema";
 import { serializeMigrationManifest } from "@/domains/project/migration-manifest";
 import { PROJECT_ERROR_CODES, ProjectError } from "@/domains/project/errors";
@@ -33,6 +40,8 @@ import type {
   ProjectSummary,
 } from "@/domains/project/types";
 import { databaseSchema } from "@/infrastructure/db/schema";
+import { getPrivateBlobStore } from "@/infrastructure/blob/private-store";
+import { AGENT_ERROR_CODES } from "@/domains/agent/errors";
 
 type RelationalSchema = ExtractTablesWithRelations<typeof databaseSchema>;
 type DatabaseLike<TQueryResult extends PgQueryResultHKT> = PgDatabase<
@@ -292,35 +301,242 @@ export class DatabaseProjectRepository<
     ownerId: string;
     projectId: string;
   }): Promise<void> {
-    const project = await this.getProject(input);
+    const pathnames = await this.db.transaction(async (tx) => {
+      // 项目行是上传、文件 mutation 和异步 Worker 共同使用的并发闸门。
+      // 删除先锁住它，确保本事务看到的是一份稳定的资产引用快照。
+      const [project] = await tx
+        .select()
+        .from(projects)
+        .where(
+          and(
+            eq(projects.id, input.projectId),
+            eq(projects.ownerId, input.ownerId),
+            isNull(projects.deletedAt),
+          ),
+        )
+        .for("update");
 
-    await this.db
-      .update(projects)
-      .set({ deletedAt: new Date(), updatedAt: new Date() })
-      .where(
-        and(eq(projects.id, project.id), eq(projects.ownerId, input.ownerId)),
-      );
+      if (!project) {
+        throw new ProjectError(
+          PROJECT_ERROR_CODES.projectDeleted,
+          "项目不存在、已删除或不属于当前匿名工作区。",
+          404,
+        );
+      }
+
+      const activeAttachments = await tx
+        .select({ pathname: chatAttachments.blobPathname })
+        .from(chatAttachments)
+        .where(
+          and(
+            eq(chatAttachments.projectId, project.id),
+            eq(chatAttachments.ownerId, input.ownerId),
+            isNull(chatAttachments.deletedAt),
+          ),
+        );
+      const activeAssets = await tx
+        .select({ pathname: projectAssets.blobPathname })
+        .from(projectAssets)
+        .where(
+          and(
+            eq(projectAssets.projectId, project.id),
+            eq(projectAssets.ownerId, input.ownerId),
+            isNull(projectAssets.deletedAt),
+          ),
+        );
+
+      const now = new Date();
+      await tx
+        .update(chatAttachments)
+        .set({ status: "deleted", deletedAt: now, updatedAt: now })
+        .where(
+          and(
+            eq(chatAttachments.projectId, project.id),
+            eq(chatAttachments.ownerId, input.ownerId),
+            isNull(chatAttachments.deletedAt),
+          ),
+        );
+      await tx
+        .update(projectAssets)
+        .set({ deletedAt: now })
+        .where(
+          and(
+            eq(projectAssets.projectId, project.id),
+            eq(projectAssets.ownerId, input.ownerId),
+            isNull(projectAssets.deletedAt),
+          ),
+        );
+
+      // 删除项目时，队列中的任务不再有业务意义。取消状态会让已经失去
+      // lease 的旧 Worker 无法再次提交成功结果，也便于后台清理任务统计。
+      await tx
+        .update(imageJobs)
+        .set({
+          status: "cancelled",
+          leaseId: null,
+          leaseExpiresAt: null,
+          nextAttemptAt: null,
+          completedAt: now,
+          updatedAt: now,
+        })
+        .where(
+          and(
+            eq(imageJobs.projectId, project.id),
+            eq(imageJobs.ownerId, input.ownerId),
+            inArray(imageJobs.status, ["queued", "running", "retryable"]),
+          ),
+        );
+      await tx
+        .update(imageRuns)
+        .set({
+          status: "cancelled",
+          errorCode: AGENT_ERROR_CODES.cancelled,
+          errorMessage: "项目已删除，图片生成任务已取消。",
+          completedAt: now,
+          updatedAt: now,
+        })
+        .where(
+          and(
+            eq(imageRuns.projectId, project.id),
+            eq(imageRuns.ownerId, input.ownerId),
+            inArray(imageRuns.status, ["queued", "running"]),
+          ),
+        );
+
+      const activeRuns = await tx
+        .select({
+          id: agentRuns.id,
+          status: agentRuns.status,
+        })
+        .from(agentRuns)
+        .where(
+          and(
+            eq(agentRuns.projectId, project.id),
+            eq(agentRuns.ownerId, input.ownerId),
+            inArray(agentRuns.status, [
+              "queued",
+              "running",
+              "awaiting_client_tool",
+              "awaiting_async_job",
+            ]),
+          ),
+        );
+      if (activeRuns.length > 0) {
+        const runIds = activeRuns.map((run) => run.id);
+        await tx
+          .update(toolInvocations)
+          .set({
+            status: "cancelled",
+            errorCode: AGENT_ERROR_CODES.cancelled,
+            completedAt: now,
+          })
+          .where(
+            and(
+              inArray(toolInvocations.runId, runIds),
+              eq(toolInvocations.status, "running"),
+            ),
+          );
+        await tx
+          .update(agentRuns)
+          .set({
+            status: "cancelled",
+            cancellationRequestedAt: now,
+            errorCode: AGENT_ERROR_CODES.cancelled,
+            errorMessage: "项目已删除，Agent Run 已取消。",
+            completedAt: now,
+            updatedAt: now,
+          })
+          .where(
+            and(
+              inArray(agentRuns.id, runIds),
+              inArray(agentRuns.status, [
+                "queued",
+                "running",
+                "awaiting_client_tool",
+                "awaiting_async_job",
+              ]),
+            ),
+          );
+        await tx.insert(agentRunEvents).values(
+          activeRuns.map((run) => ({
+            runId: run.id,
+            type: "run.status_changed",
+            payload: {
+              previousStatus: run.status,
+              status: "cancelled",
+              reason: "project_deleted",
+            },
+          })),
+        );
+      }
+
+      await tx
+        .update(projects)
+        .set({ deletedAt: now, updatedAt: now })
+        .where(
+          and(
+            eq(projects.id, project.id),
+            eq(projects.ownerId, input.ownerId),
+            isNull(projects.deletedAt),
+          ),
+        );
+
+      return [
+        ...activeAttachments.map((row) => row.pathname),
+        ...activeAssets.map((row) => row.pathname),
+      ];
+    });
+
+    // Blob 不参与数据库事务。提交成功后再按当前引用检查删除，清理失败只记日志，
+    // 让“项目已删除”这个用户可见事实不被存储服务故障阻断。
+    await Promise.all(
+      [...new Set(pathnames)].map((pathname) =>
+        this.deleteProjectBlobIfUnreferenced(pathname),
+      ),
+    );
   }
 
   async restoreProject(input: {
     ownerId: string;
     projectId: string;
   }): Promise<void> {
-    const project = await this.getProject({
-      ...input,
-      includeDeleted: true,
+    await this.db.transaction(async (tx) => {
+      const [project] = await tx
+        .select()
+        .from(projects)
+        .where(
+          and(
+            eq(projects.id, input.projectId),
+            eq(projects.ownerId, input.ownerId),
+          ),
+        )
+        .for("update");
+
+      if (!project) {
+        throw new ProjectError(
+          PROJECT_ERROR_CODES.projectNotFound,
+          "项目不存在或不属于当前匿名工作区。",
+          404,
+        );
+      }
+
+      if (!project.deletedAt) {
+        return;
+      }
+
+      // 资产和附件的 deletedAt/status 不在恢复流程中回滚，避免重新暴露
+      // 已被用户删除或已经被清理的私有对象。
+      await tx
+        .update(projects)
+        .set({ deletedAt: null, updatedAt: new Date() })
+        .where(
+          and(
+            eq(projects.id, project.id),
+            eq(projects.ownerId, input.ownerId),
+            sql`${projects.deletedAt} is not null`,
+          ),
+        );
     });
-
-    if (!project.deletedAt) {
-      return;
-    }
-
-    await this.db
-      .update(projects)
-      .set({ deletedAt: null, updatedAt: new Date() })
-      .where(
-        and(eq(projects.id, project.id), eq(projects.ownerId, input.ownerId)),
-      );
   }
 
   async claimBrowserGitProvision(input: {
@@ -1138,6 +1354,42 @@ export class DatabaseProjectRepository<
     }
 
     return project;
+  }
+
+  private async deleteProjectBlobIfUnreferenced(
+    pathname: string,
+  ): Promise<void> {
+    const [activeAttachment] = await this.db
+      .select({ id: chatAttachments.id })
+      .from(chatAttachments)
+      .where(
+        and(
+          eq(chatAttachments.blobPathname, pathname),
+          isNull(chatAttachments.deletedAt),
+        ),
+      )
+      .limit(1);
+    const [activeAsset] = await this.db
+      .select({ id: projectAssets.id })
+      .from(projectAssets)
+      .where(
+        and(
+          eq(projectAssets.blobPathname, pathname),
+          isNull(projectAssets.deletedAt),
+        ),
+      )
+      .limit(1);
+
+    if (activeAttachment || activeAsset) {
+      return;
+    }
+
+    try {
+      await getPrivateBlobStore().del(pathname);
+    } catch (error) {
+      // 数据库事实已经提交，Blob 清理失败交给后续定时任务重试。
+      console.error("[project-delete-blob-cleanup]", { pathname, error });
+    }
   }
 
   private assertBrowserGitProject(project: typeof projects.$inferSelect) {

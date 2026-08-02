@@ -136,6 +136,28 @@ export async function createImageAttachments(input: {
       pendingPathnames.add(pathname);
 
       const result = await runDatabaseTransaction(async (transaction) => {
+        // Blob 已经写入，但数据库记录尚未提交。这里锁项目并再次检查 active，
+        // 与项目删除共用同一把行锁，避免删除事务完成后又出现迟到附件。
+        const [activeProject] = await transaction
+          .select({ id: projects.id })
+          .from(projects)
+          .where(
+            and(
+              eq(projects.id, input.projectId),
+              eq(projects.ownerId, input.ownerId),
+              isNull(projects.deletedAt),
+            ),
+          )
+          .for("update");
+
+        if (!activeProject) {
+          throw new ImageError(
+            IMAGE_ERROR_CODES.projectNotFound,
+            "项目已删除，无法保存图片附件。",
+            404,
+          );
+        }
+
         const [attachment] = await transaction
           .insert(chatAttachments)
           .values({

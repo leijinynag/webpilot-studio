@@ -1,9 +1,9 @@
 import "server-only";
 
-import { and, eq, lte, or, sql } from "drizzle-orm";
+import { and, eq, isNull, lte, or, sql } from "drizzle-orm";
 
 import { IMAGE_ERROR_CODES, ImageError } from "@/domains/image/errors";
-import { imageJobs, imageRuns } from "@/infrastructure/db/schema";
+import { imageJobs, imageRuns, projects } from "@/infrastructure/db/schema";
 import {
   getDatabase,
   runDatabaseTransaction,
@@ -41,6 +41,14 @@ export async function claimImageJob(input?: {
       })
       .from(imageJobs)
       .innerJoin(imageRuns, eq(imageRuns.id, imageJobs.imageRunId))
+      .innerJoin(
+        projects,
+        and(
+          eq(projects.id, imageJobs.projectId),
+          eq(projects.ownerId, imageJobs.ownerId),
+          isNull(projects.deletedAt),
+        ),
+      )
       .where(
         and(
           input?.expectedJobId
@@ -211,6 +219,53 @@ export async function markImageJobSucceeded(input: {
 }): Promise<void> {
   const now = new Date();
   await runDatabaseTransaction(async (tx) => {
+    const [current] = await tx
+      .select({
+        id: imageJobs.id,
+        imageRunId: imageJobs.imageRunId,
+        projectId: imageJobs.projectId,
+        ownerId: imageJobs.ownerId,
+      })
+      .from(imageJobs)
+      .where(
+        and(
+          eq(imageJobs.id, input.imageJobId),
+          eq(imageJobs.status, "running"),
+          eq(imageJobs.leaseId, input.leaseId),
+        ),
+      )
+      .for("update");
+
+    if (!current) {
+      throw new ImageError(
+        IMAGE_ERROR_CODES.generationJobNotFound,
+        "图片任务租约已失效，无法提交成功结果。",
+        409,
+      );
+    }
+
+    // 项目删除与 Worker 完成共用项目行锁。只有项目仍然 active，当前租约
+    // 才能把 image job/run 提交为成功；否则删除事务保留 cancelled 事实。
+    const [activeProject] = await tx
+      .select({ id: projects.id })
+      .from(projects)
+      .where(
+        and(
+          eq(projects.id, current.projectId),
+          eq(projects.ownerId, current.ownerId),
+          isNull(projects.deletedAt),
+        ),
+      )
+      .for("update");
+
+    if (!activeProject) {
+      throw new ImageError(
+        IMAGE_ERROR_CODES.generationJobNotFound,
+        "项目已删除，图片任务不能提交成功结果。",
+        409,
+      );
+    }
+
     const [job] = await tx
       .update(imageJobs)
       .set({
@@ -223,29 +278,35 @@ export async function markImageJobSucceeded(input: {
       })
       .where(
         and(
-          eq(imageJobs.id, input.imageJobId),
+          eq(imageJobs.id, current.id),
           eq(imageJobs.status, "running"),
           eq(imageJobs.leaseId, input.leaseId),
         ),
       )
       .returning({ imageRunId: imageJobs.imageRunId });
 
-    if (!job) {
-      throw new ImageError(
-        IMAGE_ERROR_CODES.generationJobNotFound,
-        "图片任务租约已失效，无法提交成功结果。",
-        409,
-      );
-    }
-
-    await tx
+    const [completedRun] = await tx
       .update(imageRuns)
       .set({
         status: "succeeded",
         completedAt: now,
         updatedAt: now,
       })
-      .where(eq(imageRuns.id, job.imageRunId));
+      .where(
+        and(
+          eq(imageRuns.id, job.imageRunId),
+          eq(imageRuns.status, "running"),
+        ),
+      )
+      .returning({ id: imageRuns.id });
+
+    if (!completedRun) {
+      throw new ImageError(
+        IMAGE_ERROR_CODES.generationJobNotFound,
+        "图片任务状态已变化，无法提交成功结果。",
+        409,
+      );
+    }
   });
 }
 
