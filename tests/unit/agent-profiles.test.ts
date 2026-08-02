@@ -35,7 +35,7 @@ describe("Agent profiles", () => {
     expect(profile.promptDigest).toMatch(/^[a-f0-9]{64}$/);
     expect(profile.toolsetDigest).toMatch(/^[a-f0-9]{64}$/);
     expect(profile.promptProfile).toBe("webpilot-system-v5");
-    expect(profile.toolsetProfile).toBe("webpilot-browser-v5");
+    expect(profile.toolsetProfile).toBe("webpilot-browser-v6");
     const resolved = assertFrozenProfilesAvailable({
       promptProfile: profile.promptProfile,
       promptDigest: profile.promptDigest,
@@ -138,7 +138,7 @@ describe("Agent profiles", () => {
     });
 
     expect(profile.promptProfile).toBe("webpilot-system-v6");
-    expect(profile.toolsetProfile).toBe("webpilot-browser-git-v6");
+    expect(profile.toolsetProfile).toBe("webpilot-browser-git-v7");
     expect(resolved.prompt.content).toContain(
       "stage=true, unstage=false, commit=true, commitAuthor=provided",
     );

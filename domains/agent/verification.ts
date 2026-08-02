@@ -563,6 +563,8 @@ function isBrowserVerificationToolset(toolsetProfile: string): boolean {
     "webpilot-browser-git-v4",
     "webpilot-browser-git-v5",
     "webpilot-browser-git-v6",
+    "webpilot-browser-v6",
+    "webpilot-browser-git-v7",
   ].includes(toolsetProfile);
 }
 

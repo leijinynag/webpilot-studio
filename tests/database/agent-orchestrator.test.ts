@@ -40,7 +40,18 @@ class ScriptedProvider implements LlmProvider {
     const turn = this.turns[this.inputs.length - 1];
 
     if (!turn) {
-      throw new Error("测试 Provider 缺少下一轮脚本。");
+      throw new Error(
+        `测试 Provider 缺少第 ${this.inputs.length} 轮脚本，已收到 ${this.inputs.length - 1} 轮。最近消息：${JSON.stringify(
+          input.messages.slice(-4).map((message) => ({
+            role: message.role,
+            toolCallId: "toolCallId" in message ? message.toolCallId : undefined,
+            content:
+              typeof message.content === "string"
+                ? message.content.slice(0, 80)
+                : undefined,
+          })),
+        )}`,
+      );
     }
 
     for (const event of turn) {
@@ -1607,7 +1618,6 @@ describe("AgentOrchestrator", () => {
           (message.kind === "tool_call" || message.kind === "tool_result") &&
           message.toolCallId.startsWith("replay:"),
       );
-
       expect(run).toMatchObject({
         status: "succeeded",
         currentRevision: 2,

@@ -402,6 +402,9 @@ export type ToolInvocationRecord = {
 
 export type VerificationRunRecord = {
   id: string;
+  // 用数据库生成的单调序列表达验证事实顺序，避免 createdAt 同毫秒时
+  // replay 记录被旧记录覆盖。
+  seq: number;
   runId: string;
   toolCallId: string;
   projectId: string;

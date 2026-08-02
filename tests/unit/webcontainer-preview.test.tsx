@@ -27,7 +27,16 @@ const {
     crossOriginIsolated: true,
   };
   return {
-    runtimeActivateProject: vi.fn(),
+    runtimeActivateProject: vi.fn((projectId: string) => {
+      // 与真实 Manager 一致：切换项目时先清空旧项目身份，避免新项目
+      // 把旧项目的“已授权运行”状态误认为自己的启动许可。
+      if (
+        runtimeActiveProject.value !== null &&
+        runtimeActiveProject.value !== projectId
+      ) {
+        runtimeActiveProject.value = null;
+      }
+    }),
     runtimeActiveProject: { value: null as string | null },
     runtimeSnapshot: snapshot,
     runtimeStart: vi.fn(
@@ -263,7 +272,13 @@ describe("WebContainerPreview 客户端工具执行", () => {
     );
     // projectId 切换只负责清理旧上下文；没有用户点击或 Agent run_preview，
     // 新项目即使已有 package.json，也不能自动 mount/install。
-    expect(runtimeStart).not.toHaveBeenCalled();
+    expect(
+      runtimeStart.mock.calls.some(
+        (call) =>
+          call[1] === otherProjectId &&
+          call[3] === `repository:${otherProjectId}:2`,
+      ),
+    ).toBe(false);
     expect(screen.getByRole("button", { name: "运行预览" })).toBeVisible();
   });
 

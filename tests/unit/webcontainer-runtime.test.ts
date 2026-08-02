@@ -93,6 +93,178 @@ describe("WebContainerRuntimeManager", () => {
     expect(manager.getSnapshot().syncedRevision).toBe(2);
   });
 
+  it("启动时将项目资产写入 public/__webpilot/assets", async () => {
+    const runtime = new FakeWebContainer();
+    const manager = new WebContainerRuntimeManager({
+      boot: async () => runtime,
+      isCrossOriginIsolated: () => true,
+    });
+    const asset = {
+      id: "asset-1",
+      assetPath: "/__webpilot/assets/asset-1.png",
+      downloadUrl: "https://example.test/asset-1.png",
+      mimeType: "image/png",
+      originalFilename: "hero.png",
+      sha256: "a".repeat(64),
+    };
+    const originalFetch = globalThis.fetch;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () =>
+        new Response(Uint8Array.from([1, 2, 3]), {
+          status: 200,
+          headers: { "content-type": "image/png" },
+        }),
+      ),
+    );
+
+    try {
+      await manager.start({}, "project-a", 1, "revision:1", [asset]);
+
+      expect(runtime.calls).toContain("mkdir:public/__webpilot/assets");
+      expect(
+        runtime.calls.some((call) =>
+          call.startsWith("write:public/__webpilot/assets/asset-1.png"),
+        ),
+      ).toBe(true);
+      expect(fetch).toHaveBeenCalledWith(asset.downloadUrl, {
+        cache: "no-store",
+      });
+    } finally {
+      vi.stubGlobal("fetch", originalFetch);
+    }
+  });
+
+  it("资产变化时只下载新资产并删除旧资产", async () => {
+    const runtime = new FakeWebContainer();
+    const manager = new WebContainerRuntimeManager({
+      boot: async () => runtime,
+      isCrossOriginIsolated: () => true,
+    });
+    const assetOne = {
+      id: "asset-1",
+      assetPath: "/__webpilot/assets/asset-1.png",
+      downloadUrl: "https://example.test/asset-1.png",
+      mimeType: "image/png",
+      originalFilename: "hero.png",
+      sha256: "a".repeat(64),
+    };
+    const assetTwo = {
+      id: "asset-2",
+      assetPath: "/__webpilot/assets/asset-2.png",
+      downloadUrl: "https://example.test/asset-2.png",
+      mimeType: "image/png",
+      originalFilename: "logo.png",
+      sha256: "b".repeat(64),
+    };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const bytes = String(input).endsWith("asset-1.png")
+        ? [1, 2, 3]
+        : [4, 5, 6];
+      return new Response(Uint8Array.from(bytes), { status: 200 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    try {
+      await manager.start({}, "project-a", 1, "revision:1", [assetOne]);
+      const firstWriteCount = runtime.calls.filter((call) =>
+        call.startsWith("write:public/__webpilot/assets/"),
+      ).length;
+
+      await manager.syncAssets([assetTwo], "project-a");
+
+      expect(runtime.calls).toContain(
+        "rm:public/__webpilot/assets/asset-1.png",
+      );
+      expect(runtime.calls).toContain(
+        "write:public/__webpilot/assets/asset-2.png:4,5,6",
+      );
+      expect(
+        runtime.calls.filter((call) =>
+          call.startsWith("write:public/__webpilot/assets/"),
+        ),
+      ).toHaveLength(firstWriteCount + 1);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(fetchMock).toHaveBeenLastCalledWith(assetTwo.downloadUrl, {
+        cache: "no-store",
+      });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("拒绝越界或反斜杠资产路径", async () => {
+    const invalidAssets = [
+      "/__webpilot/assets/../secret.png",
+      "/__webpilot/assets/asset-1\\secret.png",
+    ];
+
+    for (const assetPath of invalidAssets) {
+      const runtime = new FakeWebContainer();
+      const manager = new WebContainerRuntimeManager({
+        boot: async () => runtime,
+        isCrossOriginIsolated: () => true,
+      });
+      const asset = {
+        id: "asset-invalid",
+        assetPath,
+        downloadUrl: "https://example.test/asset.png",
+        mimeType: "image/png",
+        originalFilename: "asset.png",
+        sha256: "c".repeat(64),
+      };
+
+      await expect(
+        manager.start({}, "project-a", 1, "revision:1", [asset]),
+      ).rejects.toMatchObject({
+        diagnostic: { code: "asset_sync_failed" },
+      });
+      expect(manager.getSnapshot().diagnostic?.code).toBe(
+        "asset_sync_failed",
+      );
+    }
+  });
+
+  it("下载资产失败时保留 HTTP 诊断并阻止 Preview ready", async () => {
+    const runtime = new FakeWebContainer();
+    const manager = new WebContainerRuntimeManager({
+      boot: async () => runtime,
+      isCrossOriginIsolated: () => true,
+    });
+    const asset = {
+      id: "asset-404",
+      assetPath: "/__webpilot/assets/missing.png",
+      downloadUrl: "https://example.test/missing.png",
+      mimeType: "image/png",
+      originalFilename: "missing.png",
+      sha256: "d".repeat(64),
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response(null, { status: 404 })),
+    );
+
+    try {
+      await expect(
+        manager.start({}, "project-a", 1, "revision:1", [asset]),
+      ).rejects.toMatchObject({
+        diagnostic: {
+          code: "asset_sync_failed",
+          detail: expect.stringContaining("HTTP 404"),
+        },
+      });
+      expect(manager.getSnapshot()).toMatchObject({
+        phase: "failed",
+        diagnostic: {
+          code: "asset_sync_failed",
+          message: expect.stringContaining("missing.png"),
+        },
+      });
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("把 forwardPreviewErrors 输出记录为 revision 绑定的浏览器异常", async () => {
     const runtime = new FakeWebContainer();
     const originalSpawn = runtime.spawn.bind(runtime);

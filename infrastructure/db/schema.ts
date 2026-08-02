@@ -1060,6 +1060,12 @@ export const verificationRuns = pgTable(
   "verification_runs",
   {
     id: uuid("id").defaultRandom().primaryKey(),
+    // created_at 只有毫秒级时间精度，同一事务内的初始验证和 replay
+    // 可能拥有相同时间戳。使用数据库生成的单调序列读取最新事实，避免
+    // completion gate 因排序不稳定继续消耗模型轮次。
+    seq: bigint("seq", { mode: "number" })
+      .generatedAlwaysAsIdentity()
+      .notNull(),
     runId: uuid("run_id")
       .notNull()
       .references(() => agentRuns.id, { onDelete: "cascade" }),

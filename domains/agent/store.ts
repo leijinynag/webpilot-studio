@@ -587,7 +587,7 @@ export class AgentStore<TQueryResult extends PgQueryResultHKT> {
                 .select()
                 .from(verificationRuns)
                 .where(inArray(verificationRuns.runId, runIds))
-                .orderBy(asc(verificationRuns.createdAt)),
+                .orderBy(asc(verificationRuns.seq)),
             ])
           : [[], [], []];
         const verificationRunIds = verificationRunRows.map((run) => run.id);
@@ -1833,7 +1833,7 @@ export class AgentStore<TQueryResult extends PgQueryResultHKT> {
             eq(verificationRuns.status, "failed"),
           ),
         )
-        .orderBy(desc(verificationRuns.createdAt))
+        .orderBy(desc(verificationRuns.seq))
         .limit(1),
       this.db
         .select()
@@ -1844,7 +1844,7 @@ export class AgentStore<TQueryResult extends PgQueryResultHKT> {
             eq(verificationRuns.runId, input.runId),
           ),
         )
-        .orderBy(desc(verificationRuns.createdAt))
+        .orderBy(desc(verificationRuns.seq))
         .limit(1),
     ]);
     const canonical = canonicalRows[0];
@@ -1892,7 +1892,7 @@ export class AgentStore<TQueryResult extends PgQueryResultHKT> {
           eq(verificationRuns.runId, input.runId),
         ),
       )
-      .orderBy(desc(verificationRuns.createdAt))
+      .orderBy(desc(verificationRuns.seq))
       .limit(1);
 
     return row ? toVerificationRunRecord(row) : null;
