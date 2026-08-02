@@ -3,10 +3,17 @@ import "server-only";
 import { randomUUID } from "node:crypto";
 
 import { and, asc, eq, inArray } from "drizzle-orm";
+import type { PgQueryResultHKT } from "drizzle-orm/pg-core/session";
 
+import type { AgentStore } from "@/domains/agent/store";
+import type { AgentRunRecord } from "@/domains/agent/types";
 import type { GenerateImageArguments } from "@/domains/image/generation";
+import type { ImageProvider } from "@/domains/image/generation";
 import { launchAgentRun } from "@/infrastructure/agent/runtime";
-import { getPrivateBlobStore } from "@/infrastructure/blob/private-store";
+import {
+  getPrivateBlobStore,
+  type PrivateBlobStore,
+} from "@/infrastructure/blob/private-store";
 import { getImageProviderRuntime } from "@/infrastructure/image/image-provider-factory";
 import {
   claimImageJob,
@@ -37,15 +44,36 @@ import { getAgentPersistence } from "@/infrastructure/http/agent-api";
 
 const MAX_GENERATED_IMAGE_BYTES = 10 * 1024 * 1024;
 
+type ImageWorkerAgentStore = Pick<
+  AgentStore<PgQueryResultHKT>,
+  "getRun" | "transitionRun"
+>;
+
+export type ImageWorkerDependencies = {
+  /**
+   * 测试可以注入 fake Provider、Blob 和 Agent Store，验证异步状态机而不
+   * 依赖线上图片模型或私有存储。生产调用不传该字段，继续使用默认工厂。
+   */
+  provider?: ImageProvider;
+  blobStore?: PrivateBlobStore;
+  agentStore?: ImageWorkerAgentStore;
+  launchAgentRun?: typeof launchAgentRun;
+};
+
 export async function processNextImageJob(input?: {
   expectedJobId?: string;
   expectedImageRunId?: string;
+  dependencies?: ImageWorkerDependencies;
 }): Promise<void> {
-  const claimed = await claimImageJob(input);
+  const claimed = await claimImageJob({
+    expectedJobId: input?.expectedJobId,
+    expectedImageRunId: input?.expectedImageRunId,
+  });
   if (!claimed) {
     return;
   }
 
+  const dependencies = resolveDependencies(input?.dependencies);
   const { job, run } = claimed;
   const createdAssets: Array<{
     id: string;
@@ -53,8 +81,7 @@ export async function processNextImageJob(input?: {
   }> = [];
 
   try {
-    const runtime = getImageProviderRuntime();
-    const generated = await runtime.provider.generate({
+    const generated = await dependencies.provider!.generate({
       prompt: run.prompt,
       count: run.requestedCount,
       size: parseImageSize(run.size),
@@ -73,7 +100,7 @@ export async function processNextImageJob(input?: {
       );
     }
 
-    const store = getPrivateBlobStore();
+    const store = dependencies.blobStore!;
     const assets: Array<{
       id: string;
       pathname: string;
@@ -116,7 +143,7 @@ export async function processNextImageJob(input?: {
     const result = {
       ok: true,
       toolName: "generate_image",
-      revision: await getParentRevision(run),
+      revision: await getParentRevision(run, dependencies.agentStore!),
       data: {
         imageRunId: run.id,
         assetCount: assetRows.length,
@@ -124,7 +151,11 @@ export async function processNextImageJob(input?: {
       },
     };
 
-    await completeSuccessfulImageTool(run, result);
+    await completeSuccessfulImageTool(
+      run,
+      result,
+      dependencies.agentStore!,
+    );
 
     await markImageJobSucceeded({
       imageJobId: job.id,
@@ -132,21 +163,24 @@ export async function processNextImageJob(input?: {
       providerJobId: generated.providerJobId,
     });
 
-    const parent = await getParentRun(run);
+    const parent = await getParentRun(run, dependencies.agentStore!);
     if (
       parent &&
       parent.status === "awaiting_async_job" &&
       !parent.cancellationRequestedAt
     ) {
-      await getAgentPersistence().store.transitionRun({
+      await dependencies.agentStore!.transitionRun({
         ownerId: run.ownerId,
         runId: parent.id,
         status: "running",
       });
-      await launchAgentRun({ ownerId: run.ownerId, runId: parent.id });
+      await dependencies.launchAgentRun!({
+        ownerId: run.ownerId,
+        runId: parent.id,
+      });
     }
   } catch (error) {
-    await cleanupCreatedAssets(createdAssets);
+    await cleanupCreatedAssets(createdAssets, dependencies.blobStore!);
     const imageError = normalizeImageError(error);
     const retryable = isRetryableImageError(imageError);
     let outcome: { retryScheduled: boolean };
@@ -166,7 +200,11 @@ export async function processNextImageJob(input?: {
     }
 
     if (!outcome.retryScheduled) {
-      await completeFailedImageTool(run, imageError);
+      await completeFailedImageTool(
+        run,
+        imageError,
+        dependencies.agentStore!,
+      );
       return;
     }
 
@@ -176,11 +214,35 @@ export async function processNextImageJob(input?: {
   }
 }
 
+function resolveDependencies(
+  overrides?: ImageWorkerDependencies,
+): {
+  provider: ImageProvider;
+  blobStore: PrivateBlobStore;
+  agentStore: ImageWorkerAgentStore;
+  launchAgentRun: typeof launchAgentRun;
+} {
+  const imageRuntime = overrides?.provider
+    ? null
+    : getImageProviderRuntime();
+  const persistence = overrides?.agentStore
+    ? null
+    : getAgentPersistence();
+
+  return {
+    provider: overrides?.provider ?? imageRuntime!.provider,
+    blobStore: overrides?.blobStore ?? getPrivateBlobStore(),
+    agentStore: overrides?.agentStore ?? persistence!.store,
+    launchAgentRun: overrides?.launchAgentRun ?? launchAgentRun,
+  };
+}
+
 async function completeFailedImageTool(
   run: typeof imageRuns.$inferSelect,
   error: ImageError,
+  agentStore: ImageWorkerAgentStore,
 ): Promise<void> {
-  const parent = await getParentRun(run);
+  const parent = await getParentRun(run, agentStore);
   const result = {
     ok: false,
     toolName: "generate_image",
@@ -255,7 +317,7 @@ async function completeFailedImageTool(
     parent.status === "awaiting_async_job" &&
     !parent.cancellationRequestedAt
   ) {
-    await getAgentPersistence().store.transitionRun({
+    await agentStore.transitionRun({
       ownerId: run.ownerId,
       runId: parent.id,
       status: "failed",
@@ -268,8 +330,9 @@ async function completeFailedImageTool(
 async function completeSuccessfulImageTool(
   run: typeof imageRuns.$inferSelect,
   result: Record<string, unknown>,
+  agentStore: ImageWorkerAgentStore,
 ): Promise<void> {
-  const parent = await getParentRun(run);
+  const parent = await getParentRun(run, agentStore);
 
   await runDatabaseTransaction(async (tx) => {
     const [invocation] = await tx
@@ -440,6 +503,7 @@ async function findGeneratedAsset(imageRunId: string, generationIndex: number) {
 
 async function cleanupCreatedAssets(
   assets: Array<{ id: string; pathname: string }>,
+  store: PrivateBlobStore,
 ): Promise<void> {
   if (assets.length === 0) {
     return;
@@ -451,7 +515,6 @@ async function cleanupCreatedAssets(
       .where(inArray(projectAssets.id, assets.map((asset) => asset.id)));
   });
 
-  const store = getPrivateBlobStore();
   await Promise.all(
     assets.map(async (asset) => {
       await deleteBlobQuietly(store, asset.pathname);
@@ -471,13 +534,15 @@ async function deleteBlobQuietly(
   });
 }
 
-async function getParentRun(run: typeof imageRuns.$inferSelect) {
+async function getParentRun(
+  run: typeof imageRuns.$inferSelect,
+  agentStore: ImageWorkerAgentStore,
+): Promise<AgentRunRecord | null> {
   if (!run.parentAgentRunId) {
     return null;
   }
 
-  const persistence = getAgentPersistence();
-  return persistence.store.getRun({
+  return agentStore.getRun({
     ownerId: run.ownerId,
     runId: run.parentAgentRunId,
   });
@@ -485,8 +550,9 @@ async function getParentRun(run: typeof imageRuns.$inferSelect) {
 
 async function getParentRevision(
   run: typeof imageRuns.$inferSelect,
+  agentStore: ImageWorkerAgentStore,
 ): Promise<number> {
-  const parent = await getParentRun(run);
+  const parent = await getParentRun(run, agentStore);
   return parent?.currentRevision ?? 0;
 }
 
