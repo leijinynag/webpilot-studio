@@ -18,8 +18,10 @@ import type {
   FileToolExecutor,
   FileToolResultEnvelope,
 } from "@/domains/agent/file-tools";
+import type { VisionToolExecutor, VisionToolResultEnvelope } from "@/domains/agent/vision-tools";
 import { assertFrozenProfilesAvailable } from "@/domains/agent/profiles";
 import { normalizeRepositoryIntent } from "@/domains/agent/repository-intent";
+import type { ImageToolResultEnvelope } from "@/domains/agent/image-tools";
 import type { LlmProvider, ProviderEvent } from "@/domains/agent/provider";
 import type { ProviderFinishReason } from "@/domains/agent/provider";
 import type { AgentStore } from "@/domains/agent/store";
@@ -32,6 +34,12 @@ import {
   type FileToolName,
   type GitToolName,
 } from "@/domains/agent/tool-contracts";
+import { INSPECT_ATTACHMENT_TOOL_NAME } from "@/domains/image/vision-tool";
+import {
+  GENERATE_IMAGE_TOOL_NAME,
+} from "@/domains/image/generation-tool";
+import type { ImageToolExecutor } from "@/domains/agent/image-tools";
+import { isImageError } from "@/domains/image/errors";
 import type {
   AgentRunRecord,
   AgentRunStatus,
@@ -70,6 +78,12 @@ type AgentStorePort = Pick<
 >;
 
 type FileToolExecutorPort = Pick<FileToolExecutor, "execute">;
+type VisionToolExecutorPort = Pick<VisionToolExecutor, "execute">;
+type ImageToolExecutorPort = Pick<ImageToolExecutor, "suspend">;
+type AgentToolResultEnvelope =
+  | FileToolResultEnvelope
+  | VisionToolResultEnvelope
+  | ImageToolResultEnvelope;
 
 type AccumulatedToolCall = {
   index: number;
@@ -86,6 +100,8 @@ export class AgentOrchestrator {
     private readonly store: AgentStorePort,
     private readonly provider: LlmProvider,
     private readonly fileTools: FileToolExecutorPort,
+    private readonly visionTools?: VisionToolExecutorPort,
+    private readonly imageTools?: ImageToolExecutorPort,
   ) {}
 
   async run(input: {
@@ -413,6 +429,80 @@ export class AgentOrchestrator {
             continue modelLoop;
           }
 
+          if (toolCall.name === INSPECT_ATTACHMENT_TOOL_NAME) {
+            if (!this.visionTools) {
+              await this.persistInvalidClientToolArguments({
+                run,
+                toolCall,
+                message: "当前 Agent Runtime 没有配置 Vision 工具。",
+                issues: [],
+              });
+              continue modelLoop;
+            }
+            const result = await this.visionTools.execute({
+              run,
+              toolCallId: toolCall.id,
+              argumentsJson,
+            });
+            await this.persistToolResult(run, toolCall, result);
+            continue modelLoop;
+          }
+
+          if (toolCall.name === GENERATE_IMAGE_TOOL_NAME) {
+            const argumentsResult = parseImageToolArguments(argumentsJson);
+
+            if (!argumentsResult.ok) {
+              await this.persistInvalidClientToolArguments({
+                run,
+                toolCall,
+                message: "工具 generate_image 的参数不合法。",
+                issues: argumentsResult.issues,
+              });
+              continue modelLoop;
+            }
+
+            if (!this.imageTools) {
+              await this.persistInvalidClientToolArguments({
+                run,
+                toolCall,
+                message: "当前 Agent Runtime 没有配置图片生成工具。",
+                issues: [],
+              });
+              continue modelLoop;
+            }
+
+            try {
+              await this.imageTools.suspend({
+                run,
+                toolCallId: toolCall.id,
+                argumentsJson: argumentsResult.data,
+                leaseId,
+              });
+            } catch (error) {
+              if (
+                isImageError(error) &&
+                error.code === "IMAGE_GENERATION_NOT_CONFIGURED"
+              ) {
+                await this.persistToolResult(run, toolCall, {
+                  ok: false,
+                  toolName: GENERATE_IMAGE_TOOL_NAME,
+                  revision: run.currentRevision,
+                  error: {
+                    code: error.code,
+                    message: error.message,
+                    ...(error.details ? { details: error.details } : {}),
+                  },
+                });
+                continue modelLoop;
+              }
+              throw error;
+            }
+            // suspendForImageGeneration 已经在同一事务中释放租约并切换
+            // awaiting_async_job。当前执行片段必须立即结束，避免继续向
+            // Provider 发送没有 tool_result 的下一轮请求。
+            return;
+          }
+
           if (
             run.repositoryCapability.storageKind === "browser_git" &&
             isBrowserRepositoryTool(toolCall.name)
@@ -723,7 +813,7 @@ export class AgentOrchestrator {
   private async persistToolResult(
     run: AgentRunRecord,
     toolCall: AccumulatedToolCall,
-    result: FileToolResultEnvelope,
+    result: AgentToolResultEnvelope,
   ) {
     await this.store.appendTranscript({
       conversationId: run.conversationId,
@@ -742,7 +832,7 @@ export class AgentOrchestrator {
         toolName: toolCall.name,
         ok: result.ok,
         revision: result.ok ? result.revision : run.currentRevision,
-        ...(result.ok ? {} : { errorCode: result.error.code }),
+        ...(result.ok ? {} : { errorCode: result.error?.code }),
       },
     });
   }
@@ -1292,6 +1382,25 @@ export class AgentOrchestrator {
       "Agent 执行过程中发生未知错误。",
     );
   }
+}
+
+function parseImageToolArguments(value: unknown):
+  | {
+      ok: true;
+      data: Record<string, unknown>;
+    }
+  | {
+      ok: false;
+      issues: readonly object[];
+    } {
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    return { ok: true, data: value as Record<string, unknown> };
+  }
+
+  return {
+    ok: false,
+    issues: [{ path: [], message: "参数必须是 JSON 对象。" }],
+  };
 }
 
 function accumulateToolCall(

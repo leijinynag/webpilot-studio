@@ -63,6 +63,8 @@ import {
   agentEvidence,
   agentRunEvents,
   agentRuns,
+  imageJobs,
+  imageRuns,
   conversations,
   databaseSchema,
   projects,
@@ -112,6 +114,7 @@ export type CreateAgentRunInput = {
   conversationId?: string;
   conversationTitle: string;
   userMessage: string;
+  attachmentIds?: string[];
   profile: FrozenAgentRunProfile;
   startRevision?: number;
 };
@@ -163,6 +166,26 @@ type SuspendForClientToolInput =
   | SuspendForPreviewInput
   | SuspendForBrowserVerifyInput
   | SuspendForBrowserRepositoryInput;
+
+export type SuspendForImageGenerationInput = {
+  ownerId: string;
+  runId: string;
+  projectId: string;
+  conversationId: string;
+  toolCallId: string;
+  argumentsJson: {
+    prompt: string;
+    count: number;
+    size: "1024x1024" | "1024x1536" | "1536x1024";
+  };
+  idempotencyKey: string;
+  revision: number;
+  leaseId: string;
+  provider: string;
+  model: string;
+  profile: string;
+  profileVersion: string;
+};
 
 type NewTranscriptMessage = TranscriptMessage extends infer Message
   ? Message extends TranscriptMessage
@@ -327,7 +350,12 @@ export class AgentStore<TQueryResult extends PgQueryResultHKT> {
           runId: run.id,
           role: "user",
           kind: "user_message",
-          payload: { content: normalizeUserMessage(input.userMessage) },
+          payload: {
+            content: normalizeUserMessage(input.userMessage),
+            ...(input.attachmentIds?.length
+              ? { attachmentIds: normalizeAttachmentIds(input.attachmentIds) }
+              : {}),
+          },
         });
         await tx.insert(agentRunEvents).values({
           runId: run.id,
@@ -1424,6 +1452,216 @@ export class AgentStore<TQueryResult extends PgQueryResultHKT> {
           },
         },
       ]);
+    });
+  }
+
+  /**
+   * 生图是异步副作用，必须把父 Run 的等待状态、异步 Tool Ledger、image run
+   * 和 image job 一次性写入。这样请求在数据库提交后即使函数实例消失，刷新
+   * 或后台恢复仍然可以从 image_jobs 继续，而不会留下半条 Tool Call。
+   */
+  async suspendForImageGeneration(
+    input: SuspendForImageGenerationInput,
+  ): Promise<{ imageRunId: string; imageJobId: string }> {
+    return this.runTransaction(async (tx) => {
+      const [lockedRun] = await tx
+        .select({
+          id: agentRuns.id,
+          status: agentRuns.status,
+          currentRevision: agentRuns.currentRevision,
+          executionLeaseId: agentRuns.executionLeaseId,
+          usage: agentRuns.usage,
+          cancellationRequestedAt: agentRuns.cancellationRequestedAt,
+        })
+        .from(agentRuns)
+        .where(
+          and(
+            eq(agentRuns.id, input.runId),
+            eq(agentRuns.ownerId, input.ownerId),
+            eq(agentRuns.projectId, input.projectId),
+          ),
+        )
+        .for("update");
+
+      if (!lockedRun) {
+        throw new AgentError(
+          AGENT_ERROR_CODES.runNotFound,
+          "Agent Run 不存在、项目不匹配或不属于当前匿名工作区。",
+          404,
+        );
+      }
+
+      const [existingInvocation] = await tx
+        .select()
+        .from(toolInvocations)
+        .where(
+          and(
+            eq(toolInvocations.runId, input.runId),
+            eq(toolInvocations.toolCallId, input.toolCallId),
+          ),
+        );
+
+      if (existingInvocation) {
+        const [existingJob] = await tx
+          .select({
+            imageRunId: imageJobs.imageRunId,
+            imageJobId: imageJobs.id,
+          })
+          .from(imageJobs)
+          .where(eq(imageJobs.idempotencyKey, input.idempotencyKey))
+          .limit(1);
+
+        if (
+          lockedRun.status === "awaiting_async_job" &&
+          existingInvocation.executionDomain === "async_worker" &&
+          existingInvocation.status === "running" &&
+          existingInvocation.idempotencyKey === input.idempotencyKey &&
+          isDeepStrictEqual(existingInvocation.argumentsJson, input.argumentsJson) &&
+          existingJob
+        ) {
+          return existingJob;
+        }
+
+        throw new AgentError(
+          AGENT_ERROR_CODES.toolAlreadyExecuted,
+          "重复的生图 Tool Call 不能再次创建任务。",
+          409,
+          { toolCallId: input.toolCallId },
+        );
+      }
+
+      if (
+        lockedRun.status !== "running" ||
+        lockedRun.currentRevision !== input.revision ||
+        lockedRun.executionLeaseId !== input.leaseId ||
+        lockedRun.cancellationRequestedAt
+      ) {
+        throw new AgentError(
+          AGENT_ERROR_CODES.runConflict,
+          "Agent Run 状态、revision、取消标记或执行租约已发生变化。",
+          409,
+        );
+      }
+
+      const now = new Date();
+      const [invocation] = await tx
+        .insert(toolInvocations)
+        .values({
+          runId: input.runId,
+          toolCallId: input.toolCallId,
+          toolName: "generate_image",
+          executionDomain: "async_worker",
+          status: "running",
+          argumentsJson: input.argumentsJson,
+          idempotencyKey: input.idempotencyKey,
+          revisionBefore: input.revision,
+          startedAt: now,
+        })
+        .returning({ id: toolInvocations.id });
+
+      if (!invocation) {
+        throw new AgentError(
+          AGENT_ERROR_CODES.toolAlreadyExecuted,
+          "生图 Tool Ledger 创建失败。",
+          409,
+        );
+      }
+
+      const [imageRun] = await tx
+        .insert(imageRuns)
+        .values({
+          ownerId: input.ownerId,
+          projectId: input.projectId,
+          conversationId: input.conversationId,
+          parentAgentRunId: input.runId,
+          toolCallId: input.toolCallId,
+          prompt: input.argumentsJson.prompt,
+          requestedCount: input.argumentsJson.count,
+          size: input.argumentsJson.size,
+          status: "queued",
+          provider: input.provider,
+          model: input.model,
+          profile: input.profile,
+          profileVersion: input.profileVersion,
+          idempotencyKey: input.idempotencyKey,
+        })
+        .returning({ id: imageRuns.id });
+
+      if (!imageRun) {
+        throw new Error("创建 image run 失败。");
+      }
+
+      const [imageJob] = await tx
+        .insert(imageJobs)
+        .values({
+          imageRunId: imageRun.id,
+          ownerId: input.ownerId,
+          projectId: input.projectId,
+          status: "queued",
+          idempotencyKey: input.idempotencyKey,
+        })
+        .returning({ id: imageJobs.id });
+
+      if (!imageJob) {
+        throw new Error("创建 image job 失败。");
+      }
+
+      const pausedUsage = pauseAgentExecution(
+        normalizeAgentRunUsage(lockedRun.usage),
+        now,
+      );
+      const [updatedRun] = await tx
+        .update(agentRuns)
+        .set({
+          status: "awaiting_async_job",
+          usage: pausedUsage,
+          executionLeaseId: null,
+          executionLeaseExpiresAt: null,
+          updatedAt: now,
+        })
+        .where(
+          and(
+            eq(agentRuns.id, input.runId),
+            eq(agentRuns.status, "running"),
+            eq(agentRuns.executionLeaseId, input.leaseId),
+          ),
+        )
+        .returning({ currentRevision: agentRuns.currentRevision });
+
+      if (!updatedRun) {
+        throw new AgentError(
+          AGENT_ERROR_CODES.runConflict,
+          "Agent Run 在创建生图任务时已被其他执行器更新。",
+          409,
+        );
+      }
+
+      await tx.insert(agentRunEvents).values([
+        {
+          runId: input.runId,
+          type: "run.status_changed",
+          payload: {
+            previousStatus: "running",
+            status: "awaiting_async_job",
+            currentRevision: updatedRun.currentRevision,
+            reason: "image_generation_requested",
+          },
+        },
+        {
+          runId: input.runId,
+          type: "async_job.requested",
+          payload: {
+            toolCallId: input.toolCallId,
+            toolName: "generate_image",
+            imageRunId: imageRun.id,
+            imageJobId: imageJob.id,
+            idempotencyKey: input.idempotencyKey,
+            revision: input.revision,
+          },
+        },
+      ]);
+
+      return { imageRunId: imageRun.id, imageJobId: imageJob.id };
     });
   }
 
@@ -2561,6 +2799,17 @@ function normalizeUserMessage(value: string): string {
   return message;
 }
 
+/**
+ * 附件 ID 只作为模型工具的引用，不信任客户端传入的重复值或空字符串。
+ * 真正的项目、会话和 owner 隔离仍由 Vision 服务读取时再次校验。
+ */
+function normalizeAttachmentIds(value: readonly string[]): string[] {
+  return [...new Set(value.map((item) => item.trim()).filter(Boolean))].slice(
+    0,
+    4,
+  );
+}
+
 function isActiveProjectRunUniqueViolation(error: unknown): boolean {
   let current: unknown = error;
 
@@ -2599,6 +2848,12 @@ function transcriptToPayload(
 ): Record<string, unknown> {
   switch (message.kind) {
     case "user_message":
+      return {
+        content: message.content,
+        ...(message.attachmentIds?.length
+          ? { attachmentIds: normalizeAttachmentIds(message.attachmentIds) }
+          : {}),
+      };
     case "assistant_message":
       return { content: message.content };
     case "tool_call":
@@ -2637,6 +2892,13 @@ function toTranscriptMessage(
         kind: row.kind,
         role: "user",
         content: String(payload.content ?? ""),
+        ...(Array.isArray(payload.attachmentIds)
+          ? {
+              attachmentIds: payload.attachmentIds.filter(
+                (value): value is string => typeof value === "string",
+              ),
+            }
+          : {}),
       };
     case "assistant_message":
       return {

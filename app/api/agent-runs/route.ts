@@ -22,6 +22,7 @@ const createAgentRunSchema = z
     projectId: z.uuid(),
     message: z.string().trim().min(1).max(20_000),
     conversationId: z.uuid().optional(),
+    attachmentIds: z.array(z.uuid()).max(4).default([]),
     locale: z.enum(["zh-CN", "en-US"]).default("zh-CN"),
     repositoryRevision: z.number().int().nonnegative().optional(),
   })
@@ -138,6 +139,7 @@ export async function POST(request: Request) {
       conversationId: body.conversationId,
       conversationTitle: body.message.slice(0, 80),
       userMessage: body.message,
+      attachmentIds: body.attachmentIds,
       profile,
       startRevision,
     });

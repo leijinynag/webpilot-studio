@@ -275,6 +275,8 @@ export type UserMessage = TranscriptBase & {
   kind: "user_message";
   role: "user";
   content: string;
+  /** 只记录附件 UUID，图片二进制始终留在私有对象存储中。 */
+  attachmentIds?: string[];
 };
 
 export type AssistantMessage = TranscriptBase & {

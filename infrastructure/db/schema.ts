@@ -95,6 +95,39 @@ export const toolInvocationStatus = pgEnum("tool_invocation_status", [
   "cancelled",
 ]);
 
+export const attachmentStatus = pgEnum("attachment_status", [
+  "ready",
+  "failed",
+  "deleted",
+]);
+
+export const imageRunStatus = pgEnum("image_run_status", [
+  "queued",
+  "running",
+  "succeeded",
+  "failed",
+  "cancelled",
+]);
+
+export const imageJobStatus = pgEnum("image_job_status", [
+  "queued",
+  "running",
+  "retryable",
+  "succeeded",
+  "failed",
+  "cancelled",
+]);
+
+export const projectAssetKind = pgEnum("project_asset_kind", [
+  "uploaded_image",
+  "generated_image",
+]);
+
+export const projectAssetSource = pgEnum("project_asset_source", [
+  "attachment",
+  "image_generation",
+]);
+
 export const agentEvidenceKind = pgEnum("agent_evidence_kind", [
   "build",
   "runtime",
@@ -708,6 +741,279 @@ export const toolInvocations = pgTable(
   ],
 );
 
+export const chatAttachments = pgTable(
+  "chat_attachments",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    ownerId: text("owner_id").notNull(),
+    projectId: uuid("project_id")
+      .notNull()
+      .references(() => projects.id, { onDelete: "cascade" }),
+    conversationId: uuid("conversation_id").references(() => conversations.id, {
+      onDelete: "set null",
+    }),
+    originalFilename: text("original_filename").notNull(),
+    mimeType: text("mime_type").notNull(),
+    byteLength: integer("byte_length").notNull(),
+    sha256: text("sha256").notNull(),
+    blobPathname: text("blob_pathname").notNull(),
+    blobUrl: text("blob_url").notNull(),
+    width: integer("width"),
+    height: integer("height"),
+    status: attachmentStatus("status").notNull().default("ready"),
+    errorCode: text("error_code"),
+    createdAt: timestamp("created_at", {
+      withTimezone: true,
+      mode: "date",
+    })
+      .notNull()
+      .defaultNow(),
+    updatedAt: timestamp("updated_at", {
+      withTimezone: true,
+      mode: "date",
+    })
+      .notNull()
+      .defaultNow(),
+    deletedAt: timestamp("deleted_at", {
+      withTimezone: true,
+      mode: "date",
+    }),
+  },
+  (table) => [
+    check("chat_attachments_byte_length_check", sql`${table.byteLength} > 0`),
+    check(
+      "chat_attachments_sha256_check",
+      sql`char_length(${table.sha256}) = 64`,
+    ),
+    check(
+      "chat_attachments_dimensions_check",
+      sql`
+        (${table.width} is null and ${table.height} is null)
+        or (${table.width} is not null and ${table.width} > 0 and ${table.height} is not null and ${table.height} > 0)
+      `,
+    ),
+    index("chat_attachments_owner_project_idx").on(
+      table.ownerId,
+      table.projectId,
+      table.deletedAt,
+      table.createdAt,
+    ),
+    index("chat_attachments_conversation_idx").on(
+      table.conversationId,
+      table.createdAt,
+    ),
+  ],
+);
+
+export const imageRuns = pgTable(
+  "image_runs",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    ownerId: text("owner_id").notNull(),
+    projectId: uuid("project_id")
+      .notNull()
+      .references(() => projects.id, { onDelete: "cascade" }),
+    conversationId: uuid("conversation_id").references(() => conversations.id, {
+      onDelete: "set null",
+    }),
+    parentAgentRunId: uuid("parent_agent_run_id").references(() => agentRuns.id, {
+      onDelete: "set null",
+    }),
+    toolCallId: text("tool_call_id").notNull(),
+    prompt: text("prompt").notNull(),
+    requestedCount: integer("requested_count").notNull(),
+    size: text("size").notNull().default("1024x1024"),
+    status: imageRunStatus("status").notNull().default("queued"),
+    provider: text("provider").notNull(),
+    model: text("model").notNull(),
+    profile: text("profile").notNull(),
+    profileVersion: text("profile_version").notNull(),
+    idempotencyKey: text("idempotency_key").notNull(),
+    errorCode: text("error_code"),
+    errorMessage: text("error_message"),
+    createdAt: timestamp("created_at", {
+      withTimezone: true,
+      mode: "date",
+    })
+      .notNull()
+      .defaultNow(),
+    startedAt: timestamp("started_at", {
+      withTimezone: true,
+      mode: "date",
+    }),
+    completedAt: timestamp("completed_at", {
+      withTimezone: true,
+      mode: "date",
+    }),
+    updatedAt: timestamp("updated_at", {
+      withTimezone: true,
+      mode: "date",
+    })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    check(
+      "image_runs_requested_count_check",
+      sql`${table.requestedCount} between 1 and 4`,
+    ),
+    check(
+      "image_runs_size_check",
+      sql`${table.size} in ('1024x1024', '1024x1536', '1536x1024')`,
+    ),
+    uniqueIndex("image_runs_idempotency_uidx").on(table.idempotencyKey),
+    index("image_runs_owner_project_status_idx").on(
+      table.ownerId,
+      table.projectId,
+      table.status,
+      table.createdAt,
+    ),
+    index("image_runs_parent_agent_run_idx").on(table.parentAgentRunId),
+  ],
+);
+
+export const imageJobs = pgTable(
+  "image_jobs",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    imageRunId: uuid("image_run_id")
+      .notNull()
+      .references(() => imageRuns.id, { onDelete: "cascade" }),
+    ownerId: text("owner_id").notNull(),
+    projectId: uuid("project_id")
+      .notNull()
+      .references(() => projects.id, { onDelete: "cascade" }),
+    status: imageJobStatus("status").notNull().default("queued"),
+    attempt: integer("attempt").notNull().default(0),
+    maxAttempts: integer("max_attempts").notNull().default(3),
+    idempotencyKey: text("idempotency_key").notNull(),
+    providerJobId: text("provider_job_id"),
+    leaseId: uuid("lease_id"),
+    leaseExpiresAt: timestamp("lease_expires_at", {
+      withTimezone: true,
+      mode: "date",
+    }),
+    nextAttemptAt: timestamp("next_attempt_at", {
+      withTimezone: true,
+      mode: "date",
+    }),
+    errorCode: text("error_code"),
+    errorMessage: text("error_message"),
+    createdAt: timestamp("created_at", {
+      withTimezone: true,
+      mode: "date",
+    })
+      .notNull()
+      .defaultNow(),
+    startedAt: timestamp("started_at", {
+      withTimezone: true,
+      mode: "date",
+    }),
+    completedAt: timestamp("completed_at", {
+      withTimezone: true,
+      mode: "date",
+    }),
+    updatedAt: timestamp("updated_at", {
+      withTimezone: true,
+      mode: "date",
+    })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    check("image_jobs_attempt_check", sql`${table.attempt} >= 0`),
+    check(
+      "image_jobs_max_attempts_check",
+      sql`${table.maxAttempts} between 1 and 5`,
+    ),
+    uniqueIndex("image_jobs_idempotency_uidx").on(table.idempotencyKey),
+    uniqueIndex("image_jobs_image_run_uidx").on(table.imageRunId),
+    index("image_jobs_status_next_attempt_idx").on(
+      table.status,
+      table.nextAttemptAt,
+      table.createdAt,
+    ),
+    index("image_jobs_lease_idx").on(table.status, table.leaseExpiresAt),
+    index("image_jobs_owner_project_idx").on(
+      table.ownerId,
+      table.projectId,
+      table.updatedAt,
+    ),
+  ],
+);
+
+export const projectAssets = pgTable(
+  "project_assets",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    ownerId: text("owner_id").notNull(),
+    projectId: uuid("project_id")
+      .notNull()
+      .references(() => projects.id, { onDelete: "cascade" }),
+    attachmentId: uuid("attachment_id").references(() => chatAttachments.id, {
+      onDelete: "set null",
+    }),
+    imageRunId: uuid("image_run_id").references(() => imageRuns.id, {
+      onDelete: "set null",
+    }),
+    generationIndex: integer("generation_index"),
+    kind: projectAssetKind("kind").notNull(),
+    source: projectAssetSource("source").notNull(),
+    originalFilename: text("original_filename"),
+    mimeType: text("mime_type").notNull(),
+    byteLength: integer("byte_length").notNull(),
+    sha256: text("sha256").notNull(),
+    blobPathname: text("blob_pathname").notNull(),
+    blobUrl: text("blob_url").notNull(),
+    width: integer("width"),
+    height: integer("height"),
+    metadata: jsonb("metadata").$type<Record<string, unknown>>().notNull().default({}),
+    createdAt: timestamp("created_at", {
+      withTimezone: true,
+      mode: "date",
+    })
+      .notNull()
+      .defaultNow(),
+    deletedAt: timestamp("deleted_at", {
+      withTimezone: true,
+      mode: "date",
+    }),
+  },
+  (table) => [
+    check("project_assets_byte_length_check", sql`${table.byteLength} > 0`),
+    check(
+      "project_assets_sha256_check",
+      sql`char_length(${table.sha256}) = 64`,
+    ),
+    check(
+      "project_assets_dimensions_check",
+      sql`
+        (${table.width} is null and ${table.height} is null)
+        or (${table.width} is not null and ${table.width} > 0 and ${table.height} is not null and ${table.height} > 0)
+      `,
+    ),
+    check(
+      "project_assets_generation_index_check",
+      sql`${table.generationIndex} is null or ${table.generationIndex} >= 0`,
+    ),
+    uniqueIndex("project_assets_project_hash_active_uidx")
+      .on(table.projectId, table.sha256)
+      .where(sql`${table.deletedAt} is null`),
+    index("project_assets_owner_project_idx").on(
+      table.ownerId,
+      table.projectId,
+      table.deletedAt,
+      table.createdAt,
+    ),
+    index("project_assets_image_run_idx").on(table.imageRunId),
+    uniqueIndex("project_assets_image_run_generation_uidx")
+      .on(table.imageRunId, table.generationIndex)
+      .where(
+        sql`${table.imageRunId} is not null and ${table.generationIndex} is not null and ${table.deletedAt} is null`,
+      ),
+  ],
+);
+
 export const agentEvidence = pgTable(
   "agent_evidence",
   {
@@ -988,6 +1294,10 @@ export const databaseSchema = {
   agentRuns,
   agentRunEvents,
   toolInvocations,
+  chatAttachments,
+  imageRuns,
+  imageJobs,
+  projectAssets,
   agentEvidence,
   verificationRuns,
   verificationSteps,
@@ -1000,3 +1310,7 @@ export type ProjectFileRow = typeof projectFiles.$inferSelect;
 export type ShowcaseCaseRow = typeof showcaseCases.$inferSelect;
 export type ShowcaseArtifactManifestRow =
   typeof showcaseArtifacts.$inferSelect;
+export type ChatAttachmentRow = typeof chatAttachments.$inferSelect;
+export type ImageRunRow = typeof imageRuns.$inferSelect;
+export type ImageJobRow = typeof imageJobs.$inferSelect;
+export type ProjectAssetRow = typeof projectAssets.$inferSelect;

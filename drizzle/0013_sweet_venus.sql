@@ -1,0 +1,2 @@
+ALTER TABLE "image_runs" ADD COLUMN "size" text DEFAULT '1024x1024' NOT NULL;--> statement-breakpoint
+ALTER TABLE "image_runs" ADD CONSTRAINT "image_runs_size_check" CHECK ("image_runs"."size" in ('1024x1024', '1024x1536', '1536x1024'));

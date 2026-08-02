@@ -1,0 +1,4 @@
+ALTER TABLE "image_runs" ADD COLUMN "tool_call_id" text NOT NULL;--> statement-breakpoint
+ALTER TABLE "project_assets" ADD COLUMN "generation_index" integer;--> statement-breakpoint
+CREATE UNIQUE INDEX "project_assets_image_run_generation_uidx" ON "project_assets" USING btree ("image_run_id","generation_index") WHERE "project_assets"."image_run_id" is not null and "project_assets"."generation_index" is not null and "project_assets"."deleted_at" is null;--> statement-breakpoint
+ALTER TABLE "project_assets" ADD CONSTRAINT "project_assets_generation_index_check" CHECK ("project_assets"."generation_index" is null or "project_assets"."generation_index" >= 0);

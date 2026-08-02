@@ -553,10 +553,17 @@ export function getAgentVerificationState(input: {
 }
 
 function isBrowserVerificationToolset(toolsetProfile: string): boolean {
-  return (
-    toolsetProfile === "webpilot-browser-v3" ||
-    toolsetProfile === "webpilot-browser-git-v4"
-  );
+  // 历史 Run 可能仍然冻结在旧 profile，因此这里不能只判断当前版本。
+  // M6 新增 Vision 和 Image 能力后，Browser Verify 仍然属于同一套
+  // 浏览器验证门禁，必须继续复用 replay 和 completion gate。
+  return [
+    "webpilot-browser-v3",
+    "webpilot-browser-v4",
+    "webpilot-browser-v5",
+    "webpilot-browser-git-v4",
+    "webpilot-browser-git-v5",
+    "webpilot-browser-git-v6",
+  ].includes(toolsetProfile);
 }
 
 export function buildAgentVerificationDirective(input: {

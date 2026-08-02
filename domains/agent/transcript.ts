@@ -41,7 +41,12 @@ export function assembleProviderMessages(
       case "user_message":
         messages.push({
           role: "user",
-          content: boundText(message.content, maxCharacters),
+          content: boundText(
+            message.attachmentIds?.length
+              ? `${message.content}\n[Attached image IDs: ${message.attachmentIds.join(", ")}]`
+              : message.content,
+            maxCharacters,
+          ),
         });
         break;
       case "assistant_message":
