@@ -11,6 +11,7 @@ import {
 } from "@/domains/agent/tool-contracts";
 import { VISION_TOOL_DEFINITIONS } from "@/domains/image/vision-tool";
 import { IMAGE_GENERATION_TOOL_DEFINITIONS } from "@/domains/image/generation-tool";
+import { PROJECT_ASSET_TOOL_DEFINITIONS } from "@/domains/image/asset-tool-definition";
 import type {
   AgentLocale,
   FrozenAgentRunProfile,
@@ -32,6 +33,9 @@ export const VISION_BROWSER_TOOLSET_PROFILE_ID = "webpilot-browser-v4";
 export const VISION_BROWSER_GIT_TOOLSET_PROFILE_ID = "webpilot-browser-git-v5";
 export const IMAGE_BROWSER_TOOLSET_PROFILE_ID = "webpilot-browser-v5";
 export const IMAGE_BROWSER_GIT_TOOLSET_PROFILE_ID = "webpilot-browser-git-v6";
+export const ASSET_IMAGE_BROWSER_TOOLSET_PROFILE_ID = "webpilot-browser-v6";
+export const ASSET_IMAGE_BROWSER_GIT_TOOLSET_PROFILE_ID =
+  "webpilot-browser-git-v7";
 // 领域层只记录“编码 Agent 模型配置”这一能力，不绑定具体供应商。
 // 当前可用的 DeepSeek adapter 在 infrastructure 层完成映射，未来替换
 // Provider 时不需要修改 Agent Run、Transcript 或 Orchestrator。
@@ -267,6 +271,14 @@ const TOOLSET_PROFILES = {
     RUN_PREVIEW_TOOL_DEFINITION,
     BROWSER_VERIFY_TOOL_DEFINITION,
   ],
+  [ASSET_IMAGE_BROWSER_TOOLSET_PROFILE_ID]: [
+    ...FILE_TOOL_DEFINITIONS,
+    ...VISION_TOOL_DEFINITIONS,
+    ...IMAGE_GENERATION_TOOL_DEFINITIONS,
+    ...PROJECT_ASSET_TOOL_DEFINITIONS,
+    RUN_PREVIEW_TOOL_DEFINITION,
+    BROWSER_VERIFY_TOOL_DEFINITION,
+  ],
   [BROWSER_GIT_TOOLSET_PROFILE_ID]: [
     ...FILE_TOOL_DEFINITIONS,
     ...GIT_TOOL_DEFINITIONS,
@@ -285,6 +297,15 @@ const TOOLSET_PROFILES = {
     ...GIT_TOOL_DEFINITIONS,
     ...VISION_TOOL_DEFINITIONS,
     ...IMAGE_GENERATION_TOOL_DEFINITIONS,
+    RUN_PREVIEW_TOOL_DEFINITION,
+    BROWSER_VERIFY_TOOL_DEFINITION,
+  ],
+  [ASSET_IMAGE_BROWSER_GIT_TOOLSET_PROFILE_ID]: [
+    ...FILE_TOOL_DEFINITIONS,
+    ...GIT_TOOL_DEFINITIONS,
+    ...VISION_TOOL_DEFINITIONS,
+    ...IMAGE_GENERATION_TOOL_DEFINITIONS,
+    ...PROJECT_ASSET_TOOL_DEFINITIONS,
     RUN_PREVIEW_TOOL_DEFINITION,
     BROWSER_VERIFY_TOOL_DEFINITION,
   ],
@@ -349,8 +370,8 @@ export function createFrozenAgentProfile(input: {
   );
   const toolset = resolveToolsetProfile(
     usesBrowserGit
-      ? IMAGE_BROWSER_GIT_TOOLSET_PROFILE_ID
-      : IMAGE_BROWSER_TOOLSET_PROFILE_ID,
+      ? ASSET_IMAGE_BROWSER_GIT_TOOLSET_PROFILE_ID
+      : ASSET_IMAGE_BROWSER_TOOLSET_PROFILE_ID,
   );
 
   return {

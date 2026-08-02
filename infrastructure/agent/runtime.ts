@@ -8,6 +8,7 @@ import {
 import { AgentOrchestrator } from "@/domains/agent/orchestrator";
 import { FileToolExecutor } from "@/domains/agent/file-tools";
 import { ImageToolExecutor } from "@/domains/agent/image-tools";
+import { AssetToolExecutor } from "@/domains/image/asset-tool";
 import { VisionToolExecutor } from "@/domains/agent/vision-tools";
 import { withAgentRunController } from "@/infrastructure/agent/run-controller";
 import { getAgentProviderRuntime } from "@/infrastructure/agent/provider-factory";
@@ -78,6 +79,7 @@ export async function launchAgentRun(input: {
         profile: imageRuntime.profile,
         profileVersion: imageRuntime.profileVersion,
       }),
+      new AssetToolExecutor(store),
     );
 
     await withAgentRunController(input.runId, (signal) =>

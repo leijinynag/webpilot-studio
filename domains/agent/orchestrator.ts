@@ -19,6 +19,10 @@ import type {
   FileToolResultEnvelope,
 } from "@/domains/agent/file-tools";
 import type { VisionToolExecutor, VisionToolResultEnvelope } from "@/domains/agent/vision-tools";
+import type {
+  AssetToolExecutor,
+  AssetToolResultEnvelope,
+} from "@/domains/image/asset-tool";
 import { assertFrozenProfilesAvailable } from "@/domains/agent/profiles";
 import { normalizeRepositoryIntent } from "@/domains/agent/repository-intent";
 import type { ImageToolResultEnvelope } from "@/domains/agent/image-tools";
@@ -38,6 +42,7 @@ import { INSPECT_ATTACHMENT_TOOL_NAME } from "@/domains/image/vision-tool";
 import {
   GENERATE_IMAGE_TOOL_NAME,
 } from "@/domains/image/generation-tool";
+import { LIST_PROJECT_ASSETS_TOOL_NAME } from "@/domains/image/asset-tool-definition";
 import type { ImageToolExecutor } from "@/domains/agent/image-tools";
 import { isImageError } from "@/domains/image/errors";
 import type {
@@ -83,6 +88,7 @@ type ImageToolExecutorPort = Pick<ImageToolExecutor, "suspend">;
 type AgentToolResultEnvelope =
   | FileToolResultEnvelope
   | VisionToolResultEnvelope
+  | AssetToolResultEnvelope
   | ImageToolResultEnvelope;
 
 type AccumulatedToolCall = {
@@ -102,6 +108,7 @@ export class AgentOrchestrator {
     private readonly fileTools: FileToolExecutorPort,
     private readonly visionTools?: VisionToolExecutorPort,
     private readonly imageTools?: ImageToolExecutorPort,
+    private readonly assetTools?: Pick<AssetToolExecutor, "execute">,
   ) {}
 
   async run(input: {
@@ -440,6 +447,25 @@ export class AgentOrchestrator {
               continue modelLoop;
             }
             const result = await this.visionTools.execute({
+              run,
+              toolCallId: toolCall.id,
+              argumentsJson,
+            });
+            await this.persistToolResult(run, toolCall, result);
+            continue modelLoop;
+          }
+
+          if (toolCall.name === LIST_PROJECT_ASSETS_TOOL_NAME) {
+            if (!this.assetTools) {
+              await this.persistInvalidClientToolArguments({
+                run,
+                toolCall,
+                message: "当前 Agent Runtime 没有配置项目资产工具。",
+                issues: [],
+              });
+              continue modelLoop;
+            }
+            const result = await this.assetTools.execute({
               run,
               toolCallId: toolCall.id,
               argumentsJson,

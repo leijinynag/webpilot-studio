@@ -395,6 +395,18 @@ export async function listOwnedAssets(input: {
   ownerId: string;
   projectId: string;
 }) {
+  const rows = await listOwnedAssetRows(input);
+  return rows.map(toAssetView);
+}
+
+/**
+ * Agent 资产工具需要保留 ownerId 和原始 Date，才能在服务端生成绑定
+ * owner/project 的临时 URL。这个内部查询不把数据库 Blob URL 暴露给调用方。
+ */
+export async function listOwnedAssetRows(input: {
+  ownerId: string;
+  projectId: string;
+}) {
   await assertOwnedProject(input);
   const rows = await getDatabase()
     .select()
@@ -407,7 +419,7 @@ export async function listOwnedAssets(input: {
       ),
     )
     .orderBy(desc(projectAssets.createdAt));
-  return rows.map(toAssetView);
+  return rows;
 }
 
 export async function getOwnedAsset(input: {
@@ -432,6 +444,37 @@ export async function getOwnedAsset(input: {
       404,
     );
   }
+  return row;
+}
+
+/**
+ * 受控资产 URL 只需要 assetId 和 projectId 找到数据库事实，ownerId 由
+ * 记录本身参与签名。这个查询不对外暴露，用于 Preview 的跨 origin 访问。
+ */
+export async function getActiveAssetForSignedAccess(input: {
+  assetId: string;
+  projectId: string;
+}) {
+  const [row] = await getDatabase()
+    .select()
+    .from(projectAssets)
+    .where(
+      and(
+        eq(projectAssets.id, input.assetId),
+        eq(projectAssets.projectId, input.projectId),
+        isNull(projectAssets.deletedAt),
+      ),
+    )
+    .limit(1);
+
+  if (!row) {
+    throw new ImageError(
+      IMAGE_ERROR_CODES.assetNotFound,
+      "资产不存在或访问链接无效。",
+      404,
+    );
+  }
+
   return row;
 }
 
@@ -515,6 +558,25 @@ function toAttachmentView(row: typeof chatAttachments.$inferSelect) {
 }
 
 function toAssetView(row: typeof projectAssets.$inferSelect) {
+  return {
+    id: row.id,
+    projectId: row.projectId,
+    kind: row.kind,
+    source: row.source,
+    attachmentId: row.attachmentId,
+    imageRunId: row.imageRunId,
+    originalFilename: row.originalFilename,
+    mimeType: row.mimeType,
+    byteLength: row.byteLength,
+    sha256: row.sha256,
+    width: row.width,
+    height: row.height,
+    metadata: row.metadata,
+    createdAt: row.createdAt.toISOString(),
+  };
+}
+
+export function toAssetToolView(row: typeof projectAssets.$inferSelect) {
   return {
     id: row.id,
     projectId: row.projectId,

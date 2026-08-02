@@ -50,6 +50,16 @@ function getSessionSecret(explicitSecret?: string): string {
   );
 }
 
+/**
+ * 资产临时 URL 与匿名会话使用同一份服务端签名密钥。
+ *
+ * 这里复用会话密钥可以避免为匿名工作区再维护一份容易错配的 Secret；
+ * 生产环境仍然遵循同一条 fail-closed 规则，不允许回退到开发固定值。
+ */
+export function getAnonymousSessionSigningSecret(): string {
+  return getSessionSecret();
+}
+
 function signPayload(encodedPayload: string, secret: string): Buffer {
   return createHmac("sha256", secret).update(encodedPayload).digest();
 }
