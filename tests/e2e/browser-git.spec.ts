@@ -71,9 +71,9 @@ test.describe("Browser Git M7 Gate", () => {
     await page
       .getByRole("button", { name: /新建文件|New file/, exact: true })
       .click();
-    await page.getByLabel(/文件路径|File path/, { exact: true }).fill(
-      "src/index.tsx",
-    );
+    await page
+      .getByLabel(/文件路径|File path/, { exact: true })
+      .fill("src/index.tsx");
     await page
       .getByRole("button", { name: /创建|Create/, exact: true })
       .click();
@@ -180,7 +180,9 @@ test.describe("Browser Git M7 Gate", () => {
     });
 
     await page.goto(`/p/${project.id}`);
-    await expect(page.getByText("src/index.tsx", { exact: true })).toBeVisible();
+    await expect(
+      page.getByText("src/index.tsx", { exact: true }),
+    ).toBeVisible();
     await page.getByRole("button", { name: "Migrate" }).click();
     await expect(page.getByRole("dialog")).toBeVisible();
     await page
@@ -211,7 +213,9 @@ test.describe("Browser Git M7 Gate", () => {
       }),
     ).toBeVisible();
 
-    const projectResponse = await page.request.get(`/api/projects/${project.id}`);
+    const projectResponse = await page.request.get(
+      `/api/projects/${project.id}`,
+    );
     expect(projectResponse.ok()).toBe(true);
     await expect(projectResponse.json()).resolves.toMatchObject({
       project: {

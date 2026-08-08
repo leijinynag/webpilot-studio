@@ -23,7 +23,8 @@ export function getVisionProviderRuntime(): VisionProviderRuntime {
     );
   }
 
-  const providerName = serverEnv.VISION_PROVIDER?.trim().toLowerCase() || "openai";
+  const providerName =
+    serverEnv.VISION_PROVIDER?.trim().toLowerCase() || "openai";
   if (providerName !== "openai" && providerName !== "openai-compatible") {
     throw new ImageError(
       IMAGE_ERROR_CODES.visionNotConfigured,

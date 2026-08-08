@@ -40,9 +40,7 @@ describe("main application security headers", () => {
       "strict-origin-when-cross-origin",
     );
     expect(headerValue(headers, "X-Content-Type-Options")).toBe("nosniff");
-    expect(headerValue(headers, "Permissions-Policy")).toContain(
-      "camera=()",
-    );
+    expect(headerValue(headers, "Permissions-Policy")).toContain("camera=()");
     expect(headerValue(headers, "Permissions-Policy")).toContain(
       "microphone=()",
     );

@@ -34,7 +34,8 @@ export function getImageProviderRuntime(): ImageProviderRuntime {
     );
   }
 
-  const providerName = serverEnv.IMAGE_PROVIDER?.trim().toLowerCase() || "openai";
+  const providerName =
+    serverEnv.IMAGE_PROVIDER?.trim().toLowerCase() || "openai";
   if (providerName !== "openai" && providerName !== "openai-compatible") {
     throw new ImageError(
       IMAGE_ERROR_CODES.generationNotConfigured,

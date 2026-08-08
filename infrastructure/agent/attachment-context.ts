@@ -29,7 +29,9 @@ export function createAttachmentContextResolver(
     async resolve({ run, transcript, signal }) {
       const contexts = new Map<string, string>();
       const messages = transcript.filter(
-        (message): message is Extract<TranscriptMessage, { kind: "user_message" }> =>
+        (
+          message,
+        ): message is Extract<TranscriptMessage, { kind: "user_message" }> =>
           message.kind === "user_message" &&
           message.runId === run.id &&
           Boolean(message.attachmentIds?.length),
@@ -55,7 +57,10 @@ export function createAttachmentContextResolver(
             "请概括这条用户消息中的图片，重点说明界面结构、可见文字、主要对象和可能需要修改的视觉细节。",
         });
 
-        contexts.set(getTranscriptMessageKey(message), formatVisionContext(summary));
+        contexts.set(
+          getTranscriptMessageKey(message),
+          formatVisionContext(summary),
+        );
       }
 
       return contexts;

@@ -43,10 +43,10 @@ export class OpenAiCompatibleVisionProvider implements VisionProvider {
   private readonly fetchImplementation: FetchLike;
 
   constructor(private readonly options: OpenAiCompatibleVisionProviderOptions) {
-    this.baseUrl = (
-      options.baseUrl ??
-      "https://api.openai.com/v1"
-    ).replace(/\/+$/, "");
+    this.baseUrl = (options.baseUrl ?? "https://api.openai.com/v1").replace(
+      /\/+$/,
+      "",
+    );
     // 图片理解通常比文本 Agent 慢，尤其是带推理过程的视觉模型。
     // 保留硬超时避免请求无限占用 Run，但默认给足完整响应时间。
     this.timeoutMs = options.timeoutMs ?? 60_000;
@@ -55,10 +55,7 @@ export class OpenAiCompatibleVisionProvider implements VisionProvider {
 
   async inspect(input: Parameters<VisionProvider["inspect"]>[0]) {
     const timeoutController = new AbortController();
-    const timeout = setTimeout(
-      () => timeoutController.abort(),
-      this.timeoutMs,
-    );
+    const timeout = setTimeout(() => timeoutController.abort(), this.timeoutMs);
     const signal = combineAbortSignals(input.signal, timeoutController.signal);
 
     try {
@@ -82,7 +79,8 @@ export class OpenAiCompatibleVisionProvider implements VisionProvider {
                     text: [
                       "请仅返回 JSON，不要 Markdown 代码块。",
                       "字段必须是 description、objects、text、colors、layout、confidence。",
-                      input.prompt ?? "描述图片中的界面、对象、文字、颜色和布局。",
+                      input.prompt ??
+                        "描述图片中的界面、对象、文字、颜色和布局。",
                     ].join("\n"),
                   },
                   ...input.images.map((image) => ({

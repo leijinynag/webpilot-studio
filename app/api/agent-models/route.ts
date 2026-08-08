@@ -1,7 +1,5 @@
 import { requireRequestOwner } from "@/domains/auth/request-owner";
-import {
-  getAgentModelOptions,
-} from "@/infrastructure/agent/provider-factory";
+import { getAgentModelOptions } from "@/infrastructure/agent/provider-factory";
 import {
   agentApiErrorResponse,
   agentJsonResponse,
@@ -19,10 +17,7 @@ export async function GET(request: Request) {
 
   try {
     await requireRequestOwner();
-    return agentJsonResponse(
-      { models: getAgentModelOptions() },
-      correlationId,
-    );
+    return agentJsonResponse({ models: getAgentModelOptions() }, correlationId);
   } catch (error) {
     return agentApiErrorResponse(error, correlationId);
   }

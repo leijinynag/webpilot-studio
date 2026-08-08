@@ -12,7 +12,10 @@ function createRequest(pathname: string, headers?: HeadersInit): NextRequest {
 describe("Showcase Runtime proxy boundary", () => {
   beforeEach(() => {
     vi.stubEnv("NODE_ENV", "production");
-    vi.stubEnv("ANON_SESSION_SECRET", "test-secret-that-is-long-enough-for-proxy");
+    vi.stubEnv(
+      "ANON_SESSION_SECRET",
+      "test-secret-that-is-long-enough-for-proxy",
+    );
     vi.stubEnv("NEXT_PUBLIC_SITE_URL", "https://webpilot-studio.vercel.app");
     vi.stubEnv("SHOWCASE_RUNTIME_ONLY", "true");
   });
@@ -54,8 +57,6 @@ describe("Showcase Runtime proxy boundary", () => {
     const response = proxy(createRequest("/"));
 
     expect(response.headers.get("x-middleware-next")).toBe("1");
-    expect(response.headers.get("set-cookie")).toContain(
-      "webpilot-anonymous=",
-    );
+    expect(response.headers.get("set-cookie")).toContain("webpilot-anonymous=");
   });
 });

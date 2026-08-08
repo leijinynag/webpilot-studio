@@ -205,14 +205,14 @@ export async function processNextImageJob(input?: {
       leaseId: job.leaseId!,
       providerJobId: generated.providerJobId,
     });
-      await settleImageQuotaAndUsage({
-        run,
-        providerJobId: generated.providerJobId,
-        attempt: job.attempt,
-        budgetReservation,
-        providerRequestStarted,
-        providerResponseReceived,
-      });
+    await settleImageQuotaAndUsage({
+      run,
+      providerJobId: generated.providerJobId,
+      attempt: job.attempt,
+      budgetReservation,
+      providerRequestStarted,
+      providerResponseReceived,
+    });
 
     const parent = await getParentRun(run, dependencies.agentStore);
     if (

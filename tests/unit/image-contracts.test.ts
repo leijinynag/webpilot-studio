@@ -23,7 +23,8 @@ describe("image tool contracts", () => {
     );
 
     expect(
-      inspectAttachmentArgumentsSchema.safeParse({ attachmentIds: ids }).success,
+      inspectAttachmentArgumentsSchema.safeParse({ attachmentIds: ids })
+        .success,
     ).toBe(false);
     expect(
       inspectAttachmentArgumentsSchema.safeParse({
@@ -81,15 +82,20 @@ describe("image tool contracts", () => {
     };
 
     expect(parseVisionSummary(valid)).toEqual(valid);
-    expect(parseVisionJsonContent(`\`\`\`json\n${JSON.stringify(valid)}\n\`\`\``))
-      .toEqual(valid);
+    expect(
+      parseVisionJsonContent(`\`\`\`json\n${JSON.stringify(valid)}\n\`\`\``),
+    ).toEqual(valid);
     expect(() =>
       parseVisionSummary({ ...valid, extra: "not allowed" }),
     ).toThrowError(
-      expect.objectContaining({ code: IMAGE_ERROR_CODES.visionInvalidResponse }),
+      expect.objectContaining({
+        code: IMAGE_ERROR_CODES.visionInvalidResponse,
+      }),
     );
     expect(() => parseVisionJsonContent("not-json")).toThrowError(
-      expect.objectContaining({ code: IMAGE_ERROR_CODES.visionInvalidResponse }),
+      expect.objectContaining({
+        code: IMAGE_ERROR_CODES.visionInvalidResponse,
+      }),
     );
   });
 });

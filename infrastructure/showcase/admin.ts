@@ -22,9 +22,7 @@ export function isShowcaseAdminRequest(request: Request): boolean {
   const expected = Buffer.from(configuredToken);
   const actual = Buffer.from(providedToken);
 
-  return (
-    expected.length === actual.length && timingSafeEqual(expected, actual)
-  );
+  return expected.length === actual.length && timingSafeEqual(expected, actual);
 }
 
 function readBearerToken(value: string | null): string | null {
@@ -35,4 +33,3 @@ function readBearerToken(value: string | null): string | null {
   const match = /^Bearer\s+(.+)$/i.exec(value.trim());
   return match?.[1]?.trim() || null;
 }
-

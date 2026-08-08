@@ -34,19 +34,20 @@ describe("project asset signed access", () => {
     const expiresAt = Number(parsed.searchParams.get("exp"));
 
     expect(parsed.origin).toBe("https://webpilot.example");
-    expect(parsed.pathname).toBe(
-      `/api/project-assets/${ASSET.id}/content`,
-    );
+    expect(parsed.pathname).toBe(`/api/project-assets/${ASSET.id}/content`);
     expect(parsed.searchParams.get("projectId")).toBe(ASSET.projectId);
     expect(parsed.searchParams.get("sig")).toBeTruthy();
     expect(
-      verifySignedAssetRequest({
-        assetId: ASSET.id,
-        projectId: ASSET.projectId,
-        ownerId: ASSET.ownerId,
-        expiresAt,
-        signature: parsed.searchParams.get("sig") ?? "",
-      }, 1_754_070_000_000),
+      verifySignedAssetRequest(
+        {
+          assetId: ASSET.id,
+          projectId: ASSET.projectId,
+          ownerId: ASSET.ownerId,
+          expiresAt,
+          signature: parsed.searchParams.get("sig") ?? "",
+        },
+        1_754_070_000_000,
+      ),
     ).toBe(true);
   });
 

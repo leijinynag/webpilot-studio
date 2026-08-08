@@ -12,7 +12,9 @@ export function toAgentLocale(locale: Locale): "zh-CN" | "en-US" {
   return locale === "en" ? "en-US" : "zh-CN";
 }
 
-export function normalizeLocale(value: string | null | undefined): Locale | null {
+export function normalizeLocale(
+  value: string | null | undefined,
+): Locale | null {
   if (!value) {
     return null;
   }

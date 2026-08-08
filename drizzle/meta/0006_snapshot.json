@@ -154,12 +154,8 @@
           "name": "agent_evidence_run_id_agent_runs_id_fk",
           "tableFrom": "agent_evidence",
           "tableTo": "agent_runs",
-          "columnsFrom": [
-            "run_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["run_id"],
+          "columnsTo": ["id"],
           "onDelete": "cascade",
           "onUpdate": "no action"
         },
@@ -167,12 +163,8 @@
           "name": "agent_evidence_project_id_projects_id_fk",
           "tableFrom": "agent_evidence",
           "tableTo": "projects",
-          "columnsFrom": [
-            "project_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["project_id"],
+          "columnsTo": ["id"],
           "onDelete": "cascade",
           "onUpdate": "no action"
         }
@@ -291,12 +283,8 @@
           "name": "agent_run_events_run_id_agent_runs_id_fk",
           "tableFrom": "agent_run_events",
           "tableTo": "agent_runs",
-          "columnsFrom": [
-            "run_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["run_id"],
+          "columnsTo": ["id"],
           "onDelete": "cascade",
           "onUpdate": "no action"
         }
@@ -599,12 +587,8 @@
           "name": "agent_runs_conversation_id_conversations_id_fk",
           "tableFrom": "agent_runs",
           "tableTo": "conversations",
-          "columnsFrom": [
-            "conversation_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["conversation_id"],
+          "columnsTo": ["id"],
           "onDelete": "cascade",
           "onUpdate": "no action"
         },
@@ -612,12 +596,8 @@
           "name": "agent_runs_project_id_projects_id_fk",
           "tableFrom": "agent_runs",
           "tableTo": "projects",
-          "columnsFrom": [
-            "project_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["project_id"],
+          "columnsTo": ["id"],
           "onDelete": "cascade",
           "onUpdate": "no action"
         }
@@ -727,12 +707,8 @@
           "name": "conversations_project_id_projects_id_fk",
           "tableFrom": "conversations",
           "tableTo": "projects",
-          "columnsFrom": [
-            "project_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["project_id"],
+          "columnsTo": ["id"],
           "onDelete": "cascade",
           "onUpdate": "no action"
         }
@@ -852,12 +828,8 @@
           "name": "project_change_set_files_change_set_id_project_change_sets_id_fk",
           "tableFrom": "project_change_set_files",
           "tableTo": "project_change_sets",
-          "columnsFrom": [
-            "change_set_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["change_set_id"],
+          "columnsTo": ["id"],
           "onDelete": "cascade",
           "onUpdate": "no action"
         },
@@ -865,12 +837,8 @@
           "name": "project_change_set_files_before_hash_project_file_blobs_hash_fk",
           "tableFrom": "project_change_set_files",
           "tableTo": "project_file_blobs",
-          "columnsFrom": [
-            "before_hash"
-          ],
-          "columnsTo": [
-            "hash"
-          ],
+          "columnsFrom": ["before_hash"],
+          "columnsTo": ["hash"],
           "onDelete": "no action",
           "onUpdate": "no action"
         },
@@ -878,12 +846,8 @@
           "name": "project_change_set_files_after_hash_project_file_blobs_hash_fk",
           "tableFrom": "project_change_set_files",
           "tableTo": "project_file_blobs",
-          "columnsFrom": [
-            "after_hash"
-          ],
-          "columnsTo": [
-            "hash"
-          ],
+          "columnsFrom": ["after_hash"],
+          "columnsTo": ["hash"],
           "onDelete": "no action",
           "onUpdate": "no action"
         }
@@ -1007,12 +971,8 @@
           "name": "project_change_sets_project_id_projects_id_fk",
           "tableFrom": "project_change_sets",
           "tableTo": "projects",
-          "columnsFrom": [
-            "project_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["project_id"],
+          "columnsTo": ["id"],
           "onDelete": "cascade",
           "onUpdate": "no action"
         },
@@ -1020,12 +980,8 @@
           "name": "project_change_sets_run_id_agent_runs_id_fk",
           "tableFrom": "project_change_sets",
           "tableTo": "agent_runs",
-          "columnsFrom": [
-            "run_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["run_id"],
+          "columnsTo": ["id"],
           "onDelete": "cascade",
           "onUpdate": "no action"
         },
@@ -1033,12 +989,8 @@
           "name": "project_change_sets_base_checkpoint_id_project_checkpoints_id_fk",
           "tableFrom": "project_change_sets",
           "tableTo": "project_checkpoints",
-          "columnsFrom": [
-            "base_checkpoint_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["base_checkpoint_id"],
+          "columnsTo": ["id"],
           "onDelete": "restrict",
           "onUpdate": "no action"
         },
@@ -1046,12 +998,8 @@
           "name": "project_change_sets_result_checkpoint_id_project_checkpoints_id_fk",
           "tableFrom": "project_change_sets",
           "tableTo": "project_checkpoints",
-          "columnsFrom": [
-            "result_checkpoint_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["result_checkpoint_id"],
+          "columnsTo": ["id"],
           "onDelete": "restrict",
           "onUpdate": "no action"
         }
@@ -1181,12 +1129,8 @@
           "name": "project_checkpoints_project_id_projects_id_fk",
           "tableFrom": "project_checkpoints",
           "tableTo": "projects",
-          "columnsFrom": [
-            "project_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["project_id"],
+          "columnsTo": ["id"],
           "onDelete": "cascade",
           "onUpdate": "no action"
         },
@@ -1194,12 +1138,8 @@
           "name": "project_checkpoints_revision_id_project_revisions_id_fk",
           "tableFrom": "project_checkpoints",
           "tableTo": "project_revisions",
-          "columnsFrom": [
-            "revision_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["revision_id"],
+          "columnsTo": ["id"],
           "onDelete": "restrict",
           "onUpdate": "no action"
         },
@@ -1207,12 +1147,8 @@
           "name": "project_checkpoints_run_id_agent_runs_id_fk",
           "tableFrom": "project_checkpoints",
           "tableTo": "agent_runs",
-          "columnsFrom": [
-            "run_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["run_id"],
+          "columnsTo": ["id"],
           "onDelete": "set null",
           "onUpdate": "no action"
         }
@@ -1375,12 +1311,8 @@
           "name": "project_files_project_id_projects_id_fk",
           "tableFrom": "project_files",
           "tableTo": "projects",
-          "columnsFrom": [
-            "project_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["project_id"],
+          "columnsTo": ["id"],
           "onDelete": "cascade",
           "onUpdate": "no action"
         },
@@ -1388,12 +1320,8 @@
           "name": "project_files_blob_hash_project_file_blobs_hash_fk",
           "tableFrom": "project_files",
           "tableTo": "project_file_blobs",
-          "columnsFrom": [
-            "blob_hash"
-          ],
-          "columnsTo": [
-            "hash"
-          ],
+          "columnsFrom": ["blob_hash"],
+          "columnsTo": ["hash"],
           "onDelete": "no action",
           "onUpdate": "no action"
         }
@@ -1449,12 +1377,8 @@
           "name": "project_revision_files_revision_id_project_revisions_id_fk",
           "tableFrom": "project_revision_files",
           "tableTo": "project_revisions",
-          "columnsFrom": [
-            "revision_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["revision_id"],
+          "columnsTo": ["id"],
           "onDelete": "cascade",
           "onUpdate": "no action"
         },
@@ -1462,12 +1386,8 @@
           "name": "project_revision_files_blob_hash_project_file_blobs_hash_fk",
           "tableFrom": "project_revision_files",
           "tableTo": "project_file_blobs",
-          "columnsFrom": [
-            "blob_hash"
-          ],
-          "columnsTo": [
-            "hash"
-          ],
+          "columnsFrom": ["blob_hash"],
+          "columnsTo": ["hash"],
           "onDelete": "no action",
           "onUpdate": "no action"
         }
@@ -1475,10 +1395,7 @@
       "compositePrimaryKeys": {
         "project_revision_files_pk": {
           "name": "project_revision_files_pk",
-          "columns": [
-            "revision_id",
-            "path"
-          ]
+          "columns": ["revision_id", "path"]
         }
       },
       "uniqueConstraints": {},
@@ -1579,12 +1496,8 @@
           "name": "project_revisions_project_id_projects_id_fk",
           "tableFrom": "project_revisions",
           "tableTo": "projects",
-          "columnsFrom": [
-            "project_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["project_id"],
+          "columnsTo": ["id"],
           "onDelete": "cascade",
           "onUpdate": "no action"
         }
@@ -1882,12 +1795,8 @@
           "name": "tool_invocations_run_id_agent_runs_id_fk",
           "tableFrom": "tool_invocations",
           "tableTo": "agent_runs",
-          "columnsFrom": [
-            "run_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["run_id"],
+          "columnsTo": ["id"],
           "onDelete": "cascade",
           "onUpdate": "no action"
         }
@@ -2015,12 +1924,8 @@
           "name": "transcript_messages_conversation_id_conversations_id_fk",
           "tableFrom": "transcript_messages",
           "tableTo": "conversations",
-          "columnsFrom": [
-            "conversation_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["conversation_id"],
+          "columnsTo": ["id"],
           "onDelete": "cascade",
           "onUpdate": "no action"
         },
@@ -2028,12 +1933,8 @@
           "name": "transcript_messages_run_id_agent_runs_id_fk",
           "tableFrom": "transcript_messages",
           "tableTo": "agent_runs",
-          "columnsFrom": [
-            "run_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["run_id"],
+          "columnsTo": ["id"],
           "onDelete": "set null",
           "onUpdate": "no action"
         }
@@ -2306,12 +2207,8 @@
           "name": "verification_runs_run_id_agent_runs_id_fk",
           "tableFrom": "verification_runs",
           "tableTo": "agent_runs",
-          "columnsFrom": [
-            "run_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["run_id"],
+          "columnsTo": ["id"],
           "onDelete": "cascade",
           "onUpdate": "no action"
         },
@@ -2319,12 +2216,8 @@
           "name": "verification_runs_project_id_projects_id_fk",
           "tableFrom": "verification_runs",
           "tableTo": "projects",
-          "columnsFrom": [
-            "project_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["project_id"],
+          "columnsTo": ["id"],
           "onDelete": "cascade",
           "onUpdate": "no action"
         }
@@ -2470,12 +2363,8 @@
           "name": "verification_steps_verification_run_id_verification_runs_id_fk",
           "tableFrom": "verification_steps",
           "tableTo": "verification_runs",
-          "columnsFrom": [
-            "verification_run_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
+          "columnsFrom": ["verification_run_id"],
+          "columnsTo": ["id"],
           "onDelete": "cascade",
           "onUpdate": "no action"
         }
@@ -2500,11 +2389,7 @@
     "public.agent_evidence_kind": {
       "name": "agent_evidence_kind",
       "schema": "public",
-      "values": [
-        "build",
-        "runtime",
-        "console"
-      ]
+      "values": ["build", "runtime", "console"]
     },
     "public.agent_run_status": {
       "name": "agent_run_status",
@@ -2524,21 +2409,12 @@
     "public.project_change_operation": {
       "name": "project_change_operation",
       "schema": "public",
-      "values": [
-        "create",
-        "update",
-        "delete",
-        "rename"
-      ]
+      "values": ["create", "update", "delete", "rename"]
     },
     "public.project_checkpoint_kind": {
       "name": "project_checkpoint_kind",
       "schema": "public",
-      "values": [
-        "agent_start",
-        "agent_success",
-        "restore"
-      ]
+      "values": ["agent_start", "agent_success", "restore"]
     },
     "public.project_revision_kind": {
       "name": "project_revision_kind",
@@ -2555,39 +2431,22 @@
     "public.project_status": {
       "name": "project_status",
       "schema": "public",
-      "values": [
-        "creating",
-        "ready",
-        "error"
-      ]
+      "values": ["creating", "ready", "error"]
     },
     "public.project_storage_kind": {
       "name": "project_storage_kind",
       "schema": "public",
-      "values": [
-        "database",
-        "browser_git"
-      ]
+      "values": ["database", "browser_git"]
     },
     "public.tool_execution_domain": {
       "name": "tool_execution_domain",
       "schema": "public",
-      "values": [
-        "server",
-        "client",
-        "async_worker"
-      ]
+      "values": ["server", "client", "async_worker"]
     },
     "public.tool_invocation_status": {
       "name": "tool_invocation_status",
       "schema": "public",
-      "values": [
-        "created",
-        "running",
-        "succeeded",
-        "failed",
-        "cancelled"
-      ]
+      "values": ["created", "running", "succeeded", "failed", "cancelled"]
     },
     "public.transcript_message_kind": {
       "name": "transcript_message_kind",
@@ -2603,38 +2462,22 @@
     "public.transcript_message_role": {
       "name": "transcript_message_role",
       "schema": "public",
-      "values": [
-        "user",
-        "assistant",
-        "tool",
-        "system"
-      ]
+      "values": ["user", "assistant", "tool", "system"]
     },
     "public.verification_run_source": {
       "name": "verification_run_source",
       "schema": "public",
-      "values": [
-        "agent",
-        "replay"
-      ]
+      "values": ["agent", "replay"]
     },
     "public.verification_run_status": {
       "name": "verification_run_status",
       "schema": "public",
-      "values": [
-        "pending",
-        "running",
-        "passed",
-        "failed"
-      ]
+      "values": ["pending", "running", "passed", "failed"]
     },
     "public.verification_step_status": {
       "name": "verification_step_status",
       "schema": "public",
-      "values": [
-        "passed",
-        "failed"
-      ]
+      "values": ["passed", "failed"]
     }
   },
   "schemas": {},

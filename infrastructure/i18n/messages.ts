@@ -12,10 +12,7 @@ export function getMessages(locale: Locale): Messages {
 
 type MessageTree = Record<string, unknown>;
 
-export function flattenMessageKeys(
-  value: MessageTree,
-  prefix = "",
-): string[] {
+export function flattenMessageKeys(value: MessageTree, prefix = ""): string[] {
   return Object.entries(value).flatMap(([key, child]) => {
     const next = prefix ? `${prefix}.${key}` : key;
     return child && typeof child === "object" && !Array.isArray(child)

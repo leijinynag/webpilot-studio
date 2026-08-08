@@ -459,9 +459,7 @@ describe("Browser Git migration candidate", () => {
         () => target,
       ),
     ).rejects.toMatchObject({
-      code: expect.stringMatching(
-        /INVALID_REQUEST|PROJECT_PATH_CONFLICT/,
-      ),
+      code: expect.stringMatching(/INVALID_REQUEST|PROJECT_PATH_CONFLICT/),
     });
 
     await expect(

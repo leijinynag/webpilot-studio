@@ -13,7 +13,12 @@ export const VISION_PROFILE = {
 export const inspectAttachmentArgumentsSchema = z
   .object({
     attachmentIds: z.array(z.uuid()).min(1).max(VISION_PROFILE.maxAttachments),
-    prompt: z.string().trim().min(1).max(VISION_PROFILE.maxPromptCharacters).optional(),
+    prompt: z
+      .string()
+      .trim()
+      .min(1)
+      .max(VISION_PROFILE.maxPromptCharacters)
+      .optional(),
   })
   .strict();
 

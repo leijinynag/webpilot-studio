@@ -9,9 +9,8 @@ import {
 } from "@/domains/image/validation";
 
 const PNG_1X1 = Uint8Array.from([
-  0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
-  0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
-  0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+  0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49,
+  0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
 ]);
 
 describe("image validation", () => {
@@ -78,9 +77,7 @@ describe("image validation", () => {
         attachmentId: "attachment-1",
         filename: "hero.jpeg",
       }),
-    ).toBe(
-      "private-assets/owner-1/project-1/attachment-1.jpg",
-    );
+    ).toBe("private-assets/owner-1/project-1/attachment-1.jpg");
     expect(
       buildGeneratedImagePathname({
         ownerId: "owner-1",
@@ -89,8 +86,6 @@ describe("image validation", () => {
         generationIndex: 0,
         format: "png",
       }),
-    ).toBe(
-      "private-assets/owner-1/project-1/generated/run-1/0.png",
-    );
+    ).toBe("private-assets/owner-1/project-1/generated/run-1/0.png");
   });
 });

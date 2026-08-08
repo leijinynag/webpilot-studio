@@ -27,9 +27,7 @@ describe("Repository intent", () => {
       allowUnstage: false,
       allowCommit: false,
     });
-    expect(
-      deriveRepositoryIntent("请取消暂存 src/App.tsx"),
-    ).toMatchObject({
+    expect(deriveRepositoryIntent("请取消暂存 src/App.tsx")).toMatchObject({
       allowStage: false,
       allowUnstage: true,
       allowCommit: false,
@@ -37,14 +35,14 @@ describe("Repository intent", () => {
   });
 
   it("commit 意图缺少完整作者信息时不自动生成身份", () => {
-    expect(deriveRepositoryIntent("请提交代码，邮箱是 dev@example.com")).toEqual(
-      {
-        allowStage: false,
-        allowUnstage: false,
-        allowCommit: true,
-        commitAuthor: null,
-      },
-    );
+    expect(
+      deriveRepositoryIntent("请提交代码，邮箱是 dev@example.com"),
+    ).toEqual({
+      allowStage: false,
+      allowUnstage: false,
+      allowCommit: true,
+      commitAuthor: null,
+    });
   });
 
   it("从明确 commit 指令中冻结姓名和邮箱", () => {

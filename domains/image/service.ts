@@ -4,10 +4,7 @@ import { randomUUID } from "node:crypto";
 
 import { and, desc, eq, isNull, ne, or } from "drizzle-orm";
 
-import {
-  IMAGE_ERROR_CODES,
-  ImageError,
-} from "@/domains/image/errors";
+import { IMAGE_ERROR_CODES, ImageError } from "@/domains/image/errors";
 import {
   buildPrivateImagePathname,
   validateImageFile,
@@ -19,7 +16,10 @@ import {
   projectAssets,
   projects,
 } from "@/infrastructure/db/schema";
-import { getDatabase, runDatabaseTransaction } from "@/infrastructure/db/client";
+import {
+  getDatabase,
+  runDatabaseTransaction,
+} from "@/infrastructure/db/client";
 import { getPrivateBlobStore } from "@/infrastructure/blob/private-store";
 import { serverEnv } from "@/infrastructure/env/server";
 import {
@@ -125,7 +125,7 @@ export async function createImageAttachments(input: {
     units: validated.length,
   });
   const store = getPrivateBlobStore();
-  const created: typeof chatAttachments.$inferSelect[] = [];
+  const created: (typeof chatAttachments.$inferSelect)[] = [];
   // Blob 与数据库无法共享同一事务，因此只记录“尚未落库”的对象。
   // 已成功写入数据库的对象即使后续文件失败，也必须保留。
   const pendingPathnames = new Set<string>();
@@ -139,11 +139,7 @@ export async function createImageAttachments(input: {
         attachmentId,
         filename: `${image.originalFilename}.${image.format === "jpeg" ? "jpg" : image.format}`,
       });
-      const blob = await store.put(
-        pathname,
-        image.bytes,
-        image.mimeType,
-      );
+      const blob = await store.put(pathname, image.bytes, image.mimeType);
       pendingPathnames.add(pathname);
 
       const result = await runDatabaseTransaction(async (transaction) => {

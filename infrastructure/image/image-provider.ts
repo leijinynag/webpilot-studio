@@ -1,10 +1,7 @@
 import { z } from "zod";
 
 import { IMAGE_ERROR_CODES, ImageError } from "@/domains/image/errors";
-import type {
-  GeneratedImage,
-  ImageProvider,
-} from "@/domains/image/generation";
+import type { GeneratedImage, ImageProvider } from "@/domains/image/generation";
 
 const responseSchema = z
   .object({
@@ -52,10 +49,7 @@ export class OpenAiCompatibleImageProvider implements ImageProvider {
 
   async generate(input: Parameters<ImageProvider["generate"]>[0]) {
     const timeoutController = new AbortController();
-    const timeout = setTimeout(
-      () => timeoutController.abort(),
-      this.timeoutMs,
-    );
+    const timeout = setTimeout(() => timeoutController.abort(), this.timeoutMs);
     const signal = combineAbortSignals(input.signal, timeoutController.signal);
 
     try {
@@ -82,7 +76,9 @@ export class OpenAiCompatibleImageProvider implements ImageProvider {
         throw new ImageError(
           IMAGE_ERROR_CODES.generationContentRejected,
           "Image Provider 拒绝了当前生图请求。",
-          response.status === 429 || response.status >= 500 ? response.status : 502,
+          response.status === 429 || response.status >= 500
+            ? response.status
+            : 502,
           { status: response.status },
         );
       }

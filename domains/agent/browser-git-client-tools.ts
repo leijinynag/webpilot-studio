@@ -57,10 +57,7 @@ export async function executeBrowserRepositoryClientTool(input: {
           repository,
           request.arguments.path,
         );
-        if (
-          existing &&
-          !request.readBeforeMutation
-        ) {
+        if (existing && !request.readBeforeMutation) {
           return toolReadRequired(request, request.arguments.path);
         }
         const mutation = await repository.writeFile(request.arguments);

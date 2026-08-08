@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 
-import { getErrorMessageMap, getLocalizedErrorMessage } from "@/infrastructure/i18n/error-messages";
+import {
+  getErrorMessageMap,
+  getLocalizedErrorMessage,
+} from "@/infrastructure/i18n/error-messages";
 import { flattenMessageKeys } from "@/infrastructure/i18n/messages";
 import en from "@/messages/en.json";
 import zh from "@/messages/zh.json";

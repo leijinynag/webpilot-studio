@@ -87,16 +87,13 @@ describe("request security", () => {
   });
 
   it("优先使用 forwarded host/proto 计算反向代理后的 origin", () => {
-    const request = new NextRequest(
-      "http://localhost:3100/api/projects",
-      {
-        headers: {
-          host: "localhost:3100",
-          "x-forwarded-host": "studio.example",
-          "x-forwarded-proto": "https",
-        },
+    const request = new NextRequest("http://localhost:3100/api/projects", {
+      headers: {
+        host: "localhost:3100",
+        "x-forwarded-host": "studio.example",
+        "x-forwarded-proto": "https",
       },
-    );
+    });
 
     expect(getRequestOrigin(request)).toBe("https://studio.example");
   });

@@ -110,11 +110,12 @@ describe("WebContainerRuntimeManager", () => {
     const originalFetch = globalThis.fetch;
     vi.stubGlobal(
       "fetch",
-      vi.fn(async () =>
-        new Response(Uint8Array.from([1, 2, 3]), {
-          status: 200,
-          headers: { "content-type": "image/png" },
-        }),
+      vi.fn(
+        async () =>
+          new Response(Uint8Array.from([1, 2, 3]), {
+            status: 200,
+            headers: { "content-type": "image/png" },
+          }),
       ),
     );
 
@@ -219,9 +220,7 @@ describe("WebContainerRuntimeManager", () => {
       ).rejects.toMatchObject({
         diagnostic: { code: "asset_sync_failed" },
       });
-      expect(manager.getSnapshot().diagnostic?.code).toBe(
-        "asset_sync_failed",
-      );
+      expect(manager.getSnapshot().diagnostic?.code).toBe("asset_sync_failed");
     }
   });
 

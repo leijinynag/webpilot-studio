@@ -29,8 +29,7 @@ const preparation: BrowserGitMigrationPreparation = {
   projectId: project.id,
   projectName: project.name,
   sourceRevision: project.revision,
-  candidateRepositoryId:
-    "migration-33333333-3333-4333-8333-333333333333",
+  candidateRepositoryId: "migration-33333333-3333-4333-8333-333333333333",
   manifestHash: "a".repeat(64),
   files: [
     {
@@ -218,9 +217,9 @@ describe("BrowserGitMigrationController", () => {
     await expect(controller.migrate({ project })).rejects.toBeInstanceOf(
       BrowserGitMigrationRecoveryRequiredError,
     );
-    await expect(controller.recover({ projectId: project.id })).resolves.toEqual(
-      migratedProject,
-    );
+    await expect(
+      controller.recover({ projectId: project.id }),
+    ).resolves.toEqual(migratedProject);
 
     const finalizeBodies = fetcher.mock.calls
       .map((call) => {

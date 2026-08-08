@@ -92,7 +92,10 @@ export async function GET(
         { status: 404 },
       );
     }
-    if (error instanceof ImageError && error.code === IMAGE_ERROR_CODES.assetNotFound) {
+    if (
+      error instanceof ImageError &&
+      error.code === IMAGE_ERROR_CODES.assetNotFound
+    ) {
       return NextResponse.json(
         { error: { code: error.code, message: error.message } },
         { status: 404 },

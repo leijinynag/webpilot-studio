@@ -1,9 +1,7 @@
 import { NextResponse } from "next/server";
 import { z } from "zod";
 
-import {
-  getPublishedShowcaseCase,
-} from "@/infrastructure/showcase/repository";
+import { getPublishedShowcaseCase } from "@/infrastructure/showcase/repository";
 import { showcaseApiError } from "@/infrastructure/showcase/api";
 
 const paramsSchema = z.object({ slug: z.string().min(1).max(160) }).strict();

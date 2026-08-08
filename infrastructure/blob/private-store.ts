@@ -2,10 +2,7 @@ import "server-only";
 
 import { del, get, put } from "@vercel/blob";
 
-import {
-  IMAGE_ERROR_CODES,
-  ImageError,
-} from "@/domains/image/errors";
+import { IMAGE_ERROR_CODES, ImageError } from "@/domains/image/errors";
 import { serverEnv } from "@/infrastructure/env/server";
 
 export type PrivateBlobObject = {

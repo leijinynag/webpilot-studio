@@ -120,7 +120,10 @@ export class VisionToolExecutor {
         ownerId: input.run.ownerId,
         runId: input.run.id,
       });
-      if (latestRun.cancellationRequestedAt || latestRun.status === "cancelled") {
+      if (
+        latestRun.cancellationRequestedAt ||
+        latestRun.status === "cancelled"
+      ) {
         throw new AgentError(
           AGENT_ERROR_CODES.cancelled,
           "Agent Run 已请求取消，Vision 工具不会继续执行。",

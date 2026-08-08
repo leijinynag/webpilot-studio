@@ -1,7 +1,5 @@
 import type { LlmToolDefinition } from "@/domains/agent/provider";
-import {
-  VISION_PROFILE,
-} from "@/domains/image/vision";
+import { VISION_PROFILE } from "@/domains/image/vision";
 
 export const INSPECT_ATTACHMENT_TOOL_NAME = "inspect_attachment";
 
@@ -34,6 +32,4 @@ export const VISION_TOOL_DEFINITIONS = [
   INSPECT_ATTACHMENT_TOOL_DEFINITION,
 ] as const;
 
-export {
-  type InspectAttachmentArguments,
-} from "@/domains/image/vision";
+export { type InspectAttachmentArguments } from "@/domains/image/vision";

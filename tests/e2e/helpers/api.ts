@@ -40,9 +40,7 @@ async function getMutationHeaders(
   );
 
   if (!csrfCookie) {
-    throw new Error(
-      "E2E 请求缺少 CSRF Cookie，请先访问主站页面建立匿名会话。",
-    );
+    throw new Error("E2E 请求缺少 CSRF Cookie，请先访问主站页面建立匿名会话。");
   }
 
   headers.set("x-webpilot-csrf", csrfCookie.value);
