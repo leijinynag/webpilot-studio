@@ -18,6 +18,20 @@ import type {
 } from "@/domains/project/types";
 import { isProjectError, PROJECT_ERROR_CODES } from "@/domains/project/errors";
 import { assertValidProjectPath } from "@/domains/project/path";
+import { browserApiFetch } from "@/infrastructure/http/browser-api";
+
+/**
+ * 同一个工作台可能因为 React Strict Mode、路由切换或重复挂载，
+ * 在很短时间内创建多个 Repository 实例。
+ *
+ * Browser Git 的首次 provision claim 是服务端一次性操作，而 Worker
+ * 初始化还需要异步创建 IndexedDB 文件系统。这里按 projectId 合并整条
+ * 初始化链，避免第二个调用在第一个调用完成前拿到 allowCreate=false。
+ */
+const browserGitInitializationPromises = new Map<
+  string,
+  Promise<BrowserGitRepositoryState>
+>();
 
 /**
  * Browser Git 适配器只在客户端创建。
@@ -43,31 +57,27 @@ export class BrowserGitProjectRepository {
   async initialize(
     initialFiles: readonly { path: string; content: string }[] = [],
   ) {
-    const provision = await this.claimProvisionIfNeeded();
-    const provisionFiles =
-      provision.allowCreate && provision.initialFiles.length > 0
-        ? provision.initialFiles
-        : initialFiles;
+    const existingInitialization = browserGitInitializationPromises.get(
+      this.project.id,
+    );
+    const initialization =
+      existingInitialization ?? this.createInitializationPromise(initialFiles);
+
+    if (!existingInitialization) {
+      browserGitInitializationPromises.set(this.project.id, initialization);
+    }
 
     try {
-      this.state = await this.client.initialize({
-        projectId: this.project.id,
-        projectName: this.project.name,
-        initialFiles: provisionFiles.map((file) => ({
-          path: assertValidProjectPath(file.path),
-          content: file.content,
-        })),
-        allowCreate: provision.allowCreate,
-      });
+      this.state = await initialization;
       return this.state;
-    } catch (error) {
+    } finally {
+      // 只合并同一批并发调用。完成后释放引用，避免长期持有项目状态，
+      // 同时让失败后的下一次打开能够重新执行 provision 和 Worker 初始化。
       if (
-        isProjectError(error) &&
-        error.code === PROJECT_ERROR_CODES.storageUnavailable
+        browserGitInitializationPromises.get(this.project.id) === initialization
       ) {
-        await this.reportUnavailable(error.message);
+        browserGitInitializationPromises.delete(this.project.id);
       }
-      throw error;
     }
   }
 
@@ -235,6 +245,39 @@ export class BrowserGitProjectRepository {
     return (await this.listFiles()).length;
   }
 
+  private createInitializationPromise(
+    initialFiles: readonly { path: string; content: string }[],
+  ): Promise<BrowserGitRepositoryState> {
+    return (async () => {
+      const provision = await this.claimProvisionIfNeeded();
+      const provisionFiles =
+        provision.allowCreate && provision.initialFiles.length > 0
+          ? provision.initialFiles
+          : initialFiles;
+
+      try {
+        return await this.client.initialize({
+          projectId: this.project.id,
+          projectName: this.project.name,
+          initialFiles: provisionFiles.map((file) => ({
+            path: assertValidProjectPath(file.path),
+            content: file.content,
+          })),
+          allowCreate: provision.allowCreate,
+        });
+      } catch (error) {
+        if (
+          isProjectError(error) &&
+          error.code === PROJECT_ERROR_CODES.storageUnavailable
+        ) {
+          // 错误处理也属于共享初始化链，多个等待者只会上报一次。
+          await this.reportUnavailable(error.message);
+        }
+        throw error;
+      }
+    })();
+  }
+
   private async claimProvisionIfNeeded(): Promise<{
     allowCreate: boolean;
     initialFiles: Array<{ path: string; content: string }>;
@@ -243,7 +286,7 @@ export class BrowserGitProjectRepository {
       return { allowCreate: false, initialFiles: [] };
     }
 
-    const response = await fetch(
+    const response = await browserApiFetch(
       `/api/projects/${this.project.id}/browser-git/provision`,
       {
         method: "POST",
@@ -273,11 +316,14 @@ export class BrowserGitProjectRepository {
 
   private async reportUnavailable(reason: string): Promise<void> {
     try {
-      await fetch(`/api/projects/${this.project.id}/browser-git/provision`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ action: "unavailable", reason }),
-      });
+      await browserApiFetch(
+        `/api/projects/${this.project.id}/browser-git/provision`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ action: "unavailable", reason }),
+        },
+      );
     } catch {
       // 服务端状态上报只是辅助索引，不能覆盖 Worker 返回的本地数据丢失错误。
     }

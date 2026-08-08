@@ -79,6 +79,7 @@ export async function POST(
       ownerId,
       projectId,
       conversationId,
+      request,
       files,
     });
 

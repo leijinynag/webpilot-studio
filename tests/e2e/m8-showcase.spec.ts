@@ -4,6 +4,7 @@ import {
   type APIRequestContext,
   type Page,
 } from "@playwright/test";
+import { postWithCsrf } from "./helpers/api";
 import { unzipSync } from "fflate";
 
 const RUN_WEBCONTAINER_E2E = process.env.RUN_M8_WEBCONTAINER_E2E === "1";
@@ -61,7 +62,7 @@ async function createProject(
 ): Promise<Project> {
   // 首次访问让 Proxy 建立匿名 owner，随后 page.request 会复用同一 Cookie。
   await page.goto("/");
-  const response = await page.request.post("/api/projects", { data: input });
+  const response = await postWithCsrf(page, "/api/projects", { data: input });
   expect(response.status()).toBe(201);
   return ((await response.json()) as { project: Project }).project;
 }
@@ -241,7 +242,7 @@ test.describe("M8 export and i18n smoke", () => {
   }) => {
     await createOwnedContext(page);
 
-    const databaseResponse = await page.request.post("/api/projects", {
+    const databaseResponse = await postWithCsrf(page, "/api/projects", {
       data: {
         name: "M8 empty database",
         storageKind: "database",
@@ -259,7 +260,7 @@ test.describe("M8 export and i18n smoke", () => {
     expect(databaseFilesResponse.status()).toBe(200);
     expect(await databaseFilesResponse.json()).toMatchObject({ files: [] });
 
-    const browserGitResponse = await page.request.post("/api/projects", {
+    const browserGitResponse = await postWithCsrf(page, "/api/projects", {
       data: {
         name: "M8 empty Browser Git",
         storageKind: "browser_git",
@@ -320,11 +321,12 @@ test.describe("M8 export and i18n smoke", () => {
 
       await page.goto(`/p/${project.id}`);
       // aria-label 是无障碍区域名称，标题文案单独验证，避免把可见标题
-      // 与语义标签耦合在一起，导致中英文文案调整时测试失去定位能力。
+      // 与语义标签耦合在一起。Agent 顶部已改为紧凑的会话切换器，
+      // 因此验证真实保留的可访问命令，不再要求已经删除的装饰性标题。
       await expect(page.getByLabel("Agent", { exact: true })).toBeVisible();
       await expect(
-        page.getByText(isChinese ? "Agent 工作台" : "Agent workspace", {
-          exact: true,
+        page.getByRole("button", {
+          name: isChinese ? "查看会话历史" : "View conversation history",
         }),
       ).toBeVisible();
       await expect(
@@ -622,7 +624,7 @@ test.describe("M8 Agent locale", () => {
         storageKind: "database",
         template: "rsbuild",
       });
-      const response = await page.request.post("/api/agent-runs", {
+      const response = await postWithCsrf(page, "/api/agent-runs", {
         data: {
           projectId: project.id,
           message:

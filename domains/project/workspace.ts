@@ -3,6 +3,19 @@ import type { ProjectFileSnapshot } from "@/domains/project/types";
 export type WorkspaceSaveStatus =
   "idle" | "saving" | "saved" | "conflict" | "error";
 
+/**
+ * 成功态和进行中状态只保存结构化事实，不在领域层拼接用户可见文案。
+ * 具体语言由工作台组件根据当前 locale 决定；服务端错误仍通过
+ * statusMessage 原样保留，避免翻译层覆盖有价值的诊断信息。
+ */
+export type WorkspaceStatusDetail =
+  | { kind: "saving" }
+  | { kind: "saved"; revision: number; hasNewDraft: boolean }
+  | { kind: "created"; path: string }
+  | { kind: "renamed"; path: string }
+  | { kind: "deleted"; path: string }
+  | null;
+
 export type WorkspaceFile = ProjectFileSnapshot & {
   /**
    * serverContent 是当前客户端已确认写入 Repository 的内容，
@@ -28,6 +41,7 @@ export type ProjectWorkspaceState = {
   activePath: string | null;
   revision: number;
   saveStatus: WorkspaceSaveStatus;
+  statusDetail: WorkspaceStatusDetail;
   statusMessage: string;
   conflict: WorkspaceConflict | null;
 };
@@ -88,6 +102,7 @@ export function createProjectWorkspaceState(
     activePath: firstPath,
     revision,
     saveStatus: "idle",
+    statusDetail: null,
     statusMessage: "",
     conflict: null,
   };
@@ -141,6 +156,7 @@ export function projectWorkspaceReducer(
         },
         // 用户继续编辑代表正在处理冲突或错误，状态提示不应继续伪装为已保存。
         saveStatus: state.saveStatus === "saving" ? state.saveStatus : "idle",
+        statusDetail: state.saveStatus === "saving" ? state.statusDetail : null,
         statusMessage: "",
       };
     }
@@ -149,7 +165,8 @@ export function projectWorkspaceReducer(
       return {
         ...state,
         saveStatus: "saving",
-        statusMessage: "正在写入 Repository...",
+        statusDetail: { kind: "saving" },
+        statusMessage: "",
         conflict: null,
       };
 
@@ -168,7 +185,8 @@ export function projectWorkspaceReducer(
         activePath: created.path,
         revision: action.revision,
         saveStatus: "saved",
-        statusMessage: `已创建 ${created.path}`,
+        statusDetail: { kind: "created", path: created.path },
+        statusMessage: "",
         conflict: null,
       };
     }
@@ -190,7 +208,8 @@ export function projectWorkspaceReducer(
             : state.activePath,
         revision: action.revision,
         saveStatus: "saved",
-        statusMessage: `已重命名为 ${action.file.path}`,
+        statusDetail: { kind: "renamed", path: action.file.path },
+        statusMessage: "",
         conflict: null,
       };
     }
@@ -212,7 +231,8 @@ export function projectWorkspaceReducer(
         activePath,
         revision: action.revision,
         saveStatus: "saved",
-        statusMessage: `已删除 ${action.path}`,
+        statusDetail: { kind: "deleted", path: action.path },
+        statusMessage: "",
         conflict: null,
       };
     }
@@ -221,6 +241,7 @@ export function projectWorkspaceReducer(
       return {
         ...state,
         saveStatus: "conflict",
+        statusDetail: null,
         statusMessage: action.message,
         conflict: {
           actualRevision: action.actualRevision,
@@ -233,6 +254,7 @@ export function projectWorkspaceReducer(
       return {
         ...state,
         saveStatus: "error",
+        statusDetail: null,
         statusMessage: action.message,
       };
 
@@ -243,6 +265,7 @@ export function projectWorkspaceReducer(
       return {
         ...state,
         saveStatus: "idle",
+        statusDetail: null,
         statusMessage: "",
         conflict: null,
       };
@@ -286,9 +309,12 @@ function applySavedFile(
     },
     revision,
     saveStatus: "saved",
-    statusMessage: savedDraftWasCurrent
-      ? `Revision ${revision} 已保存`
-      : `Revision ${revision} 已保存，仍有新草稿`,
+    statusDetail: {
+      kind: "saved",
+      revision,
+      hasNewDraft: !savedDraftWasCurrent,
+    },
+    statusMessage: "",
     conflict: null,
   };
 }

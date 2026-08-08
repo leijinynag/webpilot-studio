@@ -41,6 +41,14 @@ import {
   runDatabaseTransaction,
 } from "@/infrastructure/db/client";
 import { getAgentPersistence } from "@/infrastructure/http/agent-api";
+import {
+  isGlobalBudgetEnabled,
+  recordImageUsage,
+  reserveImageUsageBudget,
+  releaseQuotaReservation,
+  settleImageUsageBudget,
+  type UsageBudgetReservation,
+} from "@/infrastructure/quota/service";
 
 const MAX_GENERATED_IMAGE_BYTES = 10 * 1024 * 1024;
 
@@ -77,18 +85,55 @@ export async function processNextImageJob(input?: {
   }
 
   const { job, run } = claimed;
+  if (claimed.finalized) {
+    // 达到最大重试次数时，claimImageJob 已经提交了 image job/run 终态并
+    // 释放了图片并发租约。这里补齐父 Agent 的 Tool Ledger 和 transcript，
+    // 避免父 Run 永久停留在 awaiting_async_job。
+    await completeFailedImageTool(
+      run,
+      new ImageError(
+        IMAGE_ERROR_CODES.generationFailed,
+        run.errorMessage ?? "图片生成任务已达到最大重试次数。",
+        502,
+        run.errorCode ? { persistedErrorCode: run.errorCode } : undefined,
+      ),
+      dependencies.agentStore,
+    );
+    return;
+  }
+
   const createdAssets: Array<{
     id: string;
     pathname: string;
   }> = [];
+  let budgetReservation: UsageBudgetReservation | null = null;
+  let providerRequestStarted = false;
+  let providerResponseReceived = false;
 
   try {
+    // 生图费用必须在 Provider 请求前预留。attempt 纳入幂等键，
+    // 因此队列重复投递不会重复占用同一次 Provider 调用的预算。
+    budgetReservation = await reserveImageUsageBudget({
+      ownerId: run.ownerId,
+      imageRunId: run.id,
+      provider: run.provider,
+      model: run.model,
+      count: run.requestedCount,
+      size: run.size,
+      attempt: job.attempt,
+    });
+
+    // ImageProvider 当前没有显式 request_started 事件。generate() 是唯一的
+    // 外部请求入口，因此调用前标记为 started；即使上游响应前超时，也按
+    // “供应商可能已收费”处理，避免真实账单与本地账本不一致。
+    providerRequestStarted = true;
     const generated = await dependencies.provider.generate({
       prompt: run.prompt,
       count: run.requestedCount,
       size: parseImageSize(run.size),
       model: run.model,
     });
+    providerResponseReceived = true;
 
     if (generated.images.length !== run.requestedCount) {
       throw new ImageError(
@@ -153,17 +198,21 @@ export async function processNextImageJob(input?: {
       },
     };
 
-    await completeSuccessfulImageTool(
-      run,
-      result,
-      dependencies.agentStore,
-    );
+    await completeSuccessfulImageTool(run, result, dependencies.agentStore);
 
     await markImageJobSucceeded({
       imageJobId: job.id,
       leaseId: job.leaseId!,
       providerJobId: generated.providerJobId,
     });
+      await settleImageQuotaAndUsage({
+        run,
+        providerJobId: generated.providerJobId,
+        attempt: job.attempt,
+        budgetReservation,
+        providerRequestStarted,
+        providerResponseReceived,
+      });
 
     const parent = await getParentRun(run, dependencies.agentStore);
     if (
@@ -202,13 +251,28 @@ export async function processNextImageJob(input?: {
     }
 
     if (!outcome.retryScheduled) {
-      await completeFailedImageTool(
+      await settleImageQuotaAndUsage({
         run,
-        imageError,
-        dependencies.agentStore,
-      );
+        attempt: job.attempt,
+        status: "settled",
+        budgetReservation,
+        providerRequestStarted,
+        providerResponseReceived,
+      });
+      await completeFailedImageTool(run, imageError, dependencies.agentStore);
       return;
     }
+
+    // 可重试失败也要先结算当前 attempt。下一次重试是新的 Provider 请求，
+    // 使用新的幂等键和新的预算预留，不能让本次 reservation 一直悬挂。
+    await settleImageQuotaAndUsage({
+      run,
+      attempt: job.attempt,
+      status: "settled",
+      budgetReservation,
+      providerRequestStarted,
+      providerResponseReceived,
+    });
 
     // 只有可重试失败才把异常交回 Vercel Queue。Queue 会按 vercel.json
     // 中的 retryAfterSeconds 重新投递；永久失败已经完成事实落库，必须确认。
@@ -216,9 +280,62 @@ export async function processNextImageJob(input?: {
   }
 }
 
-function resolveDependencies(
-  overrides?: ImageWorkerDependencies,
-): {
+async function settleImageQuotaAndUsage(input: {
+  run: typeof imageRuns.$inferSelect;
+  providerJobId?: string;
+  attempt: number;
+  status?: "settled";
+  budgetReservation: UsageBudgetReservation | null;
+  providerRequestStarted: boolean;
+  providerResponseReceived: boolean;
+}): Promise<void> {
+  // Worker 的状态提交已经完成后才释放并发租约。两个操作均为幂等，
+  // 释放失败只记录日志，不把已经写入的业务终态改成内部错误。
+  try {
+    await releaseQuotaReservation({
+      resource: "image_generation",
+      resourceId: input.run.id,
+    });
+  } catch (error) {
+    console.error("[image-worker] image quota release failed", {
+      imageRunId: input.run.id,
+      error,
+    });
+  }
+
+  try {
+    if (input.budgetReservation || isGlobalBudgetEnabled()) {
+      await settleImageUsageBudget({
+        reservation: input.budgetReservation,
+        providerRequestStarted: input.providerRequestStarted,
+        providerResponseReceived: input.providerResponseReceived,
+        providerJobId: input.providerJobId,
+      });
+    } else {
+      await recordImageUsage({
+        ownerId: input.run.ownerId,
+        imageRunId: input.run.id,
+        provider: input.run.provider,
+        model: input.run.model,
+        count: input.run.requestedCount,
+        size: input.run.size,
+        providerJobId: input.providerJobId,
+        attempt: input.attempt,
+        status: input.status ?? "settled",
+      });
+    }
+  } catch (error) {
+    // 业务终态已经先写入，账务失败不能把队列变成无限重试；
+    // 这里保留结构化日志，后续由账务对账任务或告警补偿。
+    console.error("[image-worker] image usage settlement failed", {
+      imageRunId: input.run.id,
+      attempt: input.attempt,
+      error,
+    });
+  }
+}
+
+function resolveDependencies(overrides?: ImageWorkerDependencies): {
   provider: ImageProvider;
   blobStore: PrivateBlobStore;
   agentStore: ImageWorkerAgentStore;
@@ -505,9 +622,12 @@ async function cleanupCreatedAssets(
   }
 
   await runDatabaseTransaction(async (tx) => {
-    await tx
-      .delete(projectAssets)
-      .where(inArray(projectAssets.id, assets.map((asset) => asset.id)));
+    await tx.delete(projectAssets).where(
+      inArray(
+        projectAssets.id,
+        assets.map((asset) => asset.id),
+      ),
+    );
   });
 
   await Promise.all(
@@ -551,14 +671,8 @@ async function getParentRevision(
   return parent?.currentRevision ?? 0;
 }
 
-function parseImageSize(
-  value: string,
-): GenerateImageArguments["size"] {
-  if (
-    value === "1024x1024" ||
-    value === "1024x1536" ||
-    value === "1536x1024"
-  ) {
+function parseImageSize(value: string): GenerateImageArguments["size"] {
+  if (value === "1024x1024" || value === "1024x1536" || value === "1536x1024") {
     return value;
   }
 

@@ -11,11 +11,15 @@ describe("environment schemas", () => {
         DATABASE_URL: "",
         AGENT_ENABLED: "",
         MAX_AGENT_MODEL_TURNS: "",
+        MAX_AGENT_FILE_MUTATIONS: "",
+        VISION_TIMEOUT_MS: "",
       }),
     ).toEqual({
       DATABASE_URL: undefined,
       AGENT_ENABLED: undefined,
       MAX_AGENT_MODEL_TURNS: undefined,
+      MAX_AGENT_FILE_MUTATIONS: undefined,
+      VISION_TIMEOUT_MS: undefined,
     });
   });
 
@@ -23,15 +27,22 @@ describe("environment schemas", () => {
     expect(
       serverEnvSchema.parse({
         MAX_AGENT_MODEL_TURNS: "20",
+        MAX_AGENT_FILE_MUTATIONS: "512",
+        VISION_TIMEOUT_MS: "60000",
         MAX_GLOBAL_DAILY_COST_USD: "0",
       }),
     ).toMatchObject({
       MAX_AGENT_MODEL_TURNS: 20,
+      MAX_AGENT_FILE_MUTATIONS: 512,
+      VISION_TIMEOUT_MS: 60000,
       MAX_GLOBAL_DAILY_COST_USD: 0,
     });
 
     expect(() =>
       serverEnvSchema.parse({ MAX_CONCURRENT_RUNS_PER_OWNER: "many" }),
+    ).toThrow();
+    expect(() =>
+      serverEnvSchema.parse({ MAX_AGENT_FILE_MUTATIONS: "many" }),
     ).toThrow();
   });
 

@@ -47,7 +47,9 @@ export class OpenAiCompatibleVisionProvider implements VisionProvider {
       options.baseUrl ??
       "https://api.openai.com/v1"
     ).replace(/\/+$/, "");
-    this.timeoutMs = options.timeoutMs ?? 20_000;
+    // 图片理解通常比文本 Agent 慢，尤其是带推理过程的视觉模型。
+    // 保留硬超时避免请求无限占用 Run，但默认给足完整响应时间。
+    this.timeoutMs = options.timeoutMs ?? 60_000;
     this.fetchImplementation = options.fetchImplementation ?? fetch;
   }
 
@@ -100,11 +102,17 @@ export class OpenAiCompatibleVisionProvider implements VisionProvider {
       );
 
       if (!response.ok) {
+        const upstreamError = await readUpstreamError(response);
         throw new ImageError(
           IMAGE_ERROR_CODES.visionContentRejected,
-          "Vision Provider 拒绝了当前图片分析请求。",
+          upstreamError
+            ? `Vision Provider 拒绝了当前图片分析请求：${upstreamError}`
+            : "Vision Provider 拒绝了当前图片分析请求。",
           response.status === 429 ? 429 : 502,
-          { status: response.status },
+          {
+            status: response.status,
+            ...(upstreamError ? { upstreamError } : {}),
+          },
         );
       }
 
@@ -150,6 +158,34 @@ export class OpenAiCompatibleVisionProvider implements VisionProvider {
       clearTimeout(timeout);
     }
   }
+}
+
+/**
+ * 上游错误响应通常包含真正的兼容性原因，例如参数不支持或模型不可用。
+ * 这里只提取短消息，不记录响应头、API Key 或图片内容。
+ */
+async function readUpstreamError(response: Response): Promise<string | null> {
+  try {
+    const body = (await response.json()) as unknown;
+    if (!body || typeof body !== "object") {
+      return null;
+    }
+
+    const error = (body as { error?: unknown }).error;
+    if (typeof error === "string") {
+      return error.slice(0, 500);
+    }
+    if (error && typeof error === "object") {
+      const message = (error as { message?: unknown }).message;
+      if (typeof message === "string") {
+        return message.slice(0, 500);
+      }
+    }
+  } catch {
+    // 某些 Provider 返回纯文本或空 body，保持通用错误消息即可。
+  }
+
+  return null;
 }
 
 function combineAbortSignals(

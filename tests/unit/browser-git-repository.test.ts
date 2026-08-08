@@ -30,6 +30,7 @@ function createProject(
 describe("BrowserGitProjectRepository initialization", () => {
   beforeEach(() => {
     vi.restoreAllMocks();
+    vi.unstubAllGlobals();
     mockedGetBrowserGitClient.mockReturnValue({
       initialize: vi.fn().mockResolvedValue({
         projectId: "019f9d8f-e884-7b26-99d7-4f7dad1187f0",
@@ -99,5 +100,75 @@ describe("BrowserGitProjectRepository initialization", () => {
       initialFiles: [{ path: "local-fallback.ts", content: "local fallback" }],
       allowCreate: false,
     });
+  });
+
+  it("合并同一项目的并发初始化，只消费一次 provision claim", async () => {
+    let resolveProvision!: (response: Response) => void;
+    const provisionResponse = new Promise<Response>((resolve) => {
+      resolveProvision = resolve;
+    });
+    const fetchMock = vi.fn().mockReturnValue(provisionResponse);
+    vi.stubGlobal("fetch", fetchMock);
+    const client = mockedGetBrowserGitClient();
+    const firstRepository = new BrowserGitProjectRepository(createProject());
+    const secondRepository = new BrowserGitProjectRepository(createProject());
+
+    const firstInitialization = firstRepository.initialize();
+    const secondInitialization = secondRepository.initialize();
+
+    // 第二个 Repository 实例必须复用第一条完整初始化链，不能再次领取创建权。
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(client.initialize).not.toHaveBeenCalled();
+
+    resolveProvision(
+      new Response(
+        JSON.stringify({
+          allowCreate: true,
+          initialFiles: [],
+        }),
+        {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        },
+      ),
+    );
+
+    const [firstState, secondState] = await Promise.all([
+      firstInitialization,
+      secondInitialization,
+    ]);
+
+    expect(client.initialize).toHaveBeenCalledTimes(1);
+    expect(firstState).toBe(secondState);
+  });
+
+  it("初始化失败后释放共享 Promise，允许下一次调用重试", async () => {
+    const client = mockedGetBrowserGitClient();
+    vi.mocked(client.initialize)
+      .mockRejectedValueOnce(new Error("Worker temporarily unavailable"))
+      .mockResolvedValueOnce({
+        projectId: "019f9d8f-e884-7b26-99d7-4f7dad1187f0",
+        revision: 0,
+        branch: "main",
+        head: null,
+        ahead: 0,
+        behind: 0,
+        files: [],
+        commits: [],
+        unavailable: false,
+        unavailableReason: null,
+      });
+    const repository = new BrowserGitProjectRepository(
+      createProject({ status: "ready", revision: 0, fileCount: 0 }),
+    );
+
+    await expect(repository.initialize()).rejects.toThrow(
+      "Worker temporarily unavailable",
+    );
+    await expect(repository.initialize()).resolves.toMatchObject({
+      projectId: "019f9d8f-e884-7b26-99d7-4f7dad1187f0",
+      revision: 0,
+    });
+    expect(client.initialize).toHaveBeenCalledTimes(2);
   });
 });

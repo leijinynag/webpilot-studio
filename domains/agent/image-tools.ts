@@ -1,22 +1,18 @@
 import type { PgQueryResultHKT } from "drizzle-orm/pg-core/session";
 
 import type { AgentRunRecord } from "@/domains/agent/types";
-import type {
-  GenerateImageArguments,
-} from "@/domains/image/generation";
-import {
-  generateImageArgumentsSchema,
-} from "@/domains/image/generation";
-import {
-  IMAGE_ERROR_CODES,
-  ImageError,
-} from "@/domains/image/errors";
-import {
-  GENERATE_IMAGE_TOOL_NAME,
-} from "@/domains/image/generation-tool";
+import type { GenerateImageArguments } from "@/domains/image/generation";
+import { generateImageArgumentsSchema } from "@/domains/image/generation";
+import { IMAGE_ERROR_CODES, ImageError } from "@/domains/image/errors";
+import { GENERATE_IMAGE_TOOL_NAME } from "@/domains/image/generation-tool";
 import type { AgentStore } from "@/domains/agent/store";
 import { AGENT_ERROR_CODES, AgentError } from "@/domains/agent/errors";
 import type { JobQueue } from "@/infrastructure/queue/job-queue";
+import {
+  getQuotaIpSubjectKey,
+  releaseQuotaReservation,
+  reserveQuota,
+} from "@/infrastructure/quota/service";
 
 export type ImageToolResultEnvelope = {
   ok: boolean;
@@ -79,35 +75,61 @@ export class ImageToolExecutor {
 
     if (input.run.usage.clientResumes >= input.run.budget.maxClientResumes) {
       throw new AgentError(
-        AGENT_ERROR_CODES.budgetExhausted,
+        AGENT_ERROR_CODES.clientResumesExhausted,
         "Agent 已达到异步任务恢复次数上限。",
         409,
       );
     }
 
-    const job = await this.store.suspendForImageGeneration({
+    const quotaReservation = await reserveQuota({
+      resource: "image_generation",
       ownerId: input.run.ownerId,
-      runId: input.run.id,
-      projectId: input.run.projectId,
-      conversationId: input.run.conversationId,
-      toolCallId: input.toolCallId,
-      argumentsJson: parsed.data as GenerateImageArguments,
-      idempotencyKey: `${input.run.id}:${input.toolCallId}`,
-      revision: input.run.currentRevision,
-      leaseId: input.leaseId,
-      provider: this.options.provider,
-      model: this.options.model,
-      profile: this.options.profile,
-      profileVersion: this.options.profileVersion,
+      units: parsed.data.count,
+      ipSubjectKey: await getQuotaIpSubjectKey({
+        resource: "agent_run",
+        resourceId: input.run.id,
+      }),
+      correlationId: input.run.correlationId,
     });
 
+    let job: { imageRunId: string; imageJobId: string };
+    try {
+      job = await this.store.suspendForImageGeneration({
+        ownerId: input.run.ownerId,
+        runId: input.run.id,
+        projectId: input.run.projectId,
+        conversationId: input.run.conversationId,
+        toolCallId: input.toolCallId,
+        argumentsJson: parsed.data as GenerateImageArguments,
+        idempotencyKey: `${input.run.id}:${input.toolCallId}`,
+        revision: input.run.currentRevision,
+        leaseId: input.leaseId,
+        provider: this.options.provider,
+        model: this.options.model,
+        profile: this.options.profile,
+        profileVersion: this.options.profileVersion,
+        quotaReservation,
+      });
+    } catch (error) {
+      // 创建事务失败时租约仍未绑定到 imageRun，可以安全退回本次请求
+      // 消耗的全部单位；释放本身幂等，不会覆盖已绑定的真实任务。
+      await releaseQuotaReservation({
+        reservation: quotaReservation,
+        refundUnits: parsed.data.count,
+      });
+      throw error;
+    }
+
     // 任务记录已经在数据库事务中提交，队列发送失败时仍可由恢复入口重新
-    // 投递；不能把真实生图请求放在当前模型请求线程内同步执行。
+    // 投递；此时必须保留已绑定的 image_generation lease，不能错误退款。
     await this.queue.enqueue({
       imageJobId: job.imageJobId,
       imageRunId: job.imageRunId,
     });
 
-    return job;
+    return {
+      imageRunId: job.imageRunId,
+      imageJobId: job.imageJobId,
+    };
   }
 }

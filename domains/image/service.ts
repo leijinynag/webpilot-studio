@@ -22,11 +22,15 @@ import {
 import { getDatabase, runDatabaseTransaction } from "@/infrastructure/db/client";
 import { getPrivateBlobStore } from "@/infrastructure/blob/private-store";
 import { serverEnv } from "@/infrastructure/env/server";
+import {
+  releaseQuotaReservation,
+  reserveQuota,
+} from "@/infrastructure/quota/service";
 
 export function assertAttachmentUploadEnabled(): void {
   if (serverEnv.ATTACHMENT_UPLOAD_ENABLED !== "true") {
     throw new ImageError(
-      IMAGE_ERROR_CODES.uploadDisabled,
+      IMAGE_ERROR_CODES.featureDisabled,
       "图片附件上传功能尚未启用。",
       503,
     );
@@ -91,6 +95,7 @@ export async function createImageAttachments(input: {
   ownerId: string;
   projectId: string;
   conversationId?: string;
+  request?: Request;
   files: File[];
 }) {
   if (input.files.length === 0) {
@@ -113,6 +118,12 @@ export async function createImageAttachments(input: {
   }
 
   const validated = await Promise.all(input.files.map(validateImageFile));
+  const quotaReservation = await reserveQuota({
+    resource: "attachment_upload",
+    ownerId: input.ownerId,
+    request: input.request,
+    units: validated.length,
+  });
   const store = getPrivateBlobStore();
   const created: typeof chatAttachments.$inferSelect[] = [];
   // Blob 与数据库无法共享同一事务，因此只记录“尚未落库”的对象。
@@ -244,6 +255,9 @@ export async function createImageAttachments(input: {
       }
     }
 
+    // Blob 和数据库记录都已成功提交，上传 lease 只负责保护本次请求的
+    // 并发窗口，此时必须立即释放，不能让它等待自然过期。
+    await releaseQuotaReservation({ reservation: quotaReservation });
     return created.map(toAttachmentView);
   } catch (error) {
     await Promise.all(
@@ -253,6 +267,10 @@ export async function createImageAttachments(input: {
         }),
       ),
     );
+    await releaseQuotaReservation({
+      reservation: quotaReservation,
+      refundUnits: Math.max(0, validated.length - created.length),
+    });
     throw error;
   }
 }

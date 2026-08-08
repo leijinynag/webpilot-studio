@@ -2,12 +2,17 @@ import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { AgentPanel } from "@/components/workbench/agent-panel";
+import {
+  AgentPanel,
+  clearAgentSnapshotCache,
+} from "@/components/workbench/agent-panel";
+import { IMAGE_ONLY_MESSAGE_CONTENT } from "@/domains/agent/message-content";
 import {
   EMPTY_AGENT_RUN_USAGE,
   type AgentConversationSnapshot,
   type AgentRunRecord,
   type ConversationRecord,
+  type TranscriptMessage,
 } from "@/domains/agent/types";
 
 class MockEventSource {
@@ -152,9 +157,48 @@ function createEmptySnapshot(): AgentConversationSnapshot {
   };
 }
 
+function installModelAwareFetchMock(
+  fallbackFetch: ReturnType<typeof vi.fn<typeof fetch>>,
+) {
+  const fetchMock = vi.fn<typeof fetch>((input, init) => {
+    const url = String(input);
+    if (url.includes("/api/agent-models")) {
+      return Promise.resolve(
+        Response.json({
+          models: [
+            {
+              id: "deepseek-v4-pro",
+              label: "deepseek-v4-pro",
+              tier: "agent",
+            },
+            {
+              id: "deepseek-v4-flash",
+              label: "deepseek-v4-flash",
+              tier: "fast",
+            },
+            {
+              id: "gpt-5.5",
+              label: "gpt-5.5",
+              tier: "agent",
+            },
+          ],
+        }),
+      );
+    }
+
+    // 模型列表请求是 AgentPanel 的独立辅助请求。其余请求继续交给每个
+    // 测试自己配置的响应队列，避免新增能力改变原有快照测试的时序。
+    return fallbackFetch(input, init);
+  });
+
+  vi.stubGlobal("fetch", fetchMock);
+  return fetchMock;
+}
+
 describe("AgentPanel", () => {
   afterEach(() => {
     cleanup();
+    clearAgentSnapshotCache();
     vi.unstubAllGlobals();
     MockEventSource.instances = [];
   });
@@ -176,7 +220,7 @@ describe("AgentPanel", () => {
           snapshot: createSnapshot("succeeded"),
         }),
       );
-    vi.stubGlobal("fetch", fetchMock);
+    installModelAwareFetchMock(fetchMock);
     vi.stubGlobal("EventSource", MockEventSource);
 
     render(
@@ -189,7 +233,9 @@ describe("AgentPanel", () => {
     );
 
     expect(await screen.findByText("执行中", { exact: true })).toBeVisible();
-    expect(screen.getByRole("button", { name: "停止" })).toBeVisible();
+    expect(
+      screen.getByRole("button", { name: "停止 Agent Run" }),
+    ).toBeVisible();
     await waitFor(() => expect(MockEventSource.instances).toHaveLength(1));
     expect(String(MockEventSource.instances[0]?.url)).toContain("?cursor=12");
 
@@ -199,8 +245,9 @@ describe("AgentPanel", () => {
 
     expect(await screen.findByText("已完成", { exact: true })).toBeVisible();
     expect(
-      screen.queryByRole("button", { name: "停止" }),
+      screen.queryByRole("button", { name: "停止 Agent Run" }),
     ).not.toBeInTheDocument();
+    await userEvent.setup().click(screen.getByLabelText("展开或收起运行详情"));
     expect(screen.getByRole("button", { name: "查看改动" })).toBeVisible();
     expect(screen.getByLabelText("给 Agent 的消息")).toBeEnabled();
     await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
@@ -215,7 +262,7 @@ describe("AgentPanel", () => {
         snapshot: runningSnapshot,
       }),
     );
-    vi.stubGlobal("fetch", fetchMock);
+    installModelAwareFetchMock(fetchMock);
     vi.stubGlobal("EventSource", MockEventSource);
 
     render(
@@ -245,7 +292,9 @@ describe("AgentPanel", () => {
         "1",
       );
     });
-    expect(screen.getByText("我先检查项目结构。")).toBeVisible();
+    await waitFor(() => {
+      expect(screen.getByText("我先检查项目结构。")).toBeVisible();
+    });
 
     await act(async () => {
       stream?.emit(
@@ -283,7 +332,7 @@ describe("AgentPanel", () => {
         snapshot: runningSnapshot,
       }),
     );
-    vi.stubGlobal("fetch", fetchMock);
+    installModelAwareFetchMock(fetchMock);
     vi.stubGlobal("EventSource", MockEventSource);
 
     render(
@@ -295,7 +344,13 @@ describe("AgentPanel", () => {
       />,
     );
 
-    expect(await screen.findByText("正在请求模型规划下一步")).toBeVisible();
+    const runDetails = await screen.findByLabelText("展开或收起运行详情");
+    expect(
+      runDetails
+        .closest("details")
+        ?.querySelector(".agent-run-status-summary-detail"),
+    ).toHaveTextContent("正在请求模型规划下一步");
+    await userEvent.setup().click(runDetails);
     expect(screen.getByText(/1\/12 轮次/)).toBeVisible();
 
     await act(async () => {
@@ -313,7 +368,63 @@ describe("AgentPanel", () => {
       );
     });
 
-    expect(screen.getByText("模型已响应，正在完成当前步骤")).toBeVisible();
+    await waitFor(() => {
+      expect(
+        runDetails
+          .closest("details")
+          ?.querySelector(".agent-run-status-summary-detail"),
+      ).toHaveTextContent("模型已响应，正在完成当前步骤");
+    });
+  });
+
+  it("文件写入预算耗尽时不再误报为模型轮次上限", async () => {
+    const exhaustedSnapshot = createSnapshot("budget_exhausted");
+    exhaustedSnapshot.runs[0] = {
+      ...exhaustedSnapshot.runs[0]!,
+      errorCode: "AGENT_FILE_MUTATIONS_EXHAUSTED",
+      errorMessage: "Agent 已达到文件 mutation 次数上限。",
+      budget: {
+        ...exhaustedSnapshot.runs[0]!.budget,
+        maxModelTurns: 32,
+        maxFileMutations: 8,
+      },
+      usage: {
+        ...exhaustedSnapshot.runs[0]!.usage,
+        modelTurns: 9,
+        fileMutations: 8,
+      },
+      completedAt: new Date("2026-07-30T00:01:00.000Z"),
+    };
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
+      Response.json({
+        conversations: [conversation],
+        snapshot: exhaustedSnapshot,
+      }),
+    );
+    installModelAwareFetchMock(fetchMock);
+    vi.stubGlobal("EventSource", MockEventSource);
+
+    render(
+      <AgentPanel
+        dirtyPaths={[]}
+        onRestoreComplete={vi.fn()}
+        projectId={conversation.projectId}
+        revision={2}
+      />,
+    );
+
+    expect(
+      await screen.findByText("文件写入预算已用尽", { exact: true }),
+    ).toBeVisible();
+    const runDetails = screen.getByLabelText("展开或收起运行详情");
+    expect(
+      runDetails
+        .closest("details")
+        ?.querySelector(".agent-run-status-summary-detail"),
+    ).toHaveTextContent("已完成 8/8 次源码写入");
+    await userEvent.setup().click(runDetails);
+    expect(screen.getByText(/9\/32 轮次/)).toBeVisible();
+    expect(screen.queryByText("模型轮次预算已用尽")).not.toBeInTheDocument();
   });
 
   it("合并密集 SSE 事件，只在短窗口内读取一次完整快照", async () => {
@@ -325,7 +436,7 @@ describe("AgentPanel", () => {
         snapshot: runningSnapshot,
       }),
     );
-    vi.stubGlobal("fetch", fetchMock);
+    installModelAwareFetchMock(fetchMock);
     vi.stubGlobal("EventSource", MockEventSource);
 
     render(
@@ -357,7 +468,9 @@ describe("AgentPanel", () => {
       }
     });
 
-    expect(screen.getByText("12345678")).toBeVisible();
+    await waitFor(() => {
+      expect(screen.getByText("12345678")).toBeVisible();
+    });
     expect(fetchMock).toHaveBeenCalledTimes(1);
     await waitFor(
       () => {
@@ -398,7 +511,7 @@ describe("AgentPanel", () => {
           snapshot: nextSnapshot,
         }),
       );
-    vi.stubGlobal("fetch", fetchMock);
+    installModelAwareFetchMock(fetchMock);
     vi.stubGlobal("EventSource", MockEventSource);
 
     const view = render(
@@ -472,7 +585,7 @@ describe("AgentPanel", () => {
           snapshot: activeSnapshot,
         }),
       );
-    vi.stubGlobal("fetch", fetchMock);
+    installModelAwareFetchMock(fetchMock);
     vi.stubGlobal("EventSource", MockEventSource);
     const onRevisionChange = vi.fn();
 
@@ -487,7 +600,7 @@ describe("AgentPanel", () => {
     );
 
     expect(await screen.findByText("恢复终态")).toBeVisible();
-    await user.click(screen.getByRole("button", { name: "2 个会话" }));
+    await user.click(screen.getByRole("button", { name: "查看会话历史" }));
     await user.click(screen.getByRole("button", { name: "正在生成页面" }));
 
     expect(await screen.findByText("正在生成页面")).toBeVisible();
@@ -519,7 +632,7 @@ describe("AgentPanel", () => {
           snapshot: createSnapshot("running"),
         }),
       );
-    vi.stubGlobal("fetch", fetchMock);
+    installModelAwareFetchMock(fetchMock);
     vi.stubGlobal("EventSource", MockEventSource);
 
     render(
@@ -573,7 +686,7 @@ describe("AgentPanel", () => {
           { status: 503 },
         ),
       );
-    vi.stubGlobal("fetch", fetchMock);
+    installModelAwareFetchMock(fetchMock);
     vi.stubGlobal("EventSource", MockEventSource);
 
     render(
@@ -596,5 +709,415 @@ describe("AgentPanel", () => {
     expect(
       screen.queryByTestId("optimistic-user-message"),
     ).not.toBeInTheDocument();
+  });
+
+  it("选择模型后把模型冻结值提交给 Run API", async () => {
+    const user = userEvent.setup();
+    const fetchQueue = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        Response.json({
+          conversations: [conversation],
+          snapshot: createEmptySnapshot(),
+        }),
+      )
+      .mockResolvedValueOnce(
+        Response.json(
+          { run: createRun("running") },
+          {
+            status: 201,
+          },
+        ),
+      )
+      .mockResolvedValue(
+        Response.json({
+          conversations: [conversation],
+          snapshot: createSnapshot("running"),
+        }),
+      );
+    const fetchMock = installModelAwareFetchMock(fetchQueue);
+    vi.stubGlobal("EventSource", MockEventSource);
+
+    render(
+      <AgentPanel
+        dirtyPaths={[]}
+        onRestoreComplete={vi.fn()}
+        projectId={conversation.projectId}
+        revision={0}
+      />,
+    );
+
+    const composer = await screen.findByLabelText("给 Agent 的消息");
+    await user.click(screen.getByRole("button", { name: "选择 Agent 模型" }));
+    await user.click(
+      screen.getByRole("menuitemradio", { name: "deepseek-v4-flash" }),
+    );
+    await user.type(composer, "使用快速模型生成页面");
+    await user.click(screen.getByRole("button", { name: "发送消息" }));
+
+    await waitFor(() => {
+      expect(fetchQueue).toHaveBeenCalledWith(
+        "/api/agent-runs",
+        expect.objectContaining({
+          body: expect.stringContaining('"model":"deepseek-v4-flash"'),
+        }),
+      );
+    });
+    expect(fetchMock).toHaveBeenCalledWith("/api/agent-models", {
+      cache: "no-store",
+    });
+  });
+
+  it("渲染已持久化图片消息时隐藏图片-only占位符并显示可预览缩略图", async () => {
+    const imageSnapshot = createSnapshot("succeeded");
+    imageSnapshot.transcript = [
+      {
+        ...(imageSnapshot.transcript[0] as Extract<
+          TranscriptMessage,
+          { kind: "user_message" }
+        >),
+        content: IMAGE_ONLY_MESSAGE_CONTENT,
+        attachmentIds: [
+          "00000000-0000-4000-8000-000000000001",
+          "00000000-0000-4000-8000-000000000002",
+        ],
+      },
+    ];
+    const fetchQueue = vi.fn<typeof fetch>().mockResolvedValue(
+      Response.json({
+        conversations: [conversation],
+        snapshot: imageSnapshot,
+      }),
+    );
+    installModelAwareFetchMock(fetchQueue);
+    vi.stubGlobal("EventSource", MockEventSource);
+
+    render(
+      <AgentPanel
+        dirtyPaths={[]}
+        onRestoreComplete={vi.fn()}
+        projectId={conversation.projectId}
+        revision={2}
+      />,
+    );
+
+    expect(await screen.findByLabelText("图片附件")).toBeVisible();
+    expect(screen.getAllByRole("img")).toHaveLength(2);
+    expect(
+      screen.queryByText(IMAGE_ONLY_MESSAGE_CONTENT),
+    ).not.toBeInTheDocument();
+    expect(screen.getByAltText("第 1 张图片预览")).toHaveAttribute(
+      "src",
+      "/api/attachments/00000000-0000-4000-8000-000000000001",
+    );
+  });
+
+  it("返回工作台时立即恢复标签页缓存并在后台重验证", async () => {
+    let resolveRevalidation: ((response: Response) => void) | undefined;
+    const revalidation = new Promise<Response>((resolve) => {
+      resolveRevalidation = resolve;
+    });
+    const fetchQueue = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        Response.json({
+          conversations: [conversation],
+          snapshot: createSnapshot("succeeded"),
+        }),
+      )
+      .mockReturnValueOnce(revalidation);
+    installModelAwareFetchMock(fetchQueue);
+    vi.stubGlobal("EventSource", MockEventSource);
+
+    const firstView = render(
+      <AgentPanel
+        dirtyPaths={[]}
+        onRestoreComplete={vi.fn()}
+        projectId={conversation.projectId}
+        revision={2}
+      />,
+    );
+    expect(await screen.findByText("修改页面标题")).toBeVisible();
+    firstView.unmount();
+
+    render(
+      <AgentPanel
+        dirtyPaths={[]}
+        onRestoreComplete={vi.fn()}
+        projectId={conversation.projectId}
+        revision={2}
+      />,
+    );
+
+    // 第二次挂载的 GET 仍在等待，但成功快照应立即可见，不能重新覆盖成恢复占位。
+    expect(screen.getByText("修改页面标题")).toBeVisible();
+    expect(
+      screen.queryByText("正在恢复 Agent 会话..."),
+    ).not.toBeInTheDocument();
+    await waitFor(() => expect(fetchQueue).toHaveBeenCalledTimes(2));
+
+    await act(async () => {
+      resolveRevalidation?.(
+        Response.json({
+          conversations: [conversation],
+          snapshot: createSnapshot("succeeded"),
+        }),
+      );
+    });
+  });
+
+  it("运行中保持输入可编辑，Enter 不会误触发停止或提交", async () => {
+    const user = userEvent.setup();
+    const runningSnapshot = createSnapshot("running");
+    runningSnapshot.events = [];
+    const fetchQueue = vi.fn<typeof fetch>().mockResolvedValue(
+      Response.json({
+        conversations: [conversation],
+        snapshot: runningSnapshot,
+      }),
+    );
+    installModelAwareFetchMock(fetchQueue);
+    vi.stubGlobal("EventSource", MockEventSource);
+
+    render(
+      <AgentPanel
+        dirtyPaths={[]}
+        onRestoreComplete={vi.fn()}
+        projectId={conversation.projectId}
+        revision={2}
+      />,
+    );
+
+    const composer = await screen.findByLabelText("给 Agent 的消息");
+    const stopButton = await screen.findByRole("button", {
+      name: "停止 Agent Run",
+    });
+    const runDetails = screen.getByLabelText("展开或收起运行详情");
+
+    expect(composer).toBeEnabled();
+    expect(stopButton).toBeVisible();
+    expect(
+      screen.getAllByRole("button", { name: "停止 Agent Run" }),
+    ).toHaveLength(1);
+    expect(runDetails.closest("details")).not.toHaveAttribute("open");
+
+    await user.type(composer, "下一轮继续优化");
+    await user.keyboard("{Enter}");
+
+    expect(composer).toHaveValue("下一轮继续优化\n");
+    expect(fetchQueue).toHaveBeenCalledTimes(1);
+    expect(stopButton).toBeVisible();
+  });
+
+  it("运行详情与失败的 Browser Verify 默认折叠，按需展开查看", async () => {
+    const user = userEvent.setup();
+    const snapshot = createSnapshot("succeeded");
+    snapshot.verificationRuns = [
+      {
+        id: "77777777-7777-4777-8777-777777777777",
+        seq: 1,
+        runId: snapshot.runs[0]!.id,
+        toolCallId: "verify-call-1",
+        projectId: conversation.projectId,
+        ownerId: conversation.ownerId,
+        revision: 2,
+        status: "failed",
+        source: "agent",
+        replayCount: 0,
+        smokeSteps: [],
+        acceptedNetworkFailures: [],
+        buildEvidence: null,
+        runtimeEvidence: null,
+        consoleEvidence: null,
+        browserEvidence: null,
+        networkEvidence: null,
+        buildOk: true,
+        runtimeOk: true,
+        consoleOk: false,
+        networkOk: true,
+        actionsOk: true,
+        assertionsOk: false,
+        revisionOk: true,
+        failedStep: 0,
+        summary: "按钮仍不可见",
+        startedAt: new Date("2026-07-30T00:00:10.000Z"),
+        completedAt: new Date("2026-07-30T00:00:12.000Z"),
+        createdAt: new Date("2026-07-30T00:00:10.000Z"),
+      },
+    ];
+    const fetchQueue = vi.fn<typeof fetch>().mockResolvedValue(
+      Response.json({
+        conversations: [conversation],
+        snapshot,
+      }),
+    );
+    installModelAwareFetchMock(fetchQueue);
+    vi.stubGlobal("EventSource", MockEventSource);
+
+    render(
+      <AgentPanel
+        dirtyPaths={[]}
+        onRestoreComplete={vi.fn()}
+        projectId={conversation.projectId}
+        revision={2}
+      />,
+    );
+
+    const runDetails = await screen.findByLabelText("展开或收起运行详情");
+    expect(runDetails.closest("details")).not.toHaveAttribute("open");
+
+    await user.click(runDetails);
+    const verificationSummary = screen.getByText("Browser Verify");
+    const verificationDetails = verificationSummary.closest("details");
+    expect(verificationDetails).not.toHaveAttribute("open");
+
+    await user.click(verificationSummary);
+    expect(verificationDetails).toHaveAttribute("open");
+    expect(screen.getByText(/按钮仍不可见/)).toBeVisible();
+  });
+
+  it("使用 GFM 渲染持久化回复并支持复制 fenced code", async () => {
+    const user = userEvent.setup();
+    const writeTextSpy = vi
+      .spyOn(navigator.clipboard, "writeText")
+      .mockResolvedValue();
+    const markdownSnapshot = createSnapshot("succeeded");
+    markdownSnapshot.transcript.push({
+      id: "88888888-8888-4888-8888-888888888888",
+      conversationId: conversation.id,
+      runId: markdownSnapshot.runs[0]!.id,
+      seq: 2,
+      role: "assistant",
+      kind: "assistant_message",
+      content: [
+        "## 修改结果",
+        "",
+        "- 已更新布局",
+        "- 已保留滚动锚点",
+        "",
+        "| 项目 | 状态 |",
+        "| --- | --- |",
+        "| Markdown | 完成 |",
+        "",
+        "[查看文档](https://example.com/docs)",
+        "",
+        "```tsx",
+        "export const ready = true;",
+        "```",
+      ].join("\n"),
+    });
+    const fetchQueue = vi.fn<typeof fetch>().mockResolvedValue(
+      Response.json({
+        conversations: [conversation],
+        snapshot: markdownSnapshot,
+      }),
+    );
+    installModelAwareFetchMock(fetchQueue);
+    vi.stubGlobal("EventSource", MockEventSource);
+
+    render(
+      <AgentPanel
+        dirtyPaths={[]}
+        onRestoreComplete={vi.fn()}
+        projectId={conversation.projectId}
+        revision={2}
+      />,
+    );
+
+    expect(
+      await screen.findByRole("heading", { name: "修改结果", level: 2 }),
+    ).toBeVisible();
+    expect(screen.getByRole("list")).toBeVisible();
+    expect(screen.getByRole("table")).toBeVisible();
+    expect(screen.getByRole("link", { name: "查看文档" })).toHaveAttribute(
+      "target",
+      "_blank",
+    );
+    expect(screen.getByText("export const ready = true;")).toBeVisible();
+
+    await user.click(screen.getByRole("button", { name: "复制代码" }));
+
+    expect(writeTextSpy).toHaveBeenCalledWith("export const ready = true;");
+    expect(screen.getByRole("button", { name: "代码已复制" })).toBeVisible();
+  });
+
+  it("流式输出只在用户位于底部时跟随，否则补偿内容高度变化", async () => {
+    const runningSnapshot = createSnapshot("running");
+    runningSnapshot.events = [];
+    const fetchQueue = vi.fn<typeof fetch>().mockResolvedValue(
+      Response.json({
+        conversations: [conversation],
+        snapshot: runningSnapshot,
+      }),
+    );
+    installModelAwareFetchMock(fetchQueue);
+    vi.stubGlobal("EventSource", MockEventSource);
+
+    const view = render(
+      <AgentPanel
+        dirtyPaths={[]}
+        onRestoreComplete={vi.fn()}
+        projectId={conversation.projectId}
+        revision={2}
+      />,
+    );
+
+    await screen.findByText("执行中", { exact: true });
+    const transcript = view.container.querySelector(
+      ".agent-transcript",
+    ) as HTMLDivElement;
+    let scrollHeight = 500;
+    Object.defineProperty(transcript, "clientHeight", {
+      configurable: true,
+      value: 200,
+    });
+    Object.defineProperty(transcript, "scrollHeight", {
+      configurable: true,
+      get: () => scrollHeight,
+    });
+
+    transcript.scrollTop = 300;
+    await act(async () => {
+      transcript.dispatchEvent(new Event("scroll", { bubbles: true }));
+      MockEventSource.instances[0]?.emit(
+        "assistant.delta",
+        {
+          id: "event-scroll-bottom",
+          runId: createRun("running").id,
+          sequence: 1,
+          type: "assistant.delta",
+          payload: { text: "第一段" },
+          createdAt: new Date().toISOString(),
+        },
+        "1",
+      );
+      scrollHeight = 560;
+    });
+    await waitFor(() => {
+      expect(transcript.scrollTop).toBe(560);
+    });
+
+    transcript.scrollTop = 120;
+    await act(async () => {
+      transcript.dispatchEvent(new Event("scroll", { bubbles: true }));
+      scrollHeight = 620;
+      MockEventSource.instances[0]?.emit(
+        "assistant.delta",
+        {
+          id: "event-scroll-reading",
+          runId: createRun("running").id,
+          sequence: 2,
+          type: "assistant.delta",
+          payload: { text: "第二段" },
+          createdAt: new Date().toISOString(),
+        },
+        "2",
+      );
+    });
+
+    // 非底部状态不跳到 620，而是在原 120 基础上补偿新增的 60px。
+    await waitFor(() => {
+      expect(transcript.scrollTop).toBe(180);
+    });
   });
 });

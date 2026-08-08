@@ -14,6 +14,7 @@ import {
 import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { Button } from "@/components/ui/button";
+import { browserApiFetch } from "@/infrastructure/http/browser-api";
 import { getLocalizedErrorMessage } from "@/infrastructure/i18n/error-messages";
 import { useUiI18n } from "@/infrastructure/i18n/ui";
 import {
@@ -39,7 +40,7 @@ type ApiErrorResponse = {
 };
 
 async function fetchProjects(locale: "zh" | "en"): Promise<ProjectSummary[]> {
-  const response = await fetch("/api/projects?includeDeleted=true", {
+  const response = await browserApiFetch("/api/projects?includeDeleted=true", {
     cache: "no-store",
   });
   const body = (await response.json()) as
@@ -71,7 +72,9 @@ export function ProjectsPage() {
       setProjects(await fetchProjects(locale));
     } catch (loadError) {
       setError(
-        loadError instanceof Error ? loadError.message : t("projects.loadFailed"),
+        loadError instanceof Error
+          ? loadError.message
+          : t("projects.loadFailed"),
       );
     } finally {
       setLoading(false);
@@ -126,9 +129,12 @@ export function ProjectsPage() {
     setError(null);
 
     try {
-      const response = await fetch(`/api/projects/${project.id}/${action}`, {
-        method: "POST",
-      });
+      const response = await browserApiFetch(
+        `/api/projects/${project.id}/${action}`,
+        {
+          method: "POST",
+        },
+      );
       const body = (await response.json()) as ApiErrorResponse;
 
       if (!response.ok) {
@@ -209,7 +215,9 @@ export function ProjectsPage() {
 
         <div className="section-heading">
           <h2>{t("projects.recent")}</h2>
-          <span>{t("projects.projectCount", { count: activeProjects.length })}</span>
+          <span>
+            {t("projects.projectCount", { count: activeProjects.length })}
+          </span>
         </div>
 
         {error ? (
@@ -268,14 +276,19 @@ export function ProjectsPage() {
 
       <aside className="projects-aside">
         <div className="eyebrow">{t("projects.status")}</div>
-        <h2 className="font-editorial aside-title">{t("projects.statusTitle")}</h2>
+        <h2 className="font-editorial aside-title">
+          {t("projects.statusTitle")}
+        </h2>
         <div className="workspace-facts">
           <WorkspaceFact
             label={t("projects.active")}
             value={loading ? "..." : String(activeProjects.length)}
           />
           <WorkspaceFact label={t("projects.storage")} value="PostgreSQL" />
-          <WorkspaceFact label={t("projects.session")} value={t("projects.anonymous")} />
+          <WorkspaceFact
+            label={t("projects.session")}
+            value={t("projects.anonymous")}
+          />
         </div>
 
         <div className="deleted-projects">
@@ -306,7 +319,9 @@ export function ProjectsPage() {
               </div>
             ))
           ) : (
-            <p className="deleted-projects-empty">{t("projects.noRecoverable")}</p>
+            <p className="deleted-projects-empty">
+              {t("projects.noRecoverable")}
+            </p>
           )}
         </div>
       </aside>
@@ -324,7 +339,9 @@ export function ProjectsPage() {
             <DialogTitle>{t("projects.deleteTitle")}</DialogTitle>
             <DialogDescription>
               {projectToDelete
-                ? t("projects.deleteDescription", { name: projectToDelete.name })
+                ? t("projects.deleteDescription", {
+                    name: projectToDelete.name,
+                  })
                 : null}
             </DialogDescription>
           </DialogHeader>
@@ -380,7 +397,8 @@ function ProjectRow({
         <span className="project-name">
           <b>{project.name}</b>
           <span>
-            Revision {project.revision} · {formatProjectStatus(project.status, t)}
+            Revision {project.revision} ·{" "}
+            {formatProjectStatus(project.status, t)}
           </span>
         </span>
         <span className="storage-badge">
@@ -481,7 +499,9 @@ function formatRelativeTime(value: string, locale: "zh" | "en"): string {
   const elapsedMinutes = Math.floor(elapsedSeconds / 60);
 
   if (elapsedMinutes < 60) {
-    return locale === "zh" ? `${elapsedMinutes} 分钟前` : `${elapsedMinutes}m ago`;
+    return locale === "zh"
+      ? `${elapsedMinutes} 分钟前`
+      : `${elapsedMinutes}m ago`;
   }
 
   const elapsedHours = Math.floor(elapsedMinutes / 60);

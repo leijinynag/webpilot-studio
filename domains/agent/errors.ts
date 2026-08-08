@@ -3,6 +3,11 @@ export const AGENT_ERROR_CODES = {
   runNotFound: "AGENT_RUN_NOT_FOUND",
   invalidTransition: "AGENT_INVALID_TRANSITION",
   runConflict: "AGENT_RUN_CONFLICT",
+  featureDisabled: "FEATURE_DISABLED",
+  globalBudgetExhausted: "GLOBAL_BUDGET_EXHAUSTED",
+  dailyQuotaExhausted: "DAILY_QUOTA_EXHAUSTED",
+  tooManyConcurrentRuns: "TOO_MANY_CONCURRENT_RUNS",
+  runBudgetExhausted: "RUN_BUDGET_EXHAUSTED",
   providerNotConfigured: "AGENT_PROVIDER_NOT_CONFIGURED",
   providerTimeout: "AGENT_PROVIDER_TIMEOUT",
   providerRateLimited: "AGENT_PROVIDER_RATE_LIMITED",
@@ -10,6 +15,11 @@ export const AGENT_ERROR_CODES = {
   providerInterrupted: "AGENT_PROVIDER_INTERRUPTED",
   profileUnavailable: "AGENT_PROFILE_UNAVAILABLE",
   budgetExhausted: "AGENT_BUDGET_EXHAUSTED",
+  modelTurnsExhausted: "AGENT_MODEL_TURNS_EXHAUSTED",
+  fileMutationsExhausted: "AGENT_FILE_MUTATIONS_EXHAUSTED",
+  clientResumesExhausted: "AGENT_CLIENT_RESUMES_EXHAUSTED",
+  wallTimeExhausted: "AGENT_WALL_TIME_EXHAUSTED",
+  outputExhausted: "AGENT_OUTPUT_EXHAUSTED",
   noProgress: "AGENT_NO_PROGRESS",
   cancelled: "AGENT_CANCELLED",
   revisionConflict: "AGENT_REVISION_CONFLICT",
@@ -20,6 +30,19 @@ export const AGENT_ERROR_CODES = {
 
 export type AgentErrorCode =
   (typeof AGENT_ERROR_CODES)[keyof typeof AGENT_ERROR_CODES];
+
+const AGENT_BUDGET_ERROR_CODES = new Set<AgentErrorCode>([
+  AGENT_ERROR_CODES.budgetExhausted,
+  AGENT_ERROR_CODES.modelTurnsExhausted,
+  AGENT_ERROR_CODES.fileMutationsExhausted,
+  AGENT_ERROR_CODES.clientResumesExhausted,
+  AGENT_ERROR_CODES.wallTimeExhausted,
+  AGENT_ERROR_CODES.outputExhausted,
+]);
+
+export function isAgentBudgetErrorCode(code: AgentErrorCode): boolean {
+  return AGENT_BUDGET_ERROR_CODES.has(code);
+}
 
 export class AgentError extends Error {
   constructor(
@@ -89,17 +112,13 @@ export function serializeAgentError(
       : {}),
     ...(typeof databaseError.query === "string"
       ? {
-          query: databaseError.query.slice(
-            0,
-            MAX_SERIALIZED_QUERY_CHARACTERS,
-          ),
+          query: databaseError.query.slice(0, MAX_SERIALIZED_QUERY_CHARACTERS),
         }
       : {}),
     ...(Array.isArray(databaseError.params)
       ? { params: databaseError.params.slice(0, MAX_SERIALIZED_PARAMS) }
       : {}),
-    ...(databaseError.cause !== undefined &&
-    depth < MAX_SERIALIZED_ERROR_DEPTH
+    ...(databaseError.cause !== undefined && depth < MAX_SERIALIZED_ERROR_DEPTH
       ? { cause: serializeAgentError(databaseError.cause, depth + 1) }
       : {}),
   };

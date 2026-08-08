@@ -36,6 +36,7 @@ import { FileOperationDialog } from "@/components/workbench/file-operation-dialo
 import { FileTree } from "@/components/workbench/file-tree";
 import { PROJECT_ERROR_CODES } from "@/domains/project/errors";
 import { BrowserGitProjectRepository } from "@/domains/project/browser-git-repository";
+import { browserApiFetch } from "@/infrastructure/http/browser-api";
 import type {
   BrowserRepositoryClientToolRequest,
   ClientToolRequest,
@@ -56,6 +57,7 @@ import {
   hasDirtyFiles,
   projectWorkspaceReducer,
   selectDirtyPaths,
+  type WorkspaceStatusDetail,
 } from "@/domains/project/workspace";
 import { useUiI18n } from "@/infrastructure/i18n/ui";
 import { cn } from "@/lib/utils";
@@ -170,6 +172,10 @@ export function ProjectWorkspace({
     [state.files],
   );
   const dirtyPaths = selectDirtyPaths(state);
+  const localizedStatusMessage = formatWorkspaceStatusDetail(
+    state.statusDetail,
+    t,
+  );
 
   useEffect(() => {
     // 发布页无法访问另一个路由实例中的 reducer，因此只同步“是否有草稿”
@@ -272,15 +278,18 @@ export function ProjectWorkspace({
         return;
       }
 
-      const response = await fetch(`/api/projects/${project.id}/files`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          path,
-          content: file.draftContent,
-          expectedRevision: current.revision,
-        }),
-      });
+      const response = await browserApiFetch(
+        `/api/projects/${project.id}/files`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            path,
+            content: file.draftContent,
+            expectedRevision: current.revision,
+          }),
+        },
+      );
 
       if (!response.ok) {
         await handleMutationFailure(response, current.revision);
@@ -342,8 +351,10 @@ export function ProjectWorkspace({
       }
 
       const [projectResponse, filesResponse] = await Promise.all([
-        fetch(`/api/projects/${project.id}`, { cache: "no-store" }),
-        fetch(`/api/projects/${project.id}/files`, { cache: "no-store" }),
+        browserApiFetch(`/api/projects/${project.id}`, { cache: "no-store" }),
+        browserApiFetch(`/api/projects/${project.id}/files`, {
+          cache: "no-store",
+        }),
       ]);
 
       if (!projectResponse.ok || !filesResponse.ok) {
@@ -426,7 +437,7 @@ export function ProjectWorkspace({
   const handleClientToolResult = useCallback(
     async (request: ClientToolRequest, result: ClientToolResult) => {
       try {
-        const response = await fetch(
+        const response = await browserApiFetch(
           `/api/agent-runs/${request.runId}/client-tool-results`,
           {
             method: "POST",
@@ -630,15 +641,18 @@ export function ProjectWorkspace({
           return;
         }
 
-        const response = await fetch(`/api/projects/${project.id}/files`, {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({
-            path: value,
-            content: getInitialFileContent(value),
-            expectedRevision: current.revision,
-          }),
-        });
+        const response = await browserApiFetch(
+          `/api/projects/${project.id}/files`,
+          {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              path: value,
+              content: getInitialFileContent(value),
+              expectedRevision: current.revision,
+            }),
+          },
+        );
 
         if (!response.ok) {
           await handleMutationFailure(response, current.revision);
@@ -669,15 +683,18 @@ export function ProjectWorkspace({
           return;
         }
 
-        const response = await fetch(`/api/projects/${project.id}/files`, {
-          method: "PATCH",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({
-            fromPath: operation.path,
-            toPath: value,
-            expectedRevision: current.revision,
-          }),
-        });
+        const response = await browserApiFetch(
+          `/api/projects/${project.id}/files`,
+          {
+            method: "PATCH",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({
+              fromPath: operation.path,
+              toPath: value,
+              expectedRevision: current.revision,
+            }),
+          },
+        );
 
         if (!response.ok) {
           await handleMutationFailure(response, current.revision);
@@ -710,7 +727,7 @@ export function ProjectWorkspace({
           path: operation.path,
           expectedRevision: current.revision.toString(),
         });
-        const response = await fetch(
+        const response = await browserApiFetch(
           `/api/projects/${project.id}/files?${query}`,
           { method: "DELETE" },
         );
@@ -949,35 +966,47 @@ export function ProjectWorkspace({
                 )}
               </div>
 
-              <div
-                className={cn(
-                  "ide-surface",
-                  view === "preview" && "is-preview",
-                )}
-              >
-                {view === "code" ? (
-                  activeFile ? (
-                    <CodeEditor
-                      file={activeFile}
-                      onChange={(content) =>
-                        dispatch({
-                          type: "edit",
-                          path: activeFile.path,
-                          content,
-                        })
-                      }
-                      onEditorReady={(editorInstance) => {
-                        editorRef.current = editorInstance;
-                      }}
-                      onSave={saveActiveFile}
-                    />
-                  ) : (
-                    <div className="editor-empty">
-                      <Code2 />
-                      <span>{t("workbench.openFileHint")}</span>
-                    </div>
-                  )
-                ) : (
+              <div className="ide-surface">
+                <div
+                  aria-hidden={view !== "code"}
+                  className="ide-surface-panel ide-code-surface"
+                  hidden={view !== "code"}
+                >
+                  {view === "code" ? (
+                    activeFile ? (
+                      <CodeEditor
+                        file={activeFile}
+                        onChange={(content) =>
+                          dispatch({
+                            type: "edit",
+                            path: activeFile.path,
+                            content,
+                          })
+                        }
+                        onEditorReady={(editorInstance) => {
+                          editorRef.current = editorInstance;
+                        }}
+                        onSave={saveActiveFile}
+                      />
+                    ) : (
+                      <div className="editor-empty">
+                        <Code2 />
+                        <span>{t("workbench.openFileHint")}</span>
+                      </div>
+                    )
+                  ) : null}
+                </div>
+
+                <div
+                  aria-hidden={view !== "preview"}
+                  className="ide-surface-panel ide-preview-surface"
+                  hidden={view !== "preview"}
+                >
+                  {/*
+                   * Preview 必须常驻 DOM。Code/Preview 只是工作台视图切换，不应
+                   * 销毁 iframe、Runtime Bridge 与页面内部状态，更不应让用户误以为
+                   * 每次返回都要重新 mount/install。hidden 只控制可见性，不会卸载组件。
+                   */}
                   <WebContainerPreview
                     clientToolRequest={
                       isPreviewClientToolRequest(clientToolRequest)
@@ -989,7 +1018,7 @@ export function ProjectWorkspace({
                     projectId={project.id}
                     revision={state.revision}
                   />
-                )}
+                </div>
               </div>
 
               <footer
@@ -1001,6 +1030,7 @@ export function ProjectWorkspace({
               >
                 <span>
                   {state.statusMessage ||
+                    localizedStatusMessage ||
                     (dirtyPaths.length > 0
                       ? t("workbench.unsavedFiles", {
                           count: dirtyPaths.length,
@@ -1033,6 +1063,33 @@ export function ProjectWorkspace({
       ) : null}
     </div>
   );
+}
+
+function formatWorkspaceStatusDetail(
+  detail: WorkspaceStatusDetail,
+  t: (key: string, values?: Record<string, string | number>) => string,
+): string {
+  if (!detail) {
+    return "";
+  }
+
+  switch (detail.kind) {
+    case "saving":
+      return t("workbench.savingRepository");
+    case "saved":
+      return t(
+        detail.hasNewDraft
+          ? "workbench.savedRevisionWithDraft"
+          : "workbench.savedRevision",
+        { revision: detail.revision },
+      );
+    case "created":
+      return t("workbench.fileCreated", { path: detail.path });
+    case "renamed":
+      return t("workbench.fileRenamed", { path: detail.path });
+    case "deleted":
+      return t("workbench.fileDeleted", { path: detail.path });
+  }
 }
 
 function toProjectFileSnapshot(file: {

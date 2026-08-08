@@ -1,7 +1,18 @@
 import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 
-import { and, asc, desc, eq, gt, inArray, isNull, lt, or } from "drizzle-orm";
+import {
+  and,
+  asc,
+  desc,
+  eq,
+  gt,
+  inArray,
+  isNull,
+  lt,
+  or,
+  sql,
+} from "drizzle-orm";
 import type { PgDatabase, PgTransaction } from "drizzle-orm/pg-core";
 import type {
   PgQueryResultHKT,
@@ -68,11 +79,16 @@ import {
   conversations,
   databaseSchema,
   projects,
+  quotaLeases,
   toolInvocations,
   transcriptMessages,
   verificationRuns,
   verificationSteps,
 } from "@/infrastructure/db/schema";
+import {
+  releaseQuotaReservation,
+  type QuotaReservation,
+} from "@/infrastructure/quota/service";
 
 type RelationalSchema = ExtractTablesWithRelations<typeof databaseSchema>;
 type DatabaseLike<TQueryResult extends PgQueryResultHKT> = PgDatabase<
@@ -185,6 +201,11 @@ export type SuspendForImageGenerationInput = {
   model: string;
   profile: string;
   profileVersion: string;
+  /**
+   * 生图额度在进入 Agent Tool 后才预留。把绑定信息传入当前事务，
+   * 让 imageRun、imageJob、父 Run 和 quota lease 一起提交。
+   */
+  quotaReservation?: QuotaReservation;
 };
 
 type NewTranscriptMessage = TranscriptMessage extends infer Message
@@ -1199,10 +1220,8 @@ export class AgentStore<TQueryResult extends PgQueryResultHKT> {
    * 客户端工具的 Ledger、Verification、Run 状态、租约释放和 SSE 事件必须
    * 同时落库。任何一步失败都会回滚，避免刷新后出现“Run 正在等待，但没有
    * running Tool Invocation 可恢复”的永久悬空状态。
-  */
-  async suspendForClientTool(
-    input: SuspendForClientToolInput,
-  ): Promise<void> {
+   */
+  async suspendForClientTool(input: SuspendForClientToolInput): Promise<void> {
     await this.runTransaction(async (tx) => {
       const [lockedRun] = await tx
         .select({
@@ -1462,8 +1481,11 @@ export class AgentStore<TQueryResult extends PgQueryResultHKT> {
    */
   async suspendForImageGeneration(
     input: SuspendForImageGenerationInput,
-  ): Promise<{ imageRunId: string; imageJobId: string }> {
-    return this.runTransaction(async (tx) => {
+  ): Promise<{
+    imageRunId: string;
+    imageJobId: string;
+  }> {
+    const result = await this.runTransaction(async (tx) => {
       const [lockedRun] = await tx
         .select({
           id: agentRuns.id,
@@ -1516,10 +1538,13 @@ export class AgentStore<TQueryResult extends PgQueryResultHKT> {
           existingInvocation.executionDomain === "async_worker" &&
           existingInvocation.status === "running" &&
           existingInvocation.idempotencyKey === input.idempotencyKey &&
-          isDeepStrictEqual(existingInvocation.argumentsJson, input.argumentsJson) &&
+          isDeepStrictEqual(
+            existingInvocation.argumentsJson,
+            input.argumentsJson,
+          ) &&
           existingJob
         ) {
-          return existingJob;
+          return { ...existingJob, created: false };
         }
 
         throw new AgentError(
@@ -1606,6 +1631,41 @@ export class AgentStore<TQueryResult extends PgQueryResultHKT> {
         throw new Error("创建 image job 失败。");
       }
 
+      if (input.quotaReservation?.leaseIds.length) {
+        const boundLeases = await tx
+          .update(quotaLeases)
+          .set({
+            // quota service 负责额度扣减，本事务只负责把租约绑定到真实的
+            // imageRun。绑定发生在同一事务内，避免出现“任务已创建但租约
+            // 仍然可退款”的中间状态。
+            metadata: sql`${quotaLeases.metadata} || jsonb_build_object(
+              'resource', 'image_generation',
+              'resourceId', ${imageRun.id}::text,
+              'ipSubjectKey', ${
+                input.quotaReservation.bucketSubjects.find(
+                  (subject) => subject.subjectType === "ip",
+                )?.subjectKey ?? null
+              }::text,
+              'redisReservation', ${JSON.stringify(
+                input.quotaReservation.redisReservation ?? null,
+              )}::jsonb
+            )`,
+            updatedAt: now,
+          })
+          .where(
+            and(
+              inArray(quotaLeases.id, input.quotaReservation.leaseIds),
+              eq(quotaLeases.resource, "image_generation"),
+              eq(quotaLeases.status, "active"),
+            ),
+          )
+          .returning({ id: quotaLeases.id });
+
+        if (boundLeases.length !== input.quotaReservation.leaseIds.length) {
+          throw new Error("生图额度租约绑定失败。");
+        }
+      }
+
       const pausedUsage = pauseAgentExecution(
         normalizeAgentRunUsage(lockedRun.usage),
         now,
@@ -1661,8 +1721,26 @@ export class AgentStore<TQueryResult extends PgQueryResultHKT> {
         },
       ]);
 
-      return { imageRunId: imageRun.id, imageJobId: imageJob.id };
+      return {
+        imageRunId: imageRun.id,
+        imageJobId: imageJob.id,
+        created: true,
+      };
     });
+
+    if (!result.created && input.quotaReservation) {
+      // 幂等重放没有创建新的 imageRun，因此把刚刚预留的额度退回。
+      // 这个释放发生在创建事务提交之后，避免嵌套数据库事务。
+      await releaseQuotaReservation({
+        reservation: input.quotaReservation,
+        refundUnits: input.quotaReservation.units,
+      });
+    }
+
+    return {
+      imageRunId: result.imageRunId,
+      imageJobId: result.imageJobId,
+    };
   }
 
   /**
@@ -2147,7 +2225,7 @@ export class AgentStore<TQueryResult extends PgQueryResultHKT> {
       const terminalErrorCode = noProgress
         ? AGENT_ERROR_CODES.noProgress
         : clientResumeBudgetExhausted
-          ? AGENT_ERROR_CODES.budgetExhausted
+          ? AGENT_ERROR_CODES.clientResumesExhausted
           : null;
       const terminalErrorMessage = noProgress
         ? "同一种 Preview 失败在相同 revision 上重复出现，Agent 已停止无进展循环。"

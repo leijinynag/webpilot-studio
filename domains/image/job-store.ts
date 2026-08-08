@@ -8,6 +8,11 @@ import {
   getDatabase,
   runDatabaseTransaction,
 } from "@/infrastructure/db/client";
+import {
+  isGlobalBudgetEnabled,
+  recordImageUsage,
+  releaseQuotaReservation,
+} from "@/infrastructure/quota/service";
 
 export const IMAGE_JOB_LEASE_MS = 120_000;
 export const IMAGE_JOB_RETRY_DELAYS_MS = [5_000, 30_000, 120_000] as const;
@@ -15,6 +20,11 @@ export const IMAGE_JOB_RETRY_DELAYS_MS = [5_000, 30_000, 120_000] as const;
 export type ClaimedImageJob = {
   job: typeof imageJobs.$inferSelect;
   run: typeof imageRuns.$inferSelect;
+  /**
+   * true 表示任务已经在领取事务中完成最终失败收口。
+   * Worker 仍需要据此补写父 Agent 的 async tool ledger。
+   */
+  finalized?: boolean;
 };
 
 /**
@@ -33,7 +43,7 @@ export async function claimImageJob(input?: {
   const leaseId = crypto.randomUUID();
   const leaseExpiresAt = new Date(now.getTime() + IMAGE_JOB_LEASE_MS);
 
-  return runDatabaseTransaction(async (tx) => {
+  const result = await runDatabaseTransaction(async (tx) => {
     const [candidate] = await tx
       .select({
         job: imageJobs,
@@ -81,13 +91,10 @@ export async function claimImageJob(input?: {
       .for("update", { skipLocked: true });
 
     if (!candidate) {
-      return null;
+      return { claimed: null, finalized: null };
     }
 
-    if (
-      candidate.job.status !== "running" &&
-      candidate.job.attempt >= candidate.job.maxAttempts
-    ) {
+    if (candidate.job.attempt >= candidate.job.maxAttempts) {
       const [failedJob] = await tx
         .update(imageJobs)
         .set({
@@ -100,19 +107,38 @@ export async function claimImageJob(input?: {
         .where(eq(imageJobs.id, candidate.job.id))
         .returning();
 
-      if (failedJob) {
-        await tx
-          .update(imageRuns)
-          .set({
-            status: "failed",
-            errorCode: IMAGE_ERROR_CODES.generationFailed,
-            errorMessage: "图片生成任务已达到最大重试次数。",
-            completedAt: now,
-            updatedAt: now,
-          })
-          .where(eq(imageRuns.id, candidate.run.id));
-      }
-      return null;
+      const [failedRun] = failedJob
+        ? await tx
+            .update(imageRuns)
+            .set({
+              status: "failed",
+              errorCode: IMAGE_ERROR_CODES.generationFailed,
+              errorMessage: "图片生成任务已达到最大重试次数。",
+              completedAt: now,
+              updatedAt: now,
+            })
+            .where(eq(imageRuns.id, candidate.run.id))
+            .returning()
+        : [];
+      return {
+        claimed:
+          failedJob && failedRun
+            ? {
+                job: failedJob,
+                run: failedRun,
+                finalized: true,
+              }
+            : null,
+        finalized: {
+          ownerId: candidate.run.ownerId,
+          imageRunId: candidate.run.id,
+          provider: candidate.run.provider,
+          model: candidate.run.model,
+          count: candidate.run.requestedCount,
+          size: candidate.run.size,
+          attempt: candidate.job.attempt,
+        },
+      };
     }
 
     const [updatedJob] = await tx
@@ -144,7 +170,7 @@ export async function claimImageJob(input?: {
       .returning();
 
     if (!updatedJob) {
-      return null;
+      return { claimed: null, finalized: null };
     }
 
     const [updatedRun] = await tx
@@ -163,10 +189,52 @@ export async function claimImageJob(input?: {
       .returning();
 
     return {
-      job: updatedJob,
-      run: updatedRun ?? candidate.run,
+      claimed: {
+        job: updatedJob,
+        run: updatedRun ?? candidate.run,
+      },
+      finalized: null,
     };
   });
+
+  if (result.finalized) {
+    // 达到最大重试次数的任务不会再进入 Worker，因此这里补上最后一次
+    // 额度释放和 usage 事实记录，避免永久占用 image_generation lease。
+    try {
+      await releaseQuotaReservation({
+        resource: "image_generation",
+        resourceId: result.finalized.imageRunId,
+      });
+    } catch (error) {
+      console.error("[image-job-store] image quota release failed", {
+        imageRunId: result.finalized.imageRunId,
+        error,
+      });
+    }
+    // 达到最大重试次数但没有再次发起 Provider 请求时，只需结束旧的
+    // 兼容账本；预算账本不存在本次 attempt 的 reservation，不应虚构成本。
+    try {
+      if (!isGlobalBudgetEnabled()) {
+        await recordImageUsage({
+          ownerId: result.finalized.ownerId,
+          imageRunId: result.finalized.imageRunId,
+          provider: result.finalized.provider,
+          model: result.finalized.model,
+          count: result.finalized.count,
+          size: result.finalized.size,
+          attempt: result.finalized.attempt,
+          status: "settled",
+        });
+      }
+    } catch (error) {
+      console.error("[image-job-store] image usage settlement failed", {
+        imageRunId: result.finalized.imageRunId,
+        error,
+      });
+    }
+  }
+
+  return result.claimed;
 }
 
 export async function getImageJob(input: {
@@ -200,10 +268,7 @@ export async function getPendingImageJobForAgentRun(input: {
       and(
         eq(imageRuns.ownerId, input.ownerId),
         eq(imageRuns.parentAgentRunId, input.agentRunId),
-        or(
-          eq(imageJobs.status, "queued"),
-          eq(imageJobs.status, "retryable"),
-        ),
+        or(eq(imageJobs.status, "queued"), eq(imageJobs.status, "retryable")),
       ),
     )
     .orderBy(imageJobs.createdAt)
@@ -293,10 +358,7 @@ export async function markImageJobSucceeded(input: {
         updatedAt: now,
       })
       .where(
-        and(
-          eq(imageRuns.id, job.imageRunId),
-          eq(imageRuns.status, "running"),
-        ),
+        and(eq(imageRuns.id, job.imageRunId), eq(imageRuns.status, "running")),
       )
       .returning({ id: imageRuns.id });
 

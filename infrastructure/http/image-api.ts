@@ -2,9 +2,10 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 
 import { isImageError } from "@/domains/image/errors";
+import { isQuotaError } from "@/infrastructure/quota/errors";
 
 export function imageApiErrorResponse(error: unknown): NextResponse {
-  if (isImageError(error)) {
+  if (isImageError(error) || isQuotaError(error)) {
     return NextResponse.json(
       {
         error: {

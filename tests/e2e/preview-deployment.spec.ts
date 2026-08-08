@@ -1,4 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
+import { postWithCsrf } from "./helpers/api";
 
 const previewBaseURL = process.env.PLAYWRIGHT_BASE_URL;
 
@@ -23,7 +24,7 @@ async function enableVercelAutomationBypass(page: Page): Promise<void> {
 
 async function createPreviewProject(page: Page): Promise<string> {
   await page.goto("/");
-  const response = await page.request.post("/api/projects", {
+  const response = await postWithCsrf(page, "/api/projects", {
     data: {
       name: "Vercel preview smoke",
       storageKind: "database",

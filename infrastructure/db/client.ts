@@ -5,12 +5,20 @@ import { drizzle } from "drizzle-orm/neon-serverless";
 import type { NeonTransaction } from "drizzle-orm/neon-serverless";
 import type { PgTransactionConfig } from "drizzle-orm/pg-core/session";
 import type { ExtractTablesWithRelations } from "drizzle-orm/relations";
-import ws from "ws";
 
 import { databaseSchema } from "@/infrastructure/db/schema";
 import { serverEnv } from "@/infrastructure/env/server";
 
-neonConfig.webSocketConstructor = ws;
+/**
+ * 普通查询交给 Neon HTTP 通道，省去开发环境和 Serverless 请求中的
+ * WebSocket 建连成本。显式事务会调用 Pool.connect()，仍然使用一条
+ * 持久连接完成 BEGIN/COMMIT，不会被拆成多个 HTTP 请求。
+ *
+ * 项目要求 Node 22，其内置 WebSocket 已满足 Neon 驱动需要，因此不要再
+ * 注入 `ws` 包。Webpack 打包 `ws` 的可选原生扩展时可能得到不完整模块，
+ * 最终会在发送握手数据时触发 `bufferUtil.mask is not a function`。
+ */
+neonConfig.poolQueryViaFetch = true;
 
 function requireDatabaseUrl(): string {
   const value = serverEnv.DATABASE_URL?.trim();

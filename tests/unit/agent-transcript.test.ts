@@ -163,4 +163,93 @@ describe("Agent transcript assembler", () => {
       "正在读取文件...",
     );
   });
+
+  it("继续新 Run 时丢弃历史末尾未配对的 Tool Call", () => {
+    const transcript: TranscriptMessage[] = [
+      {
+        conversationId: "conversation",
+        role: "user",
+        kind: "user_message",
+        content: "第一次修改",
+      },
+      {
+        conversationId: "conversation",
+        role: "assistant",
+        kind: "tool_call",
+        toolCallId: "call-orphan",
+        toolName: "write_file",
+        argumentsJson: { path: "src/App.tsx" },
+      },
+      {
+        conversationId: "conversation",
+        role: "user",
+        kind: "user_message",
+        content: "继续完成剩余工作",
+      },
+      {
+        conversationId: "conversation",
+        role: "assistant",
+        kind: "tool_call",
+        toolCallId: "call-complete",
+        toolName: "read_file",
+        argumentsJson: { path: "src/App.tsx" },
+      },
+      {
+        conversationId: "conversation",
+        role: "tool",
+        kind: "tool_result",
+        toolCallId: "call-complete",
+        toolName: "read_file",
+        resultJson: { ok: true },
+      },
+    ];
+
+    expect(assembleProviderMessages(transcript)).toEqual([
+      { role: "user", content: "第一次修改" },
+      { role: "user", content: "继续完成剩余工作" },
+      {
+        role: "assistant",
+        content: null,
+        toolCalls: [
+          {
+            id: "call-complete",
+            name: "read_file",
+            argumentsJson: '{"path":"src/App.tsx"}',
+          },
+        ],
+      },
+      {
+        role: "tool",
+        toolCallId: "call-complete",
+        content: '{"ok":true}',
+      },
+    ]);
+  });
+
+  it("长会话只保留最近的完整上下文单元", () => {
+    const transcript: TranscriptMessage[] = [
+      {
+        conversationId: "conversation",
+        role: "user",
+        kind: "user_message",
+        content: "旧请求".repeat(100),
+      },
+      {
+        conversationId: "conversation",
+        role: "assistant",
+        kind: "assistant_message",
+        content: "旧回复".repeat(100),
+      },
+      {
+        conversationId: "conversation",
+        role: "user",
+        kind: "user_message",
+        content: "继续完成剩余工作",
+      },
+    ];
+
+    expect(
+      assembleProviderMessages(transcript, { maxContextCharacters: 120 }),
+    ).toEqual([{ role: "user", content: "继续完成剩余工作" }]);
+  });
 });

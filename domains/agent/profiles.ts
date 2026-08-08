@@ -358,6 +358,7 @@ export function createFrozenAgentProfile(input: {
   provider: string;
   model: string;
   maxModelTurns: number;
+  maxFileMutations?: number;
   maxWallTimeSeconds: number;
 }): FrozenAgentRunProfile {
   const usesBrowserGit =
@@ -390,6 +391,9 @@ export function createFrozenAgentProfile(input: {
       maxOutputCharacters: 24_000,
       maxToolResultCharacters: 20_000,
       ...DEFAULT_AGENT_RUN_ACTIVITY_LIMITS,
+      ...(input.maxFileMutations !== undefined
+        ? { maxFileMutations: input.maxFileMutations }
+        : {}),
     },
   };
 }

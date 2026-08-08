@@ -7,6 +7,7 @@ import { FormEvent, useState } from "react";
 
 import { Button } from "@/components/ui/button";
 import type { ProjectDescription } from "@/domains/project/types";
+import { browserApiFetch } from "@/infrastructure/http/browser-api";
 import { useUiI18n } from "@/infrastructure/i18n/ui";
 
 const templates = [
@@ -39,7 +40,7 @@ export function NewProjectPage() {
     setError(null);
 
     try {
-      const response = await fetch("/api/projects", {
+      const response = await browserApiFetch("/api/projects", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({

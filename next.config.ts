@@ -1,6 +1,8 @@
 import type { NextConfig } from "next";
 import createNextIntlPlugin from "next-intl/plugin";
 
+import { getMainApplicationSecurityHeaders } from "./infrastructure/http/security-headers";
+
 const crossOriginIsolationHeaders = [
   {
     key: "Cross-Origin-Opener-Policy",
@@ -13,6 +15,8 @@ const crossOriginIsolationHeaders = [
 ];
 
 const nextConfig: NextConfig = {
+  // Next.js 16 的开发工具按钮会覆盖工作台左下角，产品界面不需要它。
+  devIndicators: false,
   async headers() {
     return [
       {
@@ -20,7 +24,10 @@ const nextConfig: NextConfig = {
         // 首页到工作台使用客户端导航，因此全站保持同一隔离策略，避免从非隔离页面进入
         // 工作台后只能依靠用户手动完整刷新才能启动运行时。
         source: "/:path*",
-        headers: crossOriginIsolationHeaders,
+        headers: [
+          ...crossOriginIsolationHeaders,
+          ...getMainApplicationSecurityHeaders(),
+        ],
       },
     ];
   },

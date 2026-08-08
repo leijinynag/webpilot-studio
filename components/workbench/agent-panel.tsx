@@ -1,19 +1,27 @@
 "use client";
 
 import {
+  Children,
   FormEvent,
+  isValidElement,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
 } from "react";
-import type { ChangeEvent } from "react";
+import type {
+  ChangeEvent,
+  ClipboardEvent,
+  ComponentPropsWithoutRef,
+  ReactElement,
+} from "react";
 import {
   Bot,
   Check,
   ChevronDown,
-  CircleStop,
+  Copy,
   FileCode2,
   GitCompareArrows,
   Image as ImageIcon,
@@ -25,12 +33,24 @@ import {
   RotateCcw,
   Send,
   ShieldCheck,
+  Square,
   Trash2,
   TriangleAlert,
   Wrench,
 } from "lucide-react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 
 import { Button } from "@/components/ui/button";
+import { browserApiFetch } from "@/infrastructure/http/browser-api";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuLabel,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import {
   Dialog,
   DialogContent,
@@ -38,11 +58,18 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { ChangeSetDialog } from "@/components/workbench/change-set-dialog";
 import {
   clientToolRequestSchema,
   type ClientToolRequest,
 } from "@/domains/agent/client-tools";
+import { AGENT_ERROR_CODES } from "@/domains/agent/errors";
 import { verificationFailureSchema } from "@/domains/agent/verification";
 import type {
   AgentConversationSnapshot,
@@ -53,6 +80,10 @@ import type {
   VerificationRunRecord,
   VerificationStepRecord,
 } from "@/domains/agent/types";
+import {
+  IMAGE_ONLY_MESSAGE_CONTENT,
+  isImageOnlyMessageContent,
+} from "@/domains/agent/message-content";
 import { projectPendingAssistantText } from "@/domains/agent/transcript";
 import { toAgentLocale } from "@/infrastructure/i18n/locale";
 import { useUiI18n } from "@/infrastructure/i18n/ui";
@@ -93,6 +124,12 @@ type AttachmentView = {
   createdAt: string;
 };
 
+type AgentModelOption = {
+  id: string;
+  label: string;
+  tier: "agent" | "fast";
+};
+
 type AssetView = {
   id: string;
   kind: string;
@@ -130,6 +167,7 @@ const TERMINAL_STATUSES = new Set([
   "conflicted",
 ]);
 const SNAPSHOT_REFRESH_DELAY_MS = 160;
+const STREAMING_DELTA_FLUSH_DELAY_MS = 32;
 const IMMEDIATE_SNAPSHOT_EVENT_TYPES = new Set([
   "run.created",
   "run.status_changed",
@@ -145,6 +183,22 @@ const IMMEDIATE_SNAPSHOT_EVENT_TYPES = new Set([
   "verification.completed",
   "verification.completion_blocked",
 ]);
+const MAX_AGENT_SNAPSHOT_CACHE_ENTRIES = 16;
+const LATEST_CONVERSATION_CACHE_KEY = "__latest__";
+const TRANSCRIPT_BOTTOM_THRESHOLD_PX = 40;
+
+/**
+ * 这层缓存只优化同一浏览器标签页内的返回体验。
+ *
+ * PostgreSQL 中的 Conversation、AgentRun、Transcript 与 Tool Ledger 仍是最终事实；
+ * 页面挂载后一定会后台重验证。缓存不进入 localStorage，也不会跨浏览器刷新恢复，
+ * 这样既避免把可能含用户代码的对话长期写入浏览器，也不会制造第二份持久化真相。
+ */
+const agentSnapshotCache = new Map<string, AgentResponse>();
+
+export function clearAgentSnapshotCache(): void {
+  agentSnapshotCache.clear();
+}
 
 export function AgentPanel({
   projectId,
@@ -155,15 +209,20 @@ export function AgentPanel({
   onRestoreComplete,
 }: AgentPanelProps) {
   const { locale, t } = useUiI18n();
-  const [conversations, setConversations] = useState<ConversationRecord[]>([]);
+  const [initialAgentResponse] = useState(() =>
+    readAgentSnapshotCache(projectId),
+  );
+  const [conversations, setConversations] = useState<ConversationRecord[]>(
+    () => initialAgentResponse?.conversations ?? [],
+  );
   const [snapshot, setSnapshot] = useState<AgentConversationSnapshot | null>(
-    null,
+    () => initialAgentResponse?.snapshot ?? null,
   );
   const [selectedConversationId, setSelectedConversationId] = useState<
     string | null
-  >(null);
+  >(() => initialAgentResponse?.snapshot?.conversation.id ?? null);
   const [draft, setDraft] = useState("");
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(() => initialAgentResponse === null);
   const [sending, setSending] = useState(false);
   const [creatingConversation, setCreatingConversation] = useState(false);
   const [stopping, setStopping] = useState(false);
@@ -176,33 +235,171 @@ export function AgentPanel({
   const [pendingAttachments, setPendingAttachments] = useState<
     PendingAttachment[]
   >([]);
+  const [modelOptions, setModelOptions] = useState<AgentModelOption[]>([]);
+  const [selectedModel, setSelectedModel] = useState("");
   const [assets, setAssets] = useState<AssetView[]>([]);
   const [showAssets, setShowAssets] = useState(false);
   const streamRef = useRef<EventSource | null>(null);
   const streamRunIdRef = useRef<string | null>(null);
   const reconnectTimerRef = useRef<number | null>(null);
-  const lastEventIdRef = useRef(0);
-  const selectedConversationRef = useRef<string | null>(null);
+  const lastEventIdRef = useRef(
+    getLatestAgentEventSequence(initialAgentResponse?.snapshot),
+  );
+  const selectedConversationRef = useRef<string | null>(
+    initialAgentResponse?.snapshot?.conversation.id ?? null,
+  );
   const explicitConversationSelectionRef = useRef(false);
   const reconnectStreamRef = useRef<(() => void) | null>(null);
   const draftRef = useRef<HTMLTextAreaElement | null>(null);
   const attachmentInputRef = useRef<HTMLInputElement | null>(null);
+  const pendingAttachmentsRef = useRef<PendingAttachment[]>([]);
   const transcriptRef = useRef<HTMLDivElement | null>(null);
+  const transcriptPinnedToBottomRef = useRef(true);
+  const transcriptScrollMetricsRef = useRef({
+    scrollHeight: 0,
+    scrollTop: 0,
+  });
+  const transcriptContextKeyRef = useRef<string | null>(null);
   const snapshotRequestRef = useRef(0);
   const snapshotRefreshTimerRef = useRef<number | null>(null);
   const snapshotRefreshInFlightRef =
     useRef<Promise<AgentResponse | null> | null>(null);
   const snapshotRefreshTrailingRef = useRef(false);
+  const streamingDeltaBufferRef = useRef("");
+  const streamingFlushTimerRef = useRef<number | null>(null);
   const currentProjectIdRef = useRef(projectId);
+  const renderedProjectIdRef = useRef(projectId);
   const hasUploadingAttachment = pendingAttachments.some(
     (attachment) => attachment.status === "uploading",
   );
+  const hasReadyAttachment = pendingAttachments.some(
+    (attachment) =>
+      attachment.status === "ready" && attachment.attachment !== null,
+  );
+
+  const clearStreamingDeltaBuffer = useCallback(() => {
+    if (streamingFlushTimerRef.current !== null) {
+      window.clearTimeout(streamingFlushTimerRef.current);
+      streamingFlushTimerRef.current = null;
+    }
+    streamingDeltaBufferRef.current = "";
+  }, []);
+
+  const flushStreamingDeltaBuffer = useCallback(() => {
+    streamingFlushTimerRef.current = null;
+    const bufferedText = streamingDeltaBufferRef.current;
+    streamingDeltaBufferRef.current = "";
+
+    if (bufferedText) {
+      setStreamingAssistantText((current) => current + bufferedText);
+    }
+  }, []);
+
+  const queueStreamingDelta = useCallback(
+    (delta: string) => {
+      streamingDeltaBufferRef.current += delta;
+      if (streamingFlushTimerRef.current !== null) {
+        return;
+      }
+
+      // 模型可能在一个动画帧内送来多条极小 delta。先在 ref 中合并，再以
+      // 约 30fps 提交 React state，可明显减少 Markdown 重解析、布局抖动和
+      // 滚动补偿次数，同时仍保持用户感知上的实时输出。
+      streamingFlushTimerRef.current = window.setTimeout(
+        flushStreamingDeltaBuffer,
+        STREAMING_DELTA_FLUSH_DELAY_MS,
+      );
+    },
+    [flushStreamingDeltaBuffer],
+  );
+
+  useLayoutEffect(() => {
+    if (renderedProjectIdRef.current === projectId) {
+      return;
+    }
+
+    renderedProjectIdRef.current = projectId;
+    const cached = readAgentSnapshotCache(projectId);
+
+    // 路由框架通常会重建工作台，但测试、未来的并行路由或上层状态保持也可能
+    // 复用同一组件实例。项目身份变化必须在浏览器绘制前切换快照，绝不能让
+    // 上一个项目的 Transcript、Run 状态或 SSE 游标短暂出现在新项目中。
+    setConversations(cached?.conversations ?? []);
+    setSnapshot(cached?.snapshot ?? null);
+    setSelectedConversationId(cached?.snapshot?.conversation.id ?? null);
+    selectedConversationRef.current = cached?.snapshot?.conversation.id ?? null;
+    clearStreamingDeltaBuffer();
+    setStreamingAssistantText("");
+    setOptimisticUserMessage(null);
+    setErrorMessage(null);
+    setLoading(cached === null);
+    lastEventIdRef.current = getLatestAgentEventSequence(cached?.snapshot);
+    transcriptContextKeyRef.current = null;
+    transcriptPinnedToBottomRef.current = true;
+    transcriptScrollMetricsRef.current = {
+      scrollHeight: 0,
+      scrollTop: 0,
+    };
+  }, [clearStreamingDeltaBuffer, projectId]);
+
+  useEffect(() => {
+    pendingAttachmentsRef.current = pendingAttachments;
+  }, [pendingAttachments]);
+
+  useEffect(() => {
+    // Object URL 只服务于当前 Composer。项目切换或组件卸载时统一回收，
+    // 避免用户反复粘贴/选择图片后，浏览器内存持续增长。
+    return () => {
+      for (const item of pendingAttachmentsRef.current) {
+        URL.revokeObjectURL(item.previewUrl);
+      }
+    };
+  }, [projectId]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    void browserApiFetch("/api/agent-models", { cache: "no-store" })
+      .then(async (response) => {
+        if (!response.ok) {
+          return null;
+        }
+        return (await response.json()) as { models?: AgentModelOption[] };
+      })
+      .then((body) => {
+        if (cancelled) {
+          return;
+        }
+        const options = (body?.models ?? []).filter(
+          (option): option is AgentModelOption =>
+            typeof option?.id === "string" &&
+            typeof option.label === "string" &&
+            (option.tier === "agent" || option.tier === "fast"),
+        );
+        setModelOptions(options);
+        setSelectedModel((current) =>
+          current && options.some((option) => option.id === current)
+            ? current
+            : (options[0]?.id ?? ""),
+        );
+      })
+      .catch(() => {
+        // 模型列表是辅助配置，加载失败时仍允许页面展示和输入。
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const loadAssets = useCallback(async () => {
     try {
-      const response = await fetch(`/api/projects/${projectId}/assets`, {
-        cache: "no-store",
-      });
+      const response = await browserApiFetch(
+        `/api/projects/${projectId}/assets`,
+        {
+          cache: "no-store",
+        },
+      );
       if (!response.ok) {
         return;
       }
@@ -256,39 +453,42 @@ export function AgentPanel({
     );
   }, [latestRunVerifications, snapshot?.verificationSteps]);
 
-  const applySnapshot = useCallback((body: AgentResponse) => {
-    setConversations(body.conversations);
-    setSnapshot(body.snapshot);
-    setSelectedConversationId(body.snapshot?.conversation.id ?? null);
-    const activeSnapshotRun = findActiveRun(body.snapshot?.runs ?? []);
-    setStreamingAssistantText(
-      projectPendingAssistantText(
-        body.snapshot?.events ?? [],
-        activeSnapshotRun?.id ?? null,
-      ),
-    );
-    lastEventIdRef.current =
-      body.snapshot?.events.reduce(
-        (cursor, event) => Math.max(cursor, event.sequence),
-        0,
-      ) ?? 0;
-    // POST 返回和随后聚合快照之间存在短暂窗口。只在数据库 Transcript 已经
-    // 出现同一条用户消息后移除乐观投影，避免快照较慢时消息闪退，也避免重复展示。
-    setOptimisticUserMessage((current) => {
-      if (
-        current &&
-        body.snapshot?.transcript.some(
-          (message) =>
-            message.kind === "user_message" &&
-            message.content === current.content,
-        )
-      ) {
-        return null;
-      }
-      return current;
-    });
-    setErrorMessage(null);
-  }, []);
+  const applySnapshot = useCallback(
+    (body: AgentResponse) => {
+      // 聚合快照已经包含当前 Run 的全部持久化 delta。先丢弃尚未提交到视图的
+      // 本地 buffer，再从数据库事件重建，避免同一段文本被重复追加。
+      clearStreamingDeltaBuffer();
+      writeAgentSnapshotCache(projectId, body);
+      setConversations(body.conversations);
+      setSnapshot(body.snapshot);
+      setSelectedConversationId(body.snapshot?.conversation.id ?? null);
+      const activeSnapshotRun = findActiveRun(body.snapshot?.runs ?? []);
+      setStreamingAssistantText(
+        projectPendingAssistantText(
+          body.snapshot?.events ?? [],
+          activeSnapshotRun?.id ?? null,
+        ),
+      );
+      lastEventIdRef.current = getLatestAgentEventSequence(body.snapshot);
+      // POST 返回和随后聚合快照之间存在短暂窗口。只在数据库 Transcript 已经
+      // 出现同一条用户消息后移除乐观投影，避免快照较慢时消息闪退，也避免重复展示。
+      setOptimisticUserMessage((current) => {
+        if (
+          current &&
+          body.snapshot?.transcript.some(
+            (message) =>
+              message.kind === "user_message" &&
+              message.content === current.content,
+          )
+        ) {
+          return null;
+        }
+        return current;
+      });
+      setErrorMessage(null);
+    },
+    [clearStreamingDeltaBuffer, projectId],
+  );
 
   const loadAgentSnapshot = useCallback(
     async (
@@ -336,7 +536,7 @@ export function AgentPanel({
   );
 
   const scheduleAgentSnapshotRefresh = useCallback(
-    (immediate = false) => {
+    function scheduleSnapshotRefresh(immediate = false) {
       // 一个快照请求尚未结束时只记录一次 trailing refresh。SSE 可能在几十毫秒
       // 内连续送达 delta、usage、tool 事件，无需为每条事件并发读取完整 Transcript。
       if (snapshotRefreshInFlightRef.current) {
@@ -366,7 +566,7 @@ export function AgentPanel({
 
             if (snapshotRefreshTrailingRef.current) {
               snapshotRefreshTrailingRef.current = false;
-              scheduleAgentSnapshotRefresh();
+              scheduleSnapshotRefresh();
             }
           });
         },
@@ -411,7 +611,11 @@ export function AgentPanel({
       if (explicitConversationSelectionRef.current) {
         return;
       }
-      void loadAgentSnapshot();
+      void loadAgentSnapshot(undefined, {
+        // 命中标签页缓存时保留现有 Transcript，只在后台重验证。未命中时仍展示
+        // 明确的恢复状态，避免把真正的首屏网络等待伪装成空会话。
+        showLoading: readAgentSnapshotCache(projectId) === null,
+      });
     }, 0);
 
     return () => {
@@ -424,7 +628,7 @@ export function AgentPanel({
       snapshotRefreshTrailingRef.current = false;
       explicitConversationSelectionRef.current = false;
     };
-  }, [loadAgentSnapshot]);
+  }, [loadAgentSnapshot, projectId]);
 
   const reconnectStream = useCallback(() => {
     const runId = activeRun?.id;
@@ -464,14 +668,13 @@ export function AgentPanel({
         persistedEvent.type === "assistant.delta" &&
         typeof persistedEvent.payload.text === "string"
       ) {
-        setStreamingAssistantText((current) => {
-          return current + persistedEvent.payload.text;
-        });
+        queueStreamingDelta(persistedEvent.payload.text);
       } else if (
         persistedEvent?.runId === runId &&
         (persistedEvent.type === "assistant.completed" ||
           persistedEvent.type === "model.turn_retried")
       ) {
+        clearStreamingDeltaBuffer();
         setStreamingAssistantText("");
       } else if (
         persistedEvent?.runId === runId &&
@@ -551,9 +754,11 @@ export function AgentPanel({
     }
   }, [
     activeRun?.id,
+    clearStreamingDeltaBuffer,
     flushAgentSnapshotRefresh,
     onClientToolRequest,
     loadAssets,
+    queueStreamingDelta,
     scheduleAgentSnapshotRefresh,
   ]);
 
@@ -573,11 +778,12 @@ export function AgentPanel({
         snapshotRefreshTimerRef.current = null;
       }
       snapshotRefreshTrailingRef.current = false;
+      clearStreamingDeltaBuffer();
       streamRef.current?.close();
       streamRef.current = null;
       streamRunIdRef.current = null;
     };
-  }, [reconnectStream]);
+  }, [clearStreamingDeltaBuffer, reconnectStream]);
 
   useEffect(() => {
     if (snapshot?.runs.length) {
@@ -670,23 +876,80 @@ export function AgentPanel({
     snapshot?.verificationRuns,
   ]);
 
-  useEffect(() => {
-    if (streamingAssistantText) {
-      const element = transcriptRef.current;
-      if (element) {
-        element.scrollTop = element.scrollHeight;
+  const transcriptContextKey = `${projectId}:${
+    selectedConversationId ?? "latest"
+  }`;
+  const transcriptLayoutVersion = [
+    snapshot?.transcript.length ?? 0,
+    optimisticUserMessage?.content ?? "",
+    optimisticUserMessage?.status ?? "",
+    streamingAssistantText,
+    loading ? "loading" : "ready",
+  ].join(":");
+
+  useLayoutEffect(() => {
+    const element = transcriptRef.current;
+    if (!element) {
+      return;
+    }
+
+    const previous = transcriptScrollMetricsRef.current;
+    const contextChanged =
+      transcriptContextKeyRef.current !== transcriptContextKey;
+    const nextScrollHeight = element.scrollHeight;
+
+    if (contextChanged || previous.scrollHeight === 0) {
+      // 新项目或新会话默认展示最新消息。这里使用直接定位而非 smooth，
+      // 避免历史较长时出现一段可见的自动滚动动画。
+      element.scrollTop = nextScrollHeight;
+      transcriptPinnedToBottomRef.current = true;
+      transcriptContextKeyRef.current = transcriptContextKey;
+    } else if (transcriptPinnedToBottomRef.current) {
+      // 用户仍在底部时，每一批流式 token 都跟随最新内容。
+      element.scrollTop = nextScrollHeight;
+    } else {
+      // 用户正在阅读上方消息时不强制跳到底部。流式节点增长、乐观消息被
+      // 持久化 Transcript 替换等情况会改变内容总高度；补偿高度差可保持
+      // 当前阅读锚点相对稳定，避免文本在视口中突然上下跳动。
+      const heightDelta = nextScrollHeight - previous.scrollHeight;
+      if (heightDelta !== 0) {
+        element.scrollTop = Math.max(0, previous.scrollTop + heightDelta);
       }
     }
-  }, [streamingAssistantText, snapshot?.transcript.length]);
+
+    transcriptScrollMetricsRef.current = {
+      scrollHeight: nextScrollHeight,
+      scrollTop: element.scrollTop,
+    };
+  }, [transcriptContextKey, transcriptLayoutVersion]);
+
+  const handleTranscriptScroll = useCallback(() => {
+    const element = transcriptRef.current;
+    if (!element) {
+      return;
+    }
+
+    const distanceToBottom =
+      element.scrollHeight - element.scrollTop - element.clientHeight;
+    transcriptPinnedToBottomRef.current =
+      distanceToBottom <= TRANSCRIPT_BOTTOM_THRESHOLD_PX;
+    transcriptScrollMetricsRef.current = {
+      scrollHeight: element.scrollHeight,
+      scrollTop: element.scrollTop,
+    };
+  }, []);
 
   async function createConversation() {
     setCreatingConversation(true);
     try {
-      const response = await fetch(`/api/projects/${projectId}/agent`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ title: t("agent.createConversation") }),
-      });
+      const response = await browserApiFetch(
+        `/api/projects/${projectId}/agent`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ title: t("agent.createConversation") }),
+        },
+      );
       const body = (await response.json().catch(() => ({}))) as
         { conversation?: ConversationRecord } | AgentErrorResponse;
 
@@ -756,21 +1019,19 @@ export function AgentPanel({
       updatePendingAttachment(item.clientId, {
         status: "failed",
         error:
-          error instanceof Error ? error.message : t("agent.attachmentUploadFailed"),
+          error instanceof Error
+            ? error.message
+            : t("agent.attachmentUploadFailed"),
       });
     }
   }
 
-  function handleAttachmentSelection(
-    event: ChangeEvent<HTMLInputElement>,
-  ) {
-    const files = Array.from(event.target.files ?? []);
-    event.target.value = "";
+  function enqueueAttachmentFiles(files: File[]) {
     if (!files.length) {
       return;
     }
 
-    const available = Math.max(0, 4 - pendingAttachments.length);
+    const available = Math.max(0, 4 - pendingAttachmentsRef.current.length);
     const nextFiles = files.slice(0, available);
     const nextItems = nextFiles.map((file) => ({
       clientId: `${Date.now()}-${Math.random().toString(36).slice(2)}`,
@@ -788,6 +1049,36 @@ export function AgentPanel({
     }
   }
 
+  function handleAttachmentSelection(event: ChangeEvent<HTMLInputElement>) {
+    const files = Array.from(event.target.files ?? []);
+    event.target.value = "";
+    enqueueAttachmentFiles(files);
+  }
+
+  function handleComposerPaste(event: ClipboardEvent<HTMLTextAreaElement>) {
+    const imageFiles = Array.from(event.clipboardData.items)
+      .filter((item) => item.kind === "file" && item.type.startsWith("image/"))
+      .map((item) => item.getAsFile())
+      .filter((file): file is File => file !== null)
+      .map(
+        (file, index) =>
+          new File(
+            [file],
+            file.name ||
+              `${t("agent.pastedImageName")}-${Date.now()}-${index + 1}.png`,
+            { type: file.type || "image/png" },
+          ),
+      );
+
+    if (!imageFiles.length) {
+      return;
+    }
+
+    // 保留剪贴板里的文字粘贴行为，同时把图片加入和文件选择相同的上传队列。
+    event.preventDefault();
+    enqueueAttachmentFiles(imageFiles);
+  }
+
   async function removePendingAttachment(clientId: string) {
     const item = pendingAttachments.find(
       (candidate) => candidate.clientId === clientId,
@@ -803,7 +1094,7 @@ export function AgentPanel({
     // 当前 Composer 项，后端的软删除清理任务可以再次回收这个孤立对象。
     if (item?.attachment) {
       try {
-        await fetch(`/api/attachments/${item.attachment.id}`, {
+        await browserApiFetch(`/api/attachments/${item.attachment.id}`, {
           method: "DELETE",
         });
       } catch {
@@ -823,7 +1114,11 @@ export function AgentPanel({
 
   async function sendMessage(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    const message = draft.trim();
+    const message =
+      draft.trim() ||
+      (hasReadyAttachment || hasUploadingAttachment
+        ? IMAGE_ONLY_MESSAGE_CONTENT
+        : "");
 
     if (!message || sending || activeRun) {
       return;
@@ -831,10 +1126,11 @@ export function AgentPanel({
 
     const attachmentIds = pendingAttachments
       .filter(
-        (attachment): attachment is PendingAttachment & {
+        (
+          attachment,
+        ): attachment is PendingAttachment & {
           attachment: AttachmentView;
-        } =>
-          attachment.status === "ready" && attachment.attachment !== null,
+        } => attachment.status === "ready" && attachment.attachment !== null,
       )
       .map((attachment) => attachment.attachment.id);
 
@@ -855,7 +1151,7 @@ export function AgentPanel({
     setErrorMessage(null);
 
     try {
-      const response = await fetch("/api/agent-runs", {
+      const response = await browserApiFetch("/api/agent-runs", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
@@ -863,6 +1159,7 @@ export function AgentPanel({
           conversationId: selectedConversationId ?? undefined,
           message,
           attachmentIds,
+          model: selectedModel || undefined,
           locale: toAgentLocale(locale),
           repositoryRevision: revision,
         }),
@@ -913,9 +1210,12 @@ export function AgentPanel({
     setStopping(true);
 
     try {
-      const response = await fetch(`/api/agent-runs/${activeRun.id}/cancel`, {
-        method: "POST",
-      });
+      const response = await browserApiFetch(
+        `/api/agent-runs/${activeRun.id}/cancel`,
+        {
+          method: "POST",
+        },
+      );
       if (!response.ok) {
         throw new Error(t("agent.stopFailed"));
       }
@@ -939,235 +1239,308 @@ export function AgentPanel({
     );
 
   return (
-    <aside className="agent-panel-v2" aria-label={t("agent.aria")}>
-      <div className="agent-panel-header">
-        <div>
-          <span className="agent-eyebrow">
-            <Bot size={14} />
-            {t("agent.workspace")}
-          </span>
-          <strong>
-            {snapshot?.conversation.title ?? t("agent.assistant")}
-          </strong>
-        </div>
-        <div className="agent-header-actions">
-          <Button
-            aria-label={t("agent.newConversation")}
-            disabled={creatingConversation}
-            onClick={() => void createConversation()}
-            size="icon-sm"
-            variant="ghost"
-          >
-            {creatingConversation ? (
-              <LoaderCircle className="animate-spin" />
-            ) : (
-              <MessageSquarePlus />
-            )}
-          </Button>
-          <Button
-            aria-label={t("agent.refresh")}
-            onClick={() => void loadAgentSnapshot(selectedConversationId)}
-            size="icon-sm"
-            variant="ghost"
-          >
-            <RefreshCw />
-          </Button>
-        </div>
-      </div>
-
-      <div className="agent-conversation-switcher">
-        <button
-          aria-expanded={showHistory}
-          className="agent-conversation-trigger"
-          onClick={() => setShowHistory((value) => !value)}
-          type="button"
-        >
-          <span>
-            {conversations.length
-              ? t("agent.conversationCount", { count: conversations.length })
-              : t("agent.noConversations")}
-          </span>
-          <ChevronDown className={cn(showHistory && "rotate-180")} />
-        </button>
-        {showHistory ? (
-          <div className="agent-conversation-menu">
-            {conversations.length ? (
-              conversations.map((conversation) => (
-                <button
-                  className={cn(
-                    "agent-conversation-option",
-                    conversation.id === selectedConversationId && "is-active",
-                  )}
-                  key={conversation.id}
-                  onClick={() => {
-                    setShowHistory(false);
-                    selectConversation(conversation.id);
-                    void loadAgentSnapshot(conversation.id);
-                  }}
-                  type="button"
-                >
-                  <span>{conversation.title}</span>
-                  {conversation.id === selectedConversationId ? (
-                    <Check />
-                  ) : null}
-                </button>
-              ))
-            ) : (
-              <span className="agent-menu-empty">
-                {t("agent.conversationEmpty")}
+    <TooltipProvider>
+      <aside className="agent-panel-v2" aria-label={t("agent.aria")}>
+        <div className="agent-panel-header">
+          <div className="agent-conversation-switcher">
+            <button
+              aria-expanded={showHistory}
+              aria-label={t("agent.conversationHistory")}
+              className="agent-conversation-trigger"
+              onClick={() => setShowHistory((value) => !value)}
+              type="button"
+            >
+              <Bot size={14} />
+              <span>
+                {snapshot?.conversation.title ?? t("agent.assistant")}
               </span>
-            )}
-          </div>
-        ) : null}
-      </div>
-
-      <div className="agent-transcript" aria-live="polite" ref={transcriptRef}>
-        {loading ? (
-          <div className="agent-empty-state">
-            <LoaderCircle className="animate-spin" />
-            <span>{t("agent.restoreStatus")}</span>
-          </div>
-        ) : transcript.length ||
-          showOptimisticUserMessage ||
-          streamingAssistantText ? (
-          <>
-            {transcript.map((message) => (
-              <TranscriptItem
-                key={message.id ?? `${message.kind}-${message.seq}`}
-                message={message}
-              />
-            ))}
-            {showOptimisticUserMessage && optimisticUserMessage ? (
-              <OptimisticTranscriptItem message={optimisticUserMessage} />
+              <ChevronDown className={cn(showHistory && "rotate-180")} />
+            </button>
+            {showHistory ? (
+              <div className="agent-conversation-menu">
+                <span className="agent-conversation-menu-label">
+                  {conversations.length
+                    ? t("agent.conversationCount", {
+                        count: conversations.length,
+                      })
+                    : t("agent.noConversations")}
+                </span>
+                {conversations.length ? (
+                  conversations.map((conversation) => (
+                    <button
+                      className={cn(
+                        "agent-conversation-option",
+                        conversation.id === selectedConversationId &&
+                          "is-active",
+                      )}
+                      key={conversation.id}
+                      onClick={() => {
+                        setShowHistory(false);
+                        selectConversation(conversation.id);
+                        void loadAgentSnapshot(conversation.id);
+                      }}
+                      type="button"
+                    >
+                      <span>{conversation.title}</span>
+                      {conversation.id === selectedConversationId ? (
+                        <Check />
+                      ) : null}
+                    </button>
+                  ))
+                ) : (
+                  <span className="agent-menu-empty">
+                    {t("agent.conversationEmpty")}
+                  </span>
+                )}
+              </div>
             ) : null}
-            {streamingAssistantText ? (
-              <StreamingAssistantMessage content={streamingAssistantText} />
-            ) : null}
-          </>
-        ) : (
-          <div className="agent-empty-state">
-            <Bot />
-            <strong>{t("agent.emptyTitle")}</strong>
-            <span>{t("agent.emptyDescription")}</span>
           </div>
-        )}
-      </div>
-
-      {latestRun ? (
-        <AgentRunStatus
-          activeTool={activeTool}
-          hasStreamingAssistantText={Boolean(streamingAssistantText)}
-          onReviewChanges={() => setChangeSetRunId(latestRun.id)}
-          onStop={() => void stopRun()}
-          run={latestRun}
-          stopping={stopping}
-          verificationRuns={latestRunVerifications}
-          verificationSteps={latestRunVerificationSteps}
-        />
-      ) : null}
-
-      {errorMessage ? (
-        <div className="agent-inline-error" role="alert">
-          <TriangleAlert />
-          <span>{errorMessage}</span>
+          <div className="agent-header-actions">
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  aria-label={t("agent.newConversation")}
+                  disabled={creatingConversation}
+                  onClick={() => void createConversation()}
+                  size="icon-sm"
+                  variant="ghost"
+                >
+                  {creatingConversation ? (
+                    <LoaderCircle className="animate-spin" />
+                  ) : (
+                    <MessageSquarePlus />
+                  )}
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>{t("agent.newConversation")}</TooltipContent>
+            </Tooltip>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  aria-label={t("agent.refresh")}
+                  onClick={() =>
+                    void loadAgentSnapshot(selectedConversationId, {
+                      showLoading: false,
+                    })
+                  }
+                  size="icon-sm"
+                  variant="ghost"
+                >
+                  <RefreshCw />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>{t("agent.refresh")}</TooltipContent>
+            </Tooltip>
+          </div>
         </div>
-      ) : null}
 
-      <form className="agent-composer-v2" onSubmit={sendMessage}>
-        {pendingAttachments.length ? (
-          <AttachmentTray
-            attachments={pendingAttachments}
-            onRemove={removePendingAttachment}
-            onRetry={(item) => void uploadAttachment(item)}
+        <div
+          className="agent-transcript"
+          aria-live="polite"
+          onScroll={handleTranscriptScroll}
+          ref={transcriptRef}
+        >
+          {loading ? (
+            <div className="agent-empty-state">
+              <LoaderCircle className="animate-spin" />
+              <span>{t("agent.restoreStatus")}</span>
+            </div>
+          ) : transcript.length ||
+            showOptimisticUserMessage ||
+            streamingAssistantText ? (
+            <>
+              {transcript.map((message) => (
+                <TranscriptItem
+                  key={message.id ?? `${message.kind}-${message.seq}`}
+                  message={message}
+                />
+              ))}
+              {showOptimisticUserMessage && optimisticUserMessage ? (
+                <OptimisticTranscriptItem message={optimisticUserMessage} />
+              ) : null}
+              {streamingAssistantText ? (
+                <StreamingAssistantMessage content={streamingAssistantText} />
+              ) : null}
+            </>
+          ) : (
+            <div className="agent-empty-state">
+              <Bot />
+              <strong>{t("agent.emptyTitle")}</strong>
+              <span>{t("agent.emptyDescription")}</span>
+            </div>
+          )}
+        </div>
+
+        {latestRun ? (
+          <AgentRunStatus
+            activeTool={activeTool}
+            hasStreamingAssistantText={Boolean(streamingAssistantText)}
+            onReviewChanges={() => setChangeSetRunId(latestRun.id)}
+            run={latestRun}
+            verificationRuns={latestRunVerifications}
+            verificationSteps={latestRunVerificationSteps}
           />
         ) : null}
-        <textarea
-          aria-label={t("agent.messageLabel")}
-          disabled={Boolean(activeRun) || sending}
-          onChange={(event) => setDraft(event.target.value)}
-          onKeyDown={(event) => {
-            if (event.key === "Enter" && !event.shiftKey) {
-              event.preventDefault();
-              event.currentTarget.form?.requestSubmit();
-            }
-          }}
-          placeholder={t("agent.placeholder")}
-          ref={draftRef}
-          rows={3}
-          value={draft}
-        />
-        <div className="agent-composer-footer">
-          <div className="agent-composer-tools">
-            <input
-              accept="image/png,image/jpeg,image/webp"
-              className="sr-only"
-              multiple
-              onChange={handleAttachmentSelection}
-              ref={attachmentInputRef}
-              type="file"
-            />
-            <Button
-              aria-label={t("agent.addAttachment")}
-              disabled={
-                Boolean(activeRun) ||
-                sending ||
-                pendingAttachments.length >= 4 ||
-                hasUploadingAttachment
-              }
-              onClick={() => attachmentInputRef.current?.click()}
-              size="icon-sm"
-              type="button"
-              variant="ghost"
-            >
-              <Paperclip />
-            </Button>
-            <Button
-              aria-label={t("agent.openAssets")}
-              onClick={() => {
-                setShowAssets(true);
-                void loadAssets();
-              }}
-              size="icon-sm"
-              type="button"
-              variant="ghost"
-            >
-              <ImageIcon />
-            </Button>
-            <span>{t("agent.provider", { revision })}</span>
+
+        {errorMessage ? (
+          <div className="agent-inline-error" role="alert">
+            <TriangleAlert />
+            <span>{errorMessage}</span>
           </div>
-          <Button
-            aria-label={t("agent.send")}
-            disabled={!draft.trim() || Boolean(activeRun) || sending}
-            size="icon-sm"
-            type="submit"
-          >
-            {sending ? <LoaderCircle className="animate-spin" /> : <Send />}
-          </Button>
-        </div>
-      </form>
+        ) : null}
 
-      {showAssets ? (
-        <AssetPanel
-          assets={assets}
-          onClose={() => setShowAssets(false)}
-          onRefresh={() => void loadAssets()}
-        />
-      ) : null}
+        <form className="agent-composer-v2" onSubmit={sendMessage}>
+          {pendingAttachments.length ? (
+            <AttachmentTray
+              attachments={pendingAttachments}
+              onRemove={removePendingAttachment}
+              onRetry={(item) => void uploadAttachment(item)}
+            />
+          ) : null}
+          <textarea
+            aria-label={t("agent.messageLabel")}
+            disabled={sending}
+            onChange={(event) => setDraft(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" && !event.shiftKey && !activeRun) {
+                event.preventDefault();
+                event.currentTarget.form?.requestSubmit();
+              }
+            }}
+            onPaste={handleComposerPaste}
+            placeholder={t("agent.placeholder")}
+            ref={draftRef}
+            rows={3}
+            value={draft}
+          />
+          <div className="agent-composer-footer">
+            <div className="agent-composer-tools">
+              <input
+                accept="image/png,image/jpeg,image/webp"
+                className="sr-only"
+                multiple
+                onChange={handleAttachmentSelection}
+                ref={attachmentInputRef}
+                type="file"
+              />
+              <Button
+                aria-label={t("agent.addAttachment")}
+                disabled={
+                  Boolean(activeRun) ||
+                  sending ||
+                  pendingAttachments.length >= 4
+                }
+                onClick={() => attachmentInputRef.current?.click()}
+                size="icon-sm"
+                type="button"
+                variant="ghost"
+              >
+                <Paperclip />
+              </Button>
+              <Button
+                aria-label={t("agent.openAssets")}
+                onClick={() => {
+                  setShowAssets(true);
+                  void loadAssets();
+                }}
+                size="icon-sm"
+                type="button"
+                variant="ghost"
+              >
+                <ImageIcon />
+              </Button>
+              {modelOptions.length ? (
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <Button
+                      aria-label={t("agent.modelSelector")}
+                      className="agent-model-trigger"
+                      disabled={Boolean(activeRun) || sending}
+                      size="sm"
+                      type="button"
+                      variant="ghost"
+                    >
+                      <span>{selectedModel || modelOptions[0]?.label}</span>
+                      <ChevronDown />
+                    </Button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="start" className="min-w-44">
+                    <DropdownMenuLabel>{t("agent.model")}</DropdownMenuLabel>
+                    <DropdownMenuRadioGroup
+                      value={selectedModel}
+                      onValueChange={setSelectedModel}
+                    >
+                      {modelOptions.map((option) => (
+                        <DropdownMenuRadioItem
+                          key={option.id}
+                          value={option.id}
+                        >
+                          <span>{option.label}</span>
+                        </DropdownMenuRadioItem>
+                      ))}
+                    </DropdownMenuRadioGroup>
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              ) : (
+                <span>{t("agent.provider", { revision })}</span>
+              )}
+            </div>
+            <Button
+              aria-label={activeRun ? t("agent.stopRun") : t("agent.send")}
+              className={cn("agent-primary-action", activeRun && "is-stop")}
+              disabled={
+                activeRun
+                  ? stopping
+                  : (!draft.trim() && !hasReadyAttachment) || sending
+              }
+              onClick={
+                activeRun
+                  ? () => {
+                      void stopRun();
+                    }
+                  : undefined
+              }
+              size="icon-sm"
+              type={activeRun ? "button" : "submit"}
+            >
+              {activeRun ? (
+                stopping ? (
+                  <LoaderCircle className="animate-spin" />
+                ) : (
+                  <Square fill="currentColor" />
+                )
+              ) : sending ? (
+                <LoaderCircle className="animate-spin" />
+              ) : (
+                <Send />
+              )}
+            </Button>
+          </div>
+        </form>
 
-      {changeSetRunId ? (
-        <ChangeSetDialog
-          dirtyPaths={dirtyPaths}
-          key={changeSetRunId}
-          onOpenChange={(open) => {
-            if (!open) {
-              setChangeSetRunId(null);
-            }
-          }}
-          onRestoreComplete={onRestoreComplete}
-          runId={changeSetRunId}
-        />
-      ) : null}
-    </aside>
+        {showAssets ? (
+          <AssetPanel
+            assets={assets}
+            onClose={() => setShowAssets(false)}
+            onRefresh={() => void loadAssets()}
+          />
+        ) : null}
+
+        {changeSetRunId ? (
+          <ChangeSetDialog
+            dirtyPaths={dirtyPaths}
+            key={changeSetRunId}
+            onOpenChange={(open) => {
+              if (!open) {
+                setChangeSetRunId(null);
+              }
+            }}
+            onRestoreComplete={onRestoreComplete}
+            runId={changeSetRunId}
+          />
+        ) : null}
+      </aside>
+    </TooltipProvider>
   );
 }
 
@@ -1178,9 +1551,11 @@ function TranscriptItem({ message }: { message: TranscriptMessage }) {
     return (
       <article className="agent-message agent-message-user">
         <span className="agent-message-label">{t("agent.you")}</span>
-        <p>{message.content}</p>
         {message.attachmentIds?.length ? (
           <AttachmentIdList attachmentIds={message.attachmentIds} />
+        ) : null}
+        {!isImageOnlyMessageContent(message.content) ? (
+          <p>{message.content}</p>
         ) : null}
       </article>
     );
@@ -1190,7 +1565,7 @@ function TranscriptItem({ message }: { message: TranscriptMessage }) {
     return (
       <article className="agent-message agent-message-assistant">
         <span className="agent-message-label">{t("agent.assistant")}</span>
-        <p>{message.content}</p>
+        <MarkdownRenderer content={message.content} />
       </article>
     );
   }
@@ -1288,9 +1663,11 @@ function OptimisticTranscriptItem({
           ? t("agent.sendingLabel")
           : t("agent.queuedLabel")}
       </span>
-      <p>{message.content}</p>
       {message.attachmentIds?.length ? (
         <AttachmentIdList attachmentIds={message.attachmentIds} />
+      ) : null}
+      {!isImageOnlyMessageContent(message.content) ? (
+        <p>{message.content}</p>
       ) : null}
     </article>
   );
@@ -1305,8 +1682,93 @@ function StreamingAssistantMessage({ content }: { content: string }) {
         <LoaderCircle className="animate-spin" />
         {t("agent.assistant")}
       </span>
-      <p>{content}</p>
+      <MarkdownRenderer content={content} />
     </article>
+  );
+}
+
+function MarkdownRenderer({ content }: { content: string }) {
+  const [copiedCode, setCopiedCode] = useState<string | null>(null);
+
+  return (
+    <div className="agent-markdown">
+      <ReactMarkdown
+        components={{
+          a: ({ children, ...props }) => (
+            <a {...props} rel="noreferrer noopener" target="_blank">
+              {children}
+            </a>
+          ),
+          code: ({ children, className, ...props }) => {
+            return (
+              <code className={className} {...props}>
+                {children}
+              </code>
+            );
+          },
+          pre: ({ children }) => (
+            <MarkdownCodeBlock
+              copiedCode={copiedCode}
+              onCopiedCodeChange={setCopiedCode}
+            >
+              {children}
+            </MarkdownCodeBlock>
+          ),
+        }}
+        remarkPlugins={[remarkGfm]}
+      >
+        {content}
+      </ReactMarkdown>
+    </div>
+  );
+}
+
+function MarkdownCodeBlock({
+  children,
+  copiedCode,
+  onCopiedCodeChange,
+}: ComponentPropsWithoutRef<"pre"> & {
+  copiedCode: string | null;
+  onCopiedCodeChange: (code: string | null) => void;
+}) {
+  const { t } = useUiI18n();
+  const codeElement = Children.only(children);
+  const codeProps = isValidElement<{
+    children?: ReactElement | string | string[];
+    className?: string;
+  }>(codeElement)
+    ? codeElement.props
+    : {};
+  const code = String(codeProps.children ?? "").replace(/\n$/, "");
+  const language =
+    /language-([\w-]+)/.exec(codeProps.className ?? "")?.[1] ?? t("agent.code");
+  const copied = copiedCode === code;
+
+  return (
+    <div className="agent-code-block">
+      <div className="agent-code-toolbar">
+        <span>{language}</span>
+        <Button
+          aria-label={copied ? t("agent.codeCopied") : t("agent.copyCode")}
+          onClick={() => {
+            void navigator.clipboard.writeText(code).then(() => {
+              onCopiedCodeChange(code);
+              window.setTimeout(() => {
+                onCopiedCodeChange(null);
+              }, 1500);
+            });
+          }}
+          size="icon-sm"
+          type="button"
+          variant="ghost"
+        >
+          {copied ? <Check /> : <Copy />}
+        </Button>
+      </div>
+      <pre>
+        <code className={codeProps.className}>{code}</code>
+      </pre>
+    </div>
   );
 }
 
@@ -1315,8 +1777,6 @@ function AgentRunStatus({
   activeTool,
   hasStreamingAssistantText,
   onReviewChanges,
-  onStop,
-  stopping,
   verificationRuns,
   verificationSteps,
 }: {
@@ -1324,8 +1784,6 @@ function AgentRunStatus({
   activeTool: ToolInvocationRecord | null;
   hasStreamingAssistantText: boolean;
   onReviewChanges: () => void;
-  onStop: () => void;
-  stopping: boolean;
   verificationRuns: VerificationRunRecord[];
   verificationSteps: VerificationStepRecord[];
 }) {
@@ -1345,14 +1803,14 @@ function AgentRunStatus({
       : status.detail;
 
   return (
-    <section
+    <details
       className={cn(
         "agent-run-status",
         isActive && "is-active",
         `is-${status.tone}`,
       )}
     >
-      <div className="agent-run-status-top">
+      <summary aria-label={t("agent.toggleRunDetails")}>
         <span className="agent-run-status-label">
           {isActive ? (
             <LoaderCircle className="animate-spin" />
@@ -1363,85 +1821,81 @@ function AgentRunStatus({
           )}
           {status.title}
         </span>
-        <span>{elapsed}</span>
-      </div>
-      <div className="agent-run-status-detail">
-        <span>{activeDetail}</span>
-        <span>
-          {displayedModelTurns}/{run.budget.maxModelTurns} {t("agent.turns")} ·
-          r{run.currentRevision}
+        <span className="agent-run-status-summary-detail">{activeDetail}</span>
+        <span className="agent-run-status-summary-end">
+          {elapsed}
+          <ChevronDown />
         </span>
-      </div>
-      <div className="agent-run-metrics" aria-label={t("agent.runMetrics")}>
-        <span>
-          <PlayCircle />
-          <b>{run.usage.clientResumes}</b>/{run.budget.maxClientResumes}{" "}
-          {t("agent.previews")}
-        </span>
-        <span>
-          <RotateCcw />
-          <b>{run.usage.repairRounds}</b> {t("agent.repairs")}
-        </span>
-        <span>
-          <Wrench />
-          <b>{run.usage.fileMutations}</b>/{run.budget.maxFileMutations}{" "}
-          {t("agent.writes")}
-        </span>
-      </div>
-      {run.usage.latestVerificationRevision !== null ? (
-        <div
-          className={cn(
-            "agent-verification-state",
-            run.usage.latestVerificationOk ? "is-verified" : "is-unverified",
-          )}
-        >
-          {run.usage.latestVerificationOk ? <ShieldCheck /> : <TriangleAlert />}
+      </summary>
+      <div className="agent-run-status-content">
+        <div className="agent-run-status-detail">
+          <span>{activeDetail}</span>
           <span>
-            {run.usage.latestVerificationOk
-              ? t("agent.verifiedRevision", {
-                  revision: run.usage.latestVerificationRevision,
-                })
-              : t("agent.verificationFailed", {
-                  revision: run.usage.latestVerificationRevision,
-                })}
+            {displayedModelTurns}/{run.budget.maxModelTurns} {t("agent.turns")}{" "}
+            · r{run.currentRevision}
           </span>
-          {run.usage.firstPreviewDurationMs !== null ? (
-            <small>
-              {t("agent.firstPreview", {
-                duration: formatDuration(run.usage.firstPreviewDurationMs),
-              })}
-            </small>
-          ) : null}
         </div>
-      ) : null}
-      {verificationRuns.length ? (
-        <VerificationHistory
-          runs={verificationRuns}
-          steps={verificationSteps}
-        />
-      ) : null}
-      {isActive ? (
-        <Button
-          disabled={stopping}
-          onClick={onStop}
-          size="sm"
-          variant="outline"
-        >
-          <CircleStop data-icon="inline-start" />
-          {stopping ? t("agent.stopping") : t("agent.stop")}
-        </Button>
-      ) : (
-        <>
-          <p className="agent-run-error">{status.message}</p>
-          {run.status === "succeeded" ? (
-            <Button onClick={onReviewChanges} size="sm" variant="outline">
-              <GitCompareArrows data-icon="inline-start" />
-              {t("agent.reviewChanges")}
-            </Button>
-          ) : null}
-        </>
-      )}
-    </section>
+        <div className="agent-run-metrics" aria-label={t("agent.runMetrics")}>
+          <span>
+            <PlayCircle />
+            <b>{run.usage.clientResumes}</b>/{run.budget.maxClientResumes}{" "}
+            {t("agent.previews")}
+          </span>
+          <span>
+            <RotateCcw />
+            <b>{run.usage.repairRounds}</b> {t("agent.repairs")}
+          </span>
+          <span>
+            <Wrench />
+            <b>{run.usage.fileMutations}</b>/{run.budget.maxFileMutations}{" "}
+            {t("agent.writes")}
+          </span>
+        </div>
+        {run.usage.latestVerificationRevision !== null ? (
+          <div
+            className={cn(
+              "agent-verification-state",
+              run.usage.latestVerificationOk ? "is-verified" : "is-unverified",
+            )}
+          >
+            {run.usage.latestVerificationOk ? (
+              <ShieldCheck />
+            ) : (
+              <TriangleAlert />
+            )}
+            <span>
+              {run.usage.latestVerificationOk
+                ? t("agent.verifiedRevision", {
+                    revision: run.usage.latestVerificationRevision,
+                  })
+                : t("agent.verificationFailed", {
+                    revision: run.usage.latestVerificationRevision,
+                  })}
+            </span>
+            {run.usage.firstPreviewDurationMs !== null ? (
+              <small>
+                {t("agent.firstPreview", {
+                  duration: formatDuration(run.usage.firstPreviewDurationMs),
+                })}
+              </small>
+            ) : null}
+          </div>
+        ) : null}
+        {verificationRuns.length ? (
+          <VerificationHistory
+            runs={verificationRuns}
+            steps={verificationSteps}
+          />
+        ) : null}
+        {!isActive ? <p className="agent-run-error">{status.message}</p> : null}
+        {run.status === "succeeded" ? (
+          <Button onClick={onReviewChanges} size="sm" variant="outline">
+            <GitCompareArrows data-icon="inline-start" />
+            {t("agent.reviewChanges")}
+          </Button>
+        ) : null}
+      </div>
+    </details>
   );
 }
 
@@ -1484,10 +1938,7 @@ function VerificationHistory({
   const visibleRuns = runs.slice(-4).reverse();
 
   return (
-    <details
-      className="agent-verification-history"
-      open={visibleRuns[0]?.status === "failed"}
-    >
+    <details className="agent-verification-history">
       <summary>
         <span>{t("agent.verificationHistory")}</span>
         <small>{t("agent.verificationCount", { count: runs.length })}</small>
@@ -1705,11 +2156,68 @@ function getRunStatusCopy(
         tone: "warning",
       };
     case "budget_exhausted":
-      if (run.errorCode === "AGENT_NO_PROGRESS") {
+      if (run.errorCode === AGENT_ERROR_CODES.noProgress) {
         return {
           title: t("agent.statusNoProgress"),
           detail: t("agent.statusNoProgressDetail"),
           message: t("agent.statusNoProgressMessage"),
+          tone: "warning",
+        };
+      }
+      if (run.errorCode === AGENT_ERROR_CODES.fileMutationsExhausted) {
+        return {
+          title: t("agent.statusFileMutationsBudget"),
+          detail: t("agent.statusFileMutationsBudgetDetail", {
+            used: run.usage.fileMutations,
+            limit: run.budget.maxFileMutations,
+          }),
+          message: t("agent.statusFileMutationsBudgetMessage"),
+          tone: "warning",
+        };
+      }
+      if (run.errorCode === AGENT_ERROR_CODES.clientResumesExhausted) {
+        return {
+          title: t("agent.statusClientResumesBudget"),
+          detail: t("agent.statusClientResumesBudgetDetail", {
+            used: run.usage.clientResumes,
+            limit: run.budget.maxClientResumes,
+          }),
+          message: t("agent.statusClientResumesBudgetMessage"),
+          tone: "warning",
+        };
+      }
+      if (run.errorCode === AGENT_ERROR_CODES.wallTimeExhausted) {
+        return {
+          title: t("agent.statusWallTimeBudget"),
+          detail: t("agent.statusWallTimeBudgetDetail", {
+            used: Math.ceil(run.usage.activeExecutionDurationMs / 1_000),
+            limit: run.budget.maxWallTimeSeconds,
+          }),
+          message: t("agent.statusWallTimeBudgetMessage"),
+          tone: "warning",
+        };
+      }
+      if (run.errorCode === AGENT_ERROR_CODES.outputExhausted) {
+        return {
+          title: t("agent.statusOutputBudget"),
+          detail: t("agent.statusOutputBudgetDetail", {
+            limit: run.budget.maxOutputCharacters,
+          }),
+          message: t("agent.statusOutputBudgetMessage"),
+          tone: "warning",
+        };
+      }
+      if (
+        run.errorCode === AGENT_ERROR_CODES.modelTurnsExhausted ||
+        run.errorCode === AGENT_ERROR_CODES.budgetExhausted
+      ) {
+        return {
+          title: t("agent.statusModelTurnsBudget"),
+          detail: t("agent.statusModelTurnsBudgetDetail", {
+            used: run.usage.modelTurns,
+            limit: run.budget.maxModelTurns,
+          }),
+          message: t("agent.statusModelTurnsBudgetMessage"),
           tone: "warning",
         };
       }
@@ -1781,7 +2289,10 @@ type VisionResultDisplay = {
 function getVisionResultDisplay(
   message: Extract<TranscriptMessage, { kind: "tool_result" }>,
 ): VisionResultDisplay | null {
-  if (message.toolName !== "inspect_attachment" || message.resultJson.ok !== true) {
+  if (
+    message.toolName !== "inspect_attachment" ||
+    message.resultJson.ok !== true
+  ) {
     return null;
   }
 
@@ -1838,7 +2349,10 @@ function AttachmentIdList({ attachmentIds }: { attachmentIds: string[] }) {
   const { t } = useUiI18n();
 
   return (
-    <div className="agent-attachment-id-list" aria-label={t("agent.attachments")}>
+    <div
+      className="agent-attachment-id-list"
+      aria-label={t("agent.attachments")}
+    >
       {attachmentIds.map((attachmentId, index) => (
         <a
           className="agent-attachment-id"
@@ -2069,17 +2583,26 @@ function uploadImageFile(
       }
     });
     request.addEventListener("load", () => {
-      const body = request.response as
-        | { attachments?: AttachmentView[]; error?: { message?: string } }
-        | null;
-      if (request.status < 200 || request.status >= 300 || !body?.attachments?.[0]) {
+      const body = request.response as {
+        attachments?: AttachmentView[];
+        error?: { message?: string };
+      } | null;
+      if (
+        request.status < 200 ||
+        request.status >= 300 ||
+        !body?.attachments?.[0]
+      ) {
         reject(new Error(body?.error?.message ?? "图片上传失败。"));
         return;
       }
       resolve(body.attachments[0]);
     });
-    request.addEventListener("error", () => reject(new Error("图片上传失败。")));
-    request.addEventListener("abort", () => reject(new Error("图片上传已取消。")));
+    request.addEventListener("error", () =>
+      reject(new Error("图片上传失败。")),
+    );
+    request.addEventListener("abort", () =>
+      reject(new Error("图片上传已取消。")),
+    );
     request.send(formData);
   });
 }
@@ -2142,6 +2665,27 @@ function getFailedRunStatusCopy(
         message: t("agent.statusProfileUnavailableMessage"),
         tone: "error",
       };
+    case "IMAGE_VISION_TIMEOUT":
+      return {
+        title: t("agent.statusVisionTimeout"),
+        detail: t("agent.statusVisionTimeoutDetail"),
+        message: t("agent.statusVisionTimeoutMessage"),
+        tone: "error",
+      };
+    case "IMAGE_VISION_CONTENT_REJECTED":
+      return {
+        title: t("agent.statusVisionRejected"),
+        detail: t("agent.statusVisionRejectedDetail"),
+        message: t("agent.statusVisionRejectedMessage"),
+        tone: "error",
+      };
+    case "IMAGE_VISION_INVALID_RESPONSE":
+      return {
+        title: t("agent.statusVisionInvalidResponse"),
+        detail: t("agent.statusVisionInvalidResponseDetail"),
+        message: t("agent.statusVisionInvalidResponseMessage"),
+        tone: "error",
+      };
     default:
       return {
         title: t("agent.statusFailed"),
@@ -2159,9 +2703,12 @@ async function fetchAgentSnapshot(
   const query = conversationId
     ? `?conversationId=${encodeURIComponent(conversationId)}`
     : "";
-  const response = await fetch(`/api/projects/${projectId}/agent${query}`, {
-    cache: "no-store",
-  });
+  const response = await browserApiFetch(
+    `/api/projects/${projectId}/agent${query}`,
+    {
+      cache: "no-store",
+    },
+  );
   const body = (await response.json().catch(() => ({}))) as
     AgentResponse | AgentErrorResponse;
 
@@ -2174,6 +2721,65 @@ async function fetchAgentSnapshot(
   }
 
   return body;
+}
+
+function createAgentSnapshotCacheKey(
+  projectId: string,
+  conversationId: string,
+): string {
+  return `${projectId}:${conversationId}`;
+}
+
+function readAgentSnapshotCache(
+  projectId: string,
+  conversationId = LATEST_CONVERSATION_CACHE_KEY,
+): AgentResponse | null {
+  const key = createAgentSnapshotCacheKey(projectId, conversationId);
+  const cached = agentSnapshotCache.get(key);
+  if (!cached) {
+    return null;
+  }
+
+  // Map 的插入顺序同时承担轻量 LRU。命中时重新插入，频繁访问的项目不会
+  // 因为用户打开多个其他项目而过早被淘汰。
+  agentSnapshotCache.delete(key);
+  agentSnapshotCache.set(key, cached);
+  return cached;
+}
+
+function writeAgentSnapshotCache(
+  projectId: string,
+  response: AgentResponse,
+): void {
+  const keys = [LATEST_CONVERSATION_CACHE_KEY];
+  if (response.snapshot?.conversation.id) {
+    keys.push(response.snapshot.conversation.id);
+  }
+
+  for (const conversationId of keys) {
+    const key = createAgentSnapshotCacheKey(projectId, conversationId);
+    agentSnapshotCache.delete(key);
+    agentSnapshotCache.set(key, response);
+  }
+
+  while (agentSnapshotCache.size > MAX_AGENT_SNAPSHOT_CACHE_ENTRIES) {
+    const oldestKey = agentSnapshotCache.keys().next().value;
+    if (typeof oldestKey !== "string") {
+      break;
+    }
+    agentSnapshotCache.delete(oldestKey);
+  }
+}
+
+function getLatestAgentEventSequence(
+  snapshot: AgentConversationSnapshot | null | undefined,
+): number {
+  return (
+    snapshot?.events.reduce(
+      (cursor, event) => Math.max(cursor, event.sequence),
+      0,
+    ) ?? 0
+  );
 }
 
 function findActiveRun(runs: readonly AgentRunRecord[]): AgentRunRecord | null {

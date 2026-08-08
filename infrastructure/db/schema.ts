@@ -3,9 +3,11 @@ import {
   bigint,
   boolean,
   check,
+  date,
   index,
   integer,
   jsonb,
+  numeric,
   pgEnum,
   pgTable,
   primaryKey,
@@ -149,6 +151,30 @@ export const verificationRunSource = pgEnum("verification_run_source", [
 export const verificationStepStatus = pgEnum("verification_step_status", [
   "passed",
   "failed",
+]);
+
+export const quotaResource = pgEnum("quota_resource", [
+  "agent_run",
+  "image_generation",
+  "attachment_upload",
+]);
+
+export const quotaSubjectType = pgEnum("quota_subject_type", [
+  "ip",
+  "owner",
+  "global",
+]);
+
+export const quotaLeaseStatus = pgEnum("quota_lease_status", [
+  "active",
+  "released",
+  "expired",
+]);
+
+export const usageLedgerStatus = pgEnum("usage_ledger_status", [
+  "reserved",
+  "settled",
+  "released",
 ]);
 
 export const showcaseCaseStatus = pgEnum("showcase_case_status", [
@@ -339,9 +365,7 @@ export const browserGitMigrationSessions = pgTable(
     candidateRepositoryId: text("candidate_repository_id").notNull(),
     manifestHash: text("manifest_hash").notNull(),
     expectedHead: text("expected_head"),
-    status: browserGitMigrationStatus("status")
-      .notNull()
-      .default("prepared"),
+    status: browserGitMigrationStatus("status").notNull().default("prepared"),
     expiresAt: timestamp("expires_at", {
       withTimezone: true,
       mode: "date",
@@ -816,9 +840,12 @@ export const imageRuns = pgTable(
     conversationId: uuid("conversation_id").references(() => conversations.id, {
       onDelete: "set null",
     }),
-    parentAgentRunId: uuid("parent_agent_run_id").references(() => agentRuns.id, {
-      onDelete: "set null",
-    }),
+    parentAgentRunId: uuid("parent_agent_run_id").references(
+      () => agentRuns.id,
+      {
+        onDelete: "set null",
+      },
+    ),
     toolCallId: text("tool_call_id").notNull(),
     prompt: text("prompt").notNull(),
     requestedCount: integer("requested_count").notNull(),
@@ -942,6 +969,230 @@ export const imageJobs = pgTable(
   ],
 );
 
+/**
+ * 按自然日保存的额度桶。
+ *
+ * subjectKey 只保存服务端生成的稳定键：owner 使用匿名 ownerId，IP 使用
+ * 带每日 salt 的 HMAC。原始 IP 不会进入数据库，避免把网络标识变成业务数据。
+ */
+export const quotaBuckets = pgTable(
+  "quota_buckets",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    resource: quotaResource("resource").notNull(),
+    subjectType: quotaSubjectType("subject_type").notNull(),
+    subjectKey: text("subject_key").notNull(),
+    bucketDate: date("bucket_date", { mode: "string" }).notNull(),
+    limit: integer("quota_limit").notNull(),
+    consumed: integer("consumed").notNull().default(0),
+    createdAt: timestamp("created_at", {
+      withTimezone: true,
+      mode: "date",
+    })
+      .notNull()
+      .defaultNow(),
+    updatedAt: timestamp("updated_at", {
+      withTimezone: true,
+      mode: "date",
+    })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    check("quota_buckets_limit_check", sql`${table.limit} >= 0`),
+    check(
+      "quota_buckets_consumed_check",
+      sql`${table.consumed} >= 0 and ${table.consumed} <= ${table.limit}`,
+    ),
+    uniqueIndex("quota_buckets_subject_uidx").on(
+      table.resource,
+      table.subjectType,
+      table.subjectKey,
+      table.bucketDate,
+    ),
+    index("quota_buckets_date_idx").on(table.bucketDate, table.resource),
+  ],
+);
+
+/**
+ * 短时并发租约事实。与 Agent Run 的执行租约分开，避免一个请求线程失效时
+ * 额度保护也跟着丢失；释放和过期都保留状态，方便审计和排查泄漏。
+ */
+export const quotaLeases = pgTable(
+  "quota_leases",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    resource: quotaResource("resource").notNull(),
+    ownerId: text("owner_id").notNull(),
+    subjectKey: text("subject_key").notNull(),
+    status: quotaLeaseStatus("status").notNull().default("active"),
+    expiresAt: timestamp("expires_at", {
+      withTimezone: true,
+      mode: "date",
+    }).notNull(),
+    releasedAt: timestamp("released_at", {
+      withTimezone: true,
+      mode: "date",
+    }),
+    correlationId: uuid("correlation_id"),
+    metadata: jsonb("metadata")
+      .$type<Record<string, unknown>>()
+      .notNull()
+      .default({}),
+    createdAt: timestamp("created_at", {
+      withTimezone: true,
+      mode: "date",
+    })
+      .notNull()
+      .defaultNow(),
+    updatedAt: timestamp("updated_at", {
+      withTimezone: true,
+      mode: "date",
+    })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    index("quota_leases_owner_status_idx").on(
+      table.ownerId,
+      table.status,
+      table.expiresAt,
+    ),
+    index("quota_leases_resource_status_idx").on(
+      table.resource,
+      table.status,
+      table.expiresAt,
+    ),
+  ],
+);
+
+/**
+ * Provider 用量的最终账本。reserved 记录调用前的预算预留，settled 记录
+ * Provider 返回的真实 token/费用，released 表示调用未发生或已取消。
+ */
+export const usageLedger = pgTable(
+  "usage_ledger",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    ownerId: text("owner_id").notNull(),
+    resource: quotaResource("resource").notNull(),
+    agentRunId: uuid("agent_run_id").references(() => agentRuns.id, {
+      onDelete: "set null",
+    }),
+    imageRunId: uuid("image_run_id").references(() => imageRuns.id, {
+      onDelete: "set null",
+    }),
+    provider: text("provider").notNull(),
+    model: text("model").notNull(),
+    status: usageLedgerStatus("status").notNull().default("reserved"),
+    idempotencyKey: text("idempotency_key").notNull(),
+    reservedInputTokens: integer("reserved_input_tokens").notNull().default(0),
+    reservedOutputTokens: integer("reserved_output_tokens")
+      .notNull()
+      .default(0),
+    inputTokens: integer("input_tokens").notNull().default(0),
+    outputTokens: integer("output_tokens").notNull().default(0),
+    estimatedCostUsd: numeric("estimated_cost_usd", {
+      precision: 12,
+      scale: 6,
+    })
+      .notNull()
+      .default("0"),
+    metadata: jsonb("metadata")
+      .$type<Record<string, unknown>>()
+      .notNull()
+      .default({}),
+    createdAt: timestamp("created_at", {
+      withTimezone: true,
+      mode: "date",
+    })
+      .notNull()
+      .defaultNow(),
+    settledAt: timestamp("settled_at", {
+      withTimezone: true,
+      mode: "date",
+    }),
+    updatedAt: timestamp("updated_at", {
+      withTimezone: true,
+      mode: "date",
+    })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    check(
+      "usage_ledger_reserved_tokens_check",
+      sql`${table.reservedInputTokens} >= 0 and ${table.reservedOutputTokens} >= 0`,
+    ),
+    check(
+      "usage_ledger_tokens_check",
+      sql`${table.inputTokens} >= 0 and ${table.outputTokens} >= 0`,
+    ),
+    uniqueIndex("usage_ledger_idempotency_uidx").on(table.idempotencyKey),
+    index("usage_ledger_owner_created_idx").on(table.ownerId, table.createdAt),
+    index("usage_ledger_resource_status_idx").on(
+      table.resource,
+      table.status,
+      table.createdAt,
+    ),
+  ],
+);
+
+/**
+ * 全站自然日费用预算的并发事实层。
+ *
+ * reservedUsd 是已经发出 Provider 请求、但还没有拿到最终用量的成本；
+ * consumedUsd 是已结算成本。两者都在同一事务内锁行更新，多个 Serverless
+ * 实例不会因为同时检查余额而越过当天预算。
+ */
+export const dailyBudgetBuckets = pgTable(
+  "daily_budget_buckets",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    bucketDate: date("bucket_date", { mode: "string" }).notNull(),
+    limitUsd: numeric("limit_usd", {
+      precision: 12,
+      scale: 6,
+    }).notNull(),
+    reservedUsd: numeric("reserved_usd", {
+      precision: 12,
+      scale: 6,
+    })
+      .notNull()
+      .default("0"),
+    consumedUsd: numeric("consumed_usd", {
+      precision: 12,
+      scale: 6,
+    })
+      .notNull()
+      .default("0"),
+    createdAt: timestamp("created_at", {
+      withTimezone: true,
+      mode: "date",
+    })
+      .notNull()
+      .defaultNow(),
+    updatedAt: timestamp("updated_at", {
+      withTimezone: true,
+      mode: "date",
+    })
+      .notNull()
+      .defaultNow(),
+  },
+  (table) => [
+    check("daily_budget_buckets_limit_check", sql`${table.limitUsd} >= 0`),
+    check(
+      "daily_budget_buckets_reserved_check",
+      sql`${table.reservedUsd} >= 0`,
+    ),
+    check(
+      "daily_budget_buckets_consumed_check",
+      sql`${table.consumedUsd} >= 0`,
+    ),
+    uniqueIndex("daily_budget_buckets_date_uidx").on(table.bucketDate),
+  ],
+);
+
 export const projectAssets = pgTable(
   "project_assets",
   {
@@ -967,7 +1218,10 @@ export const projectAssets = pgTable(
     blobUrl: text("blob_url").notNull(),
     width: integer("width"),
     height: integer("height"),
-    metadata: jsonb("metadata").$type<Record<string, unknown>>().notNull().default({}),
+    metadata: jsonb("metadata")
+      .$type<Record<string, unknown>>()
+      .notNull()
+      .default({}),
     createdAt: timestamp("created_at", {
       withTimezone: true,
       mode: "date",
@@ -1281,7 +1535,10 @@ export const showcaseArtifacts = pgTable(
       sql`${table.sourceRevision} >= 0`,
     ),
     check("showcase_artifacts_file_count_check", sql`${table.fileCount} > 0`),
-    check("showcase_artifacts_total_bytes_check", sql`${table.totalBytes} >= 0`),
+    check(
+      "showcase_artifacts_total_bytes_check",
+      sql`${table.totalBytes} >= 0`,
+    ),
   ],
 );
 
@@ -1304,6 +1561,10 @@ export const databaseSchema = {
   imageRuns,
   imageJobs,
   projectAssets,
+  quotaBuckets,
+  quotaLeases,
+  usageLedger,
+  dailyBudgetBuckets,
   agentEvidence,
   verificationRuns,
   verificationSteps,
@@ -1314,8 +1575,7 @@ export const databaseSchema = {
 export type ProjectRow = typeof projects.$inferSelect;
 export type ProjectFileRow = typeof projectFiles.$inferSelect;
 export type ShowcaseCaseRow = typeof showcaseCases.$inferSelect;
-export type ShowcaseArtifactManifestRow =
-  typeof showcaseArtifacts.$inferSelect;
+export type ShowcaseArtifactManifestRow = typeof showcaseArtifacts.$inferSelect;
 export type ChatAttachmentRow = typeof chatAttachments.$inferSelect;
 export type ImageRunRow = typeof imageRuns.$inferSelect;
 export type ImageJobRow = typeof imageJobs.$inferSelect;

@@ -5,7 +5,9 @@ import {
   isAgentError,
   serializeAgentError,
 } from "@/domains/agent/errors";
+import { isImageError } from "@/domains/image/errors";
 import { AgentOrchestrator } from "@/domains/agent/orchestrator";
+import { createAttachmentContextResolver } from "@/infrastructure/agent/attachment-context";
 import { FileToolExecutor } from "@/domains/agent/file-tools";
 import { ImageToolExecutor } from "@/domains/agent/image-tools";
 import { AssetToolExecutor } from "@/domains/image/asset-tool";
@@ -18,6 +20,14 @@ import { getAgentPersistence } from "@/infrastructure/http/agent-api";
 import { getImageJobQueue } from "@/infrastructure/queue/factory";
 import { getPendingImageJobForAgentRun } from "@/domains/image/job-store";
 import type { AgentRunRecord } from "@/domains/agent/types";
+import {
+  ensureQuotaLease,
+  getQuotaIpSubjectKey,
+  releaseQuotaReservation,
+  recordModelUsage,
+  reserveModelUsageBudget,
+  settleModelUsageBudget,
+} from "@/infrastructure/quota/service";
 
 export async function launchAgentRun(input: {
   ownerId: string;
@@ -32,10 +42,33 @@ export async function launchAgentRun(input: {
       return;
     }
 
-    const { provider } = getAgentProviderRuntime();
+    if (currentRun.status === "queued" || currentRun.status === "running") {
+      // 刷新、队列重投和跨实例接管都要重新占用短时并发 lease，但
+      // ensureQuotaLease 不会重复扣除已经消费过的每日额度。
+      await ensureQuotaLease({
+        resource: "agent_run",
+        ownerId: currentRun.ownerId,
+        resourceId: currentRun.id,
+        correlationId: currentRun.correlationId,
+        ipSubjectKey: await getQuotaIpSubjectKey({
+          resource: "agent_run",
+          resourceId: currentRun.id,
+        }),
+      });
+    }
+
+    // Run 创建时已经冻结了模型。恢复执行必须沿用这个模型，
+    // 否则用户选择 gpt-5.5 后，后台重启会悄悄退回 DeepSeek。
+    const { provider } = getAgentProviderRuntime(currentRun.model);
     let visionTools: VisionToolExecutor | undefined;
+    let attachmentContextResolver:
+      ReturnType<typeof createAttachmentContextResolver> | undefined;
     try {
       const visionRuntime = getVisionProviderRuntime();
+      attachmentContextResolver = createAttachmentContextResolver(
+        visionRuntime.provider,
+        visionRuntime.model,
+      );
       visionTools = new VisionToolExecutor(store, visionRuntime.provider, {
         model: visionRuntime.model,
         profile: visionRuntime.profile,
@@ -73,13 +106,21 @@ export async function launchAgentRun(input: {
       provider,
       new FileToolExecutor(repository, store),
       visionTools,
-      new ImageToolExecutor(store, getImageJobQueue(), imageRuntime && {
-        provider: imageRuntime.providerName,
-        model: imageRuntime.model,
-        profile: imageRuntime.profile,
-        profileVersion: imageRuntime.profileVersion,
-      }),
+      new ImageToolExecutor(
+        store,
+        getImageJobQueue(),
+        imageRuntime && {
+          provider: imageRuntime.providerName,
+          model: imageRuntime.model,
+          profile: imageRuntime.profile,
+          profileVersion: imageRuntime.profileVersion,
+        },
+      ),
       new AssetToolExecutor(store),
+      attachmentContextResolver,
+      recordModelUsage,
+      reserveModelUsageBudget,
+      settleModelUsageBudget,
     );
 
     await withAgentRunController(input.runId, (signal) =>
@@ -102,12 +143,14 @@ export async function launchAgentRun(input: {
         ownerId: input.ownerId,
         runId: input.runId,
         status: "failed",
-        errorCode: isAgentError(error)
-          ? error.code
-          : AGENT_ERROR_CODES.providerInterrupted,
-        errorMessage: isAgentError(error)
-          ? error.message
-          : "Agent 执行器启动失败。",
+        errorCode:
+          isAgentError(error) || isImageError(error)
+            ? error.code
+            : AGENT_ERROR_CODES.providerInterrupted,
+        errorMessage:
+          isAgentError(error) || isImageError(error)
+            ? error.message
+            : "Agent 执行器启动失败。",
       });
     }
 
@@ -118,12 +161,34 @@ export async function launchAgentRun(input: {
         ...serializeAgentError(error),
       }),
     );
+  } finally {
+    const latest = await store.getRun(input).catch(() => null);
+    if (
+      latest &&
+      (latest.status === "succeeded" ||
+        latest.status === "failed" ||
+        latest.status === "cancelled" ||
+        latest.status === "budget_exhausted" ||
+        latest.status === "conflicted" ||
+        latest.status === "awaiting_client_tool" ||
+        latest.status === "awaiting_async_job")
+    ) {
+      // 等待客户端工具或异步生图时，服务端执行片段已经结束，不应继续
+      // 占用全站 Agent 并发名额。释放操作按 resourceId 幂等。
+      await releaseQuotaReservation({
+        resource: "agent_run",
+        resourceId: input.runId,
+      }).catch((releaseError) => {
+        console.error("[agent-runtime] quota lease release failed", {
+          runId: input.runId,
+          releaseError,
+        });
+      });
+    }
   }
 }
 
-async function dispatchPendingImageJob(
-  run: AgentRunRecord,
-): Promise<void> {
+async function dispatchPendingImageJob(run: AgentRunRecord): Promise<void> {
   const pending = await getPendingImageJobForAgentRun({
     ownerId: run.ownerId,
     agentRunId: run.id,

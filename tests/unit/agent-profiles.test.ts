@@ -2,7 +2,9 @@ import { describe, expect, it } from "vitest";
 
 import { AGENT_ERROR_CODES } from "@/domains/agent/errors";
 import {
+  DEFAULT_AGENT_RUN_ACTIVITY_LIMITS,
   DEFAULT_MAX_AGENT_MODEL_TURNS,
+  DEFAULT_MAX_AGENT_WALL_TIME_SECONDS,
   normalizeAgentRunBudget,
 } from "@/domains/agent/types";
 import {
@@ -74,8 +76,8 @@ describe("Agent profiles", () => {
       "Do not call run_preview or browser_verify only to answer a read-only request",
     );
     expect(profile.budget).toMatchObject({
-      maxFileMutations: 8,
-      maxClientResumes: 6,
+      maxFileMutations: 512,
+      maxClientResumes: 32,
       maxNoProgressRepeats: 2,
     });
     expect(resolved.toolset.tools.map((tool) => tool.name)).toEqual(
@@ -87,15 +89,37 @@ describe("Agent profiles", () => {
     );
   });
 
-  it("旧 Run 缺少模型轮次字段时使用新的空项目默认预算", () => {
-    expect(normalizeAgentRunBudget({}).maxModelTurns).toBe(
-      DEFAULT_MAX_AGENT_MODEL_TURNS,
+  it("旧 Run 缺少预算字段时补齐当前默认值，并保留已冻结的显式值", () => {
+    const normalized = normalizeAgentRunBudget({});
+
+    expect(normalized.maxModelTurns).toBe(DEFAULT_MAX_AGENT_MODEL_TURNS);
+    expect(normalized.maxFileMutations).toBe(
+      DEFAULT_AGENT_RUN_ACTIVITY_LIMITS.maxFileMutations,
     );
-    expect(DEFAULT_MAX_AGENT_MODEL_TURNS).toBe(16);
+    expect(normalized.maxClientResumes).toBe(
+      DEFAULT_AGENT_RUN_ACTIVITY_LIMITS.maxClientResumes,
+    );
+    expect(normalized.maxWallTimeSeconds).toBe(
+      DEFAULT_MAX_AGENT_WALL_TIME_SECONDS,
+    );
+    expect(DEFAULT_MAX_AGENT_MODEL_TURNS).toBe(128);
+    expect(DEFAULT_AGENT_RUN_ACTIVITY_LIMITS.maxFileMutations).toBe(512);
+    expect(DEFAULT_AGENT_RUN_ACTIVITY_LIMITS.maxClientResumes).toBe(32);
+    expect(DEFAULT_MAX_AGENT_WALL_TIME_SECONDS).toBe(1_800);
     // 已冻结的显式预算仍保持原值，避免恢复旧 Run 时悄然改变执行边界。
-    expect(normalizeAgentRunBudget({ maxModelTurns: 12 }).maxModelTurns).toBe(
-      12,
-    );
+    expect(
+      normalizeAgentRunBudget({
+        maxModelTurns: 12,
+        maxFileMutations: 8,
+        maxClientResumes: 6,
+        maxWallTimeSeconds: 300,
+      }),
+    ).toMatchObject({
+      maxModelTurns: 12,
+      maxFileMutations: 8,
+      maxClientResumes: 6,
+      maxWallTimeSeconds: 300,
+    });
   });
 
   it("为 Browser Git 冻结客户端工具、Git 权限和远端禁用边界", () => {

@@ -36,6 +36,7 @@ import type {
   ProjectRestoreImpact,
   ProjectRestorePreview,
 } from "@/domains/project/types";
+import { browserApiFetch } from "@/infrastructure/http/browser-api";
 import { useUiI18n } from "@/infrastructure/i18n/ui";
 import { cn } from "@/lib/utils";
 
@@ -154,13 +155,16 @@ export function ChangeSetDialog({
     setErrorMessage(null);
 
     try {
-      const response = await fetch(`/api/agent-runs/${runId}/restore`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          expectedRevision: preview.currentRevision,
-        }),
-      });
+      const response = await browserApiFetch(
+        `/api/agent-runs/${runId}/restore`,
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            expectedRevision: preview.currentRevision,
+          }),
+        },
+      );
       const body = (await response.json().catch(() => ({}))) as
         RestoreResponse | ApiErrorResponse;
 
@@ -628,8 +632,10 @@ async function fetchChangeSetReview(
   // 两个查询互不依赖：ChangeSet 负责展示历史正文，preview 负责读取
   // 当前 Repository 状态。并行请求可以避免弹窗先后闪烁两次。
   const [changeSetResponse, previewResponse] = await Promise.all([
-    fetch(`/api/agent-runs/${runId}/change-set`, { cache: "no-store" }),
-    fetch(`/api/agent-runs/${runId}/restore-preview`, {
+    browserApiFetch(`/api/agent-runs/${runId}/change-set`, {
+      cache: "no-store",
+    }),
+    browserApiFetch(`/api/agent-runs/${runId}/restore-preview`, {
       cache: "no-store",
     }),
   ]);

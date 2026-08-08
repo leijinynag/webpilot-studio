@@ -1,4 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
+import { postWithCsrf } from "./helpers/api";
 
 const AGENT_E2E_ENABLED = process.env.RUN_AGENT_E2E === "1";
 const TERMINAL_STATUSES = new Set([
@@ -153,7 +154,7 @@ async function createProject(
 ): Promise<Project> {
   // 先建立匿名 owner Cookie；项目 API 和工作台请求必须共享同一浏览器会话。
   await page.goto("/");
-  const response = await page.request.post("/api/projects", {
+  const response = await postWithCsrf(page, "/api/projects", {
     data: {
       name,
       storageKind: input.storageKind ?? "database",
@@ -213,7 +214,8 @@ async function writeProjectFile(
     expectedRevision: number;
   },
 ): Promise<number> {
-  const response = await page.request.post(
+  const response = await postWithCsrf(
+    page,
     `/api/projects/${input.projectId}/files`,
     {
       data: {
@@ -256,6 +258,179 @@ async function readAgentSnapshot(
   }
   return body.snapshot;
 }
+
+test("keeps the workbench inside the viewport at tablet width", async ({
+  page,
+}) => {
+  const project = await createProject(page, "Tablet Agent layout");
+  await page.setViewportSize({ width: 708, height: 800 });
+  await page.goto(`/p/${project.id}`);
+
+  const workbenchGrid = page.locator(".workbench-grid");
+  const agentPanel = page.locator(".agent-panel-v2");
+  const composer = page.locator(".agent-composer-v2");
+
+  await expect(workbenchGrid).toBeVisible();
+  await expect(agentPanel).toBeVisible();
+  await expect(composer).toBeVisible();
+  // 该布局回归与国际化文案无关，使用 Composer 内部的 textbox 角色。
+  await expect(composer.getByRole("textbox")).toBeVisible();
+
+  const layout = await page.evaluate(() => {
+    const grid = document.querySelector<HTMLElement>(".workbench-grid");
+    const panel = document.querySelector<HTMLElement>(".agent-panel-v2");
+    const transcript = document.querySelector<HTMLElement>(".agent-transcript");
+    const workbenchPage =
+      document.querySelector<HTMLElement>(".workbench-page");
+    const composerElement =
+      document.querySelector<HTMLElement>(".agent-composer-v2");
+
+    return {
+      bodyClientWidth: document.body.clientWidth,
+      bodyScrollWidth: document.body.scrollWidth,
+      gridDisplay: grid ? getComputedStyle(grid).display : null,
+      gridMinWidth: grid ? getComputedStyle(grid).minWidth : null,
+      workbenchClientWidth: workbenchPage?.clientWidth ?? 0,
+      workbenchScrollWidth: workbenchPage?.scrollWidth ?? 0,
+      workbenchOverflowX: workbenchPage
+        ? getComputedStyle(workbenchPage).overflowX
+        : null,
+      panelWidth: panel?.getBoundingClientRect().width ?? 0,
+      transcriptOverflowY: transcript
+        ? getComputedStyle(transcript).overflowY
+        : null,
+      composerBottom: composerElement?.getBoundingClientRect().bottom ?? 0,
+      composerFooterBottom:
+        document
+          .querySelector<HTMLElement>(".agent-composer-footer")
+          ?.getBoundingClientRect().bottom ?? 0,
+      composerDisplay: composerElement
+        ? getComputedStyle(composerElement).display
+        : null,
+      composerFooterDisplay: document.querySelector<HTMLElement>(
+        ".agent-composer-footer",
+      )
+        ? getComputedStyle(
+            document.querySelector<HTMLElement>(".agent-composer-footer")!,
+          ).display
+        : null,
+      viewportHeight: window.innerHeight,
+    };
+  });
+
+  expect(layout.gridDisplay).toBe("grid");
+  expect(layout.gridMinWidth).toBe("0px");
+  expect(layout.bodyScrollWidth).toBeLessThanOrEqual(layout.bodyClientWidth);
+  expect(layout.workbenchScrollWidth).toBeGreaterThanOrEqual(
+    layout.workbenchClientWidth,
+  );
+  expect(layout.workbenchOverflowX).toBe("auto");
+  expect(layout.panelWidth).toBeGreaterThan(0);
+  expect(layout.transcriptOverflowY).toBe("auto");
+  expect(layout.composerBottom).toBeLessThanOrEqual(layout.viewportHeight + 1);
+  // 工具栏应贴近 Composer 内边界，不能因 Grid auto track 被拉到中间。
+  expect(
+    layout.composerBottom - layout.composerFooterBottom,
+  ).toBeLessThanOrEqual(16);
+  expect(layout.composerDisplay).toBe("flex");
+  expect(layout.composerFooterDisplay).toBe("flex");
+});
+
+test("keeps Agent fixed and lets the Explorer scroll independently", async ({
+  page,
+}) => {
+  // 该用例会顺序写入多份文件以制造真实滚动高度。远程 PostgreSQL 在开发环境
+  // 偶发冷连接时可能超过默认 30 秒，但布局断言本身不应因此被提前中止。
+  test.setTimeout(90_000);
+  const project = await createProject(page, "Stable workspace columns");
+  let revision = project.revision;
+
+  // 写入足够多的源码文件，验证 Explorer 是真实的独立滚动区域，
+  // 而不是仅仅声明了 overflow-y: auto。
+  for (let index = 0; index < 14; index += 1) {
+    revision = await writeProjectFile(page, {
+      projectId: project.id,
+      path: `src/generated/file-${String(index + 1).padStart(2, "0")}.ts`,
+      content: `export const generated${index + 1} = ${index + 1};`,
+      expectedRevision: revision,
+    });
+  }
+
+  await page.setViewportSize({ width: 708, height: 800 });
+  await page.goto(`/p/${project.id}`);
+
+  const agentPanel = page.locator(".agent-panel-v2");
+  const fileTree = page.locator(".file-tree");
+  const workbenchPage = page.locator(".workbench-page");
+
+  await expect(agentPanel).toBeVisible();
+  await expect(fileTree).toBeVisible();
+
+  const beforeScroll = await page.evaluate(() => {
+    const agent = document.querySelector<HTMLElement>(".agent-panel-v2");
+    const tree = document.querySelector<HTMLElement>(".file-tree");
+    const pageElement = document.querySelector<HTMLElement>(".workbench-page");
+
+    return {
+      agentLeft: agent?.getBoundingClientRect().left ?? 0,
+      agentWidth: agent?.getBoundingClientRect().width ?? 0,
+      treeClientHeight: tree?.clientHeight ?? 0,
+      treeScrollHeight: tree?.scrollHeight ?? 0,
+      pageScrollWidth: pageElement?.scrollWidth ?? 0,
+      pageClientWidth: pageElement?.clientWidth ?? 0,
+    };
+  });
+
+  expect(beforeScroll.agentWidth).toBeGreaterThan(0);
+  expect(beforeScroll.treeScrollHeight).toBeGreaterThan(
+    beforeScroll.treeClientHeight,
+  );
+  expect(beforeScroll.pageScrollWidth).toBeGreaterThan(
+    beforeScroll.pageClientWidth,
+  );
+
+  await fileTree.evaluate((element) => {
+    element.scrollTop = element.scrollHeight;
+  });
+  await workbenchPage.evaluate((element) => {
+    element.scrollLeft = element.scrollWidth;
+  });
+
+  const afterScroll = await page.evaluate(() => {
+    const agent = document.querySelector<HTMLElement>(".agent-panel-v2");
+    const tree = document.querySelector<HTMLElement>(".file-tree");
+
+    return {
+      agentLeft: agent?.getBoundingClientRect().left ?? 0,
+      treeScrollTop: tree?.scrollTop ?? 0,
+      treeMaxScrollTop: tree
+        ? tree.scrollHeight - tree.clientHeight
+        : Number.POSITIVE_INFINITY,
+      composerBottom:
+        document
+          .querySelector<HTMLElement>(".agent-composer-v2")
+          ?.getBoundingClientRect().bottom ?? 0,
+      statusbarBottom:
+        document
+          .querySelector<HTMLElement>(".workspace-statusbar")
+          ?.getBoundingClientRect().bottom ?? 0,
+      viewportHeight: window.innerHeight,
+    };
+  });
+
+  expect(afterScroll.agentLeft).toBeGreaterThanOrEqual(-1);
+  expect(afterScroll.treeScrollTop).toBeGreaterThan(0);
+  expect(afterScroll.treeScrollTop).toBeCloseTo(
+    afterScroll.treeMaxScrollTop,
+    0,
+  );
+  expect(afterScroll.composerBottom).toBeLessThanOrEqual(
+    afterScroll.viewportHeight + 1,
+  );
+  expect(afterScroll.statusbarBottom).toBeLessThanOrEqual(
+    afterScroll.viewportHeight + 1,
+  );
+});
 
 async function waitForRunStatus(
   page: Page,
@@ -650,9 +825,10 @@ test.describe("Agent workspace live flow", () => {
     const createdRun = await startAgentRunFromWorkspace(page, prompt);
     const run = await waitForTerminalRun(page, createdRun.id, 720_000);
 
-    expect(run.status, run.errorMessage ?? "Browser Git Agent 未成功完成。").toBe(
-      "succeeded",
-    );
+    expect(
+      run.status,
+      run.errorMessage ?? "Browser Git Agent 未成功完成。",
+    ).toBe("succeeded");
     expect(run.currentRevision).toBeGreaterThan(project.revision);
 
     // Browser Git 的源码事实只存在浏览器仓库，工作台文件树是这里的可见证明。
@@ -661,16 +837,17 @@ test.describe("Agent workspace live flow", () => {
     ).toBeVisible({ timeout: 15_000 });
 
     await page.getByRole("link", { name: /Source Control/ }).click();
-    await expect(page.getByText("Working tree clean", { exact: true })).toHaveCount(
-      0,
-      { timeout: 15_000 },
-    );
+    await expect(
+      page.getByText("Working tree clean", { exact: true }),
+    ).toHaveCount(0, { timeout: 15_000 });
     await expect(
       page.getByRole("button", { name: "暂存 src/index.tsx" }),
     ).toBeVisible({ timeout: 15_000 });
 
     // 用户没有明确授权 Git 操作时，Agent 可以修改源码，但不得隐式创建 commit。
-    await expect(page.getByText("还没有 commit。", { exact: true })).toBeVisible();
+    await expect(
+      page.getByText("还没有 commit。", { exact: true }),
+    ).toBeVisible();
   });
 
   test("stops a run before it can mutate the repository", async ({ page }) => {
@@ -678,7 +855,7 @@ test.describe("Agent workspace live flow", () => {
     const project = await createProject(page, "M2 live agent stop");
     await page.goto(`/p/${project.id}`);
 
-    const createRunResponse = await page.request.post("/api/agent-runs", {
+    const createRunResponse = await postWithCsrf(page, "/api/agent-runs", {
       data: {
         projectId: project.id,
         message:
@@ -690,7 +867,8 @@ test.describe("Agent workspace live flow", () => {
     const createRunBody = (await createRunResponse.json()) as { run: Run };
 
     // API 立即发送取消请求，验证服务端 fence；这比依赖模型响应速度的 UI 点击更稳定。
-    const cancelResponse = await page.request.post(
+    const cancelResponse = await postWithCsrf(
+      page,
       `/api/agent-runs/${createRunBody.run.id}/cancel`,
     );
     expect(cancelResponse.ok()).toBe(true);
@@ -915,7 +1093,7 @@ createRoot(document.getElementById("root")!).render(<App />);
         hasSpecificInstallIssue: true,
       });
 
-    await page.request.post(`/api/agent-runs/${runBody.run.id}/cancel`);
+    await postWithCsrf(page, `/api/agent-runs/${runBody.run.id}/cancel`);
     const cancelled = await waitForTerminalRun(page, runBody.run.id);
     expect(cancelled.status).toBe("cancelled");
   });
@@ -940,7 +1118,8 @@ createRoot(document.getElementById("root")!).render(<App />);
     const runBody = (await runResponse.json()) as { run: Run };
     await waitForRunStatus(page, runBody.run.id, "awaiting_client_tool");
 
-    const cancelResponse = await page.request.post(
+    const cancelResponse = await postWithCsrf(
+      page,
       `/api/agent-runs/${runBody.run.id}/cancel`,
     );
     expect(cancelResponse.ok()).toBe(true);
@@ -1312,7 +1491,7 @@ createRoot(document.getElementById("root")!).render(<App />);
 
     // 此案例的通过条件就是明确失败。Run 可能已恢复给模型，因此主动取消，
     // 避免它在下一轮违背夹具约束并尝试“修复”本来就故意重复的按钮。
-    await page.request.post(`/api/agent-runs/${createdRun.id}/cancel`);
+    await postWithCsrf(page, `/api/agent-runs/${createdRun.id}/cancel`);
     const cancelled = await waitForTerminalRun(page, createdRun.id);
     expect(cancelled.status).toBe("cancelled");
     expect(cancelled.currentRevision).toBe(revision);
@@ -1433,7 +1612,7 @@ createRoot(document.getElementById("root")!).render(<App />);
       },
     });
 
-    await page.request.post(`/api/agent-runs/${createdRun.id}/cancel`);
+    await postWithCsrf(page, `/api/agent-runs/${createdRun.id}/cancel`);
     const cancelled = await waitForTerminalRun(page, createdRun.id);
     expect(cancelled.status).toBe("cancelled");
   });

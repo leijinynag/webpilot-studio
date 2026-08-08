@@ -4,6 +4,7 @@ import { NextResponse } from "next/server";
 import { z } from "zod";
 
 import { isAgentError } from "@/domains/agent/errors";
+import { isQuotaError } from "@/infrastructure/quota/errors";
 import { AgentStore } from "@/domains/agent/store";
 import { isProjectError } from "@/domains/project/errors";
 import { ProjectHistoryService } from "@/domains/project/history";
@@ -46,7 +47,7 @@ export function agentApiErrorResponse(
   error: unknown,
   correlationId: string,
 ): NextResponse<ApiErrorBody> {
-  if (isAgentError(error) || isProjectError(error)) {
+  if (isAgentError(error) || isProjectError(error) || isQuotaError(error)) {
     return agentJsonResponse(
       {
         error: {

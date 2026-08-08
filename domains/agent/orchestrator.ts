@@ -4,6 +4,7 @@ import {
   AGENT_ERROR_CODES,
   AgentError,
   isAgentError,
+  isAgentBudgetErrorCode,
   serializeAgentError,
 } from "@/domains/agent/errors";
 import {
@@ -18,7 +19,10 @@ import type {
   FileToolExecutor,
   FileToolResultEnvelope,
 } from "@/domains/agent/file-tools";
-import type { VisionToolExecutor, VisionToolResultEnvelope } from "@/domains/agent/vision-tools";
+import type {
+  VisionToolExecutor,
+  VisionToolResultEnvelope,
+} from "@/domains/agent/vision-tools";
 import type {
   AssetToolExecutor,
   AssetToolResultEnvelope,
@@ -39,12 +43,17 @@ import {
   type GitToolName,
 } from "@/domains/agent/tool-contracts";
 import { INSPECT_ATTACHMENT_TOOL_NAME } from "@/domains/image/vision-tool";
-import {
-  GENERATE_IMAGE_TOOL_NAME,
-} from "@/domains/image/generation-tool";
+import { GENERATE_IMAGE_TOOL_NAME } from "@/domains/image/generation-tool";
 import { LIST_PROJECT_ASSETS_TOOL_NAME } from "@/domains/image/asset-tool-definition";
 import type { ImageToolExecutor } from "@/domains/agent/image-tools";
 import { isImageError } from "@/domains/image/errors";
+import type { AttachmentContextResolver } from "@/infrastructure/agent/attachment-context";
+import type {
+  recordModelUsage,
+  reserveModelUsageBudget,
+  settleModelUsageBudget,
+  UsageBudgetReservation,
+} from "@/infrastructure/quota/service";
 import type {
   AgentRunRecord,
   AgentRunStatus,
@@ -98,6 +107,34 @@ type AccumulatedToolCall = {
   argumentsText: string;
 };
 
+function estimateProviderInputTokens(
+  messages: readonly {
+    content?: unknown;
+    name?: string;
+    toolCallId?: string;
+    toolCalls?: readonly unknown[];
+  }[],
+): number {
+  // Provider 可能把图片、工具参数和系统提示分别计入 token。这里不追求
+  // 账单级精确，而是用字符数加结构字段做调用前保守上限，最终仍以 Provider
+  // 返回的 usage 结算。
+  const serializedCharacters = messages.reduce((total, message) => {
+    const contentCharacters =
+      typeof message.content === "string"
+        ? message.content.length
+        : JSON.stringify(message.content ?? "").length;
+    return (
+      total +
+      contentCharacters +
+      (message.name?.length ?? 0) +
+      (message.toolCallId?.length ?? 0) +
+      JSON.stringify(message.toolCalls ?? "").length
+    );
+  }, 0);
+
+  return Math.max(1, Math.ceil(serializedCharacters / 4));
+}
+
 const EXECUTION_LEASE_RENEW_INTERVAL_MS = 45_000;
 const MAX_PARTIAL_PROVIDER_STREAM_RETRIES = 2;
 
@@ -109,6 +146,10 @@ export class AgentOrchestrator {
     private readonly visionTools?: VisionToolExecutorPort,
     private readonly imageTools?: ImageToolExecutorPort,
     private readonly assetTools?: Pick<AssetToolExecutor, "execute">,
+    private readonly attachmentContextResolver?: AttachmentContextResolver,
+    private readonly onModelUsage?: typeof recordModelUsage,
+    private readonly reserveModelBudget?: typeof reserveModelUsageBudget,
+    private readonly settleModelBudget?: typeof settleModelUsageBudget,
   ) {}
 
   async run(input: {
@@ -190,6 +231,7 @@ export class AgentOrchestrator {
       }
 
       let partialProviderStreamRetries = 0;
+      let attachmentContexts = new Map<string, string>();
 
       modelLoop: while (run.usage.modelTurns < run.budget.maxModelTurns) {
         assertWithinWallTime(run);
@@ -213,6 +255,24 @@ export class AgentOrchestrator {
           ownerId: run.ownerId,
           conversationId: run.conversationId,
         });
+        if (
+          run.usage.modelTurns === 0 &&
+          this.hasRunAttachments(run, transcript)
+        ) {
+          if (!this.attachmentContextResolver) {
+            throw new AgentError(
+              AGENT_ERROR_CODES.providerNotConfigured,
+              "当前 Agent 已收到图片，但服务端没有配置 Vision Provider。",
+              503,
+              { feature: "vision" },
+            );
+          }
+          attachmentContexts = await this.attachmentContextResolver.resolve({
+            run,
+            transcript,
+            signal: input.signal,
+          });
+        }
         const latestVerificationRun = await this.store.getLatestVerificationRun(
           {
             ownerId: run.ownerId,
@@ -231,6 +291,7 @@ export class AgentOrchestrator {
             }),
           ].join("\n\n"),
           tools: profiles.toolset.tools,
+          attachmentContexts,
           leaseId,
           signal: input.signal,
         });
@@ -245,6 +306,19 @@ export class AgentOrchestrator {
           runId: run.id,
           usage: nextUsage,
         });
+        // 全局预算开启时，usage ledger 已经在 streamModelTurn 内完成预留和
+        // 结算，不能再写一条兼容账本。未开启预算时才使用旧入口保留用量记录。
+        if (!turn.budgetReservation) {
+          await this.onModelUsage?.({
+            ownerId: run.ownerId,
+            agentRunId: run.id,
+            provider: run.provider,
+            model: run.model,
+            turn: nextUsage.modelTurns,
+            inputTokens: turn.inputTokens,
+            outputTokens: turn.outputTokens,
+          });
+        }
 
         if (turn.interruption) {
           if (
@@ -310,7 +384,7 @@ export class AgentOrchestrator {
           await this.finishRun(
             run,
             "budget_exhausted",
-            AGENT_ERROR_CODES.budgetExhausted,
+            AGENT_ERROR_CODES.outputExhausted,
             "模型输出达到长度限制。",
           );
           return;
@@ -536,7 +610,7 @@ export class AgentOrchestrator {
             if (isFileMutationTool(toolCall.name)) {
               if (run.usage.fileMutations >= run.budget.maxFileMutations) {
                 throw new AgentError(
-                  AGENT_ERROR_CODES.budgetExhausted,
+                  AGENT_ERROR_CODES.fileMutationsExhausted,
                   "Agent 已达到文件 mutation 次数上限。",
                   409,
                 );
@@ -571,7 +645,7 @@ export class AgentOrchestrator {
           if (isFileMutationTool(toolCall.name)) {
             if (run.usage.fileMutations >= run.budget.maxFileMutations) {
               throw new AgentError(
-                AGENT_ERROR_CODES.budgetExhausted,
+                AGENT_ERROR_CODES.fileMutationsExhausted,
                 "Agent 已达到文件 mutation 次数上限。",
                 409,
               );
@@ -687,7 +761,7 @@ export class AgentOrchestrator {
       await this.finishRun(
         run,
         "budget_exhausted",
-        AGENT_ERROR_CODES.budgetExhausted,
+        AGENT_ERROR_CODES.modelTurnsExhausted,
         "Agent 已达到最大模型轮次。",
       );
     } catch (error) {
@@ -710,17 +784,21 @@ export class AgentOrchestrator {
       description: string;
       parameters: Record<string, unknown>;
     }[];
+    attachmentContexts: ReadonlyMap<string, string>;
     leaseId: string;
     signal?: AbortSignal;
   }) {
     let assistantText = "";
     let inputTokens = 0;
     let outputTokens = 0;
+    let usageObserved = false;
+    let providerRequestStarted = false;
     let finishReason: ProviderFinishReason | null = null;
     const toolCalls = new Map<number, AccumulatedToolCall>();
     let heartbeatError: unknown = null;
     let heartbeatInFlight: Promise<void> | null = null;
     let interruption: AgentError | null = null;
+    let budgetReservation: UsageBudgetReservation | null = null;
     const renewLease = () => {
       if (heartbeatError || heartbeatInFlight) {
         return;
@@ -746,17 +824,37 @@ export class AgentOrchestrator {
 
     try {
       try {
+        const messages = assembleProviderMessages(input.transcript, {
+          systemPrompt: input.systemPrompt,
+          maxMessageCharacters: input.run.budget.maxToolResultCharacters,
+          // 单条工具结果最多 20,000 字符，但多轮读写会快速累积。
+          // 这里保留最近上下文，避免“继续”请求超过模型上下文窗口。
+          maxContextCharacters: 96_000,
+          attachmentContexts: input.attachmentContexts,
+        });
+        const maxOutputTokens = Math.max(
+          256,
+          Math.ceil(input.run.budget.maxOutputCharacters / 4),
+        );
+        budgetReservation =
+          (await this.reserveModelBudget?.({
+            ownerId: input.run.ownerId,
+            agentRunId: input.run.id,
+            provider: input.run.provider,
+            model: input.run.model,
+            turn: input.run.usage.modelTurns + 1,
+            estimatedInputTokens: estimateProviderInputTokens(messages),
+            maxOutputTokens,
+          })) ?? null;
+
+        // Provider 的 streamTurn 本身就是请求入口。即使上游在首个事件前
+        // 返回错误，请求也可能已经发出，因此这里采用保守的“已开始”语义。
+        providerRequestStarted = true;
         for await (const event of this.provider.streamTurn({
           model: input.run.model,
-          messages: assembleProviderMessages(input.transcript, {
-            systemPrompt: input.systemPrompt,
-            maxMessageCharacters: input.run.budget.maxToolResultCharacters,
-          }),
+          messages,
           tools: input.tools,
-          maxOutputTokens: Math.max(
-            256,
-            Math.ceil(input.run.budget.maxOutputCharacters / 4),
-          ),
+          maxOutputTokens,
           userId: input.run.ownerId,
           signal: input.signal,
         })) {
@@ -769,7 +867,7 @@ export class AgentOrchestrator {
               assistantText += event.text;
               if (assistantText.length > input.run.budget.maxOutputCharacters) {
                 throw new AgentError(
-                  AGENT_ERROR_CODES.budgetExhausted,
+                  AGENT_ERROR_CODES.outputExhausted,
                   "模型输出超过字符预算。",
                   409,
                 );
@@ -786,6 +884,7 @@ export class AgentOrchestrator {
             case "usage":
               inputTokens = event.inputTokens;
               outputTokens = event.outputTokens;
+              usageObserved = true;
               await this.store.appendEvent({
                 runId: input.run.id,
                 type: "model.usage",
@@ -818,6 +917,16 @@ export class AgentOrchestrator {
     } finally {
       clearInterval(heartbeat);
       await heartbeatInFlight;
+      if (this.settleModelBudget && budgetReservation) {
+        await this.settleModelBudget({
+          reservation: budgetReservation,
+          provider: input.run.provider,
+          inputTokens,
+          outputTokens,
+          providerRequestStarted,
+          usageObserved,
+        });
+      }
     }
 
     if (heartbeatError) {
@@ -831,9 +940,24 @@ export class AgentOrchestrator {
       toolCalls: [...toolCalls.values()],
       inputTokens,
       outputTokens,
+      usageObserved,
+      providerRequestStarted,
+      budgetReservation,
       finishReason,
       interruption,
     };
+  }
+
+  private hasRunAttachments(
+    run: AgentRunRecord,
+    transcript: readonly TranscriptMessage[],
+  ): boolean {
+    return transcript.some(
+      (message) =>
+        message.kind === "user_message" &&
+        message.runId === run.id &&
+        Boolean(message.attachmentIds?.length),
+    );
   }
 
   private async persistToolResult(
@@ -977,7 +1101,7 @@ export class AgentOrchestrator {
 
     if (input.run.usage.clientResumes >= input.run.budget.maxClientResumes) {
       throw new AgentError(
-        AGENT_ERROR_CODES.budgetExhausted,
+        AGENT_ERROR_CODES.clientResumesExhausted,
         "Agent 已达到浏览器验证恢复次数上限。",
         409,
       );
@@ -1045,7 +1169,7 @@ export class AgentOrchestrator {
 
     if (input.run.usage.clientResumes >= input.run.budget.maxClientResumes) {
       throw new AgentError(
-        AGENT_ERROR_CODES.budgetExhausted,
+        AGENT_ERROR_CODES.clientResumesExhausted,
         "Agent 已达到浏览器验证恢复次数上限。",
         409,
       );
@@ -1118,10 +1242,10 @@ export class AgentOrchestrator {
             : null;
       const readBeforeMutation = pathToRead
         ? await this.store.findSuccessfulRead({
-          runId: input.run.id,
-          path: pathToRead!,
-          revision: input.run.currentRevision,
-        })
+            runId: input.run.id,
+            path: pathToRead!,
+            revision: input.run.currentRevision,
+          })
         : false;
 
       if (
@@ -1165,7 +1289,7 @@ export class AgentOrchestrator {
 
     if (input.run.usage.clientResumes >= input.run.budget.maxClientResumes) {
       throw new AgentError(
-        AGENT_ERROR_CODES.budgetExhausted,
+        AGENT_ERROR_CODES.clientResumesExhausted,
         "Agent 已达到浏览器工具恢复次数上限。",
         409,
       );
@@ -1374,7 +1498,7 @@ export class AgentOrchestrator {
         return;
       }
 
-      if (error.code === AGENT_ERROR_CODES.budgetExhausted) {
+      if (isAgentBudgetErrorCode(error.code)) {
         await this.finishRun(
           run,
           "budget_exhausted",
@@ -1549,7 +1673,7 @@ function assertWithinWallTime(run: AgentRunRecord): void {
     run.budget.maxWallTimeSeconds * 1000
   ) {
     throw new AgentError(
-      AGENT_ERROR_CODES.budgetExhausted,
+      AGENT_ERROR_CODES.wallTimeExhausted,
       "Agent 已达到最大运行时间。",
       409,
     );

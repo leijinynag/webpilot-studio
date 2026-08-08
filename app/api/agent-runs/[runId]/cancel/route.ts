@@ -4,6 +4,7 @@ import { AGENT_ERROR_CODES, isAgentError } from "@/domains/agent/errors";
 import { requireRequestOwner } from "@/domains/auth/request-owner";
 import { isTerminalAgentRunStatus } from "@/domains/agent/state-machine";
 import { abortAgentRun } from "@/infrastructure/agent/run-controller";
+import { releaseAgentRunQuotaReservations } from "@/infrastructure/quota/service";
 import {
   agentApiErrorResponse,
   agentJsonResponse,
@@ -48,6 +49,20 @@ export async function POST(
         // 返回数据库中的最终状态即可，取消接口保持幂等。
         run = await store.getRun({ ownerId, runId });
       }
+    }
+
+    // 取消接口本身就是一个终态写入口。不能只依赖原执行器的 finally，
+    // 否则用户停止后，短时间内仍会被并发 lease 阻塞。
+    try {
+      await releaseAgentRunQuotaReservations({ ownerId, runId });
+    } catch (error) {
+      // Run 已经进入取消终态后，额度清理异常不能把用户响应反转成 500。
+      // 活跃租约仍会按 expiresAt 自动失效，同时受控日志可用于后续补偿。
+      console.error("[agent-cancel] quota release failed", {
+        runId,
+        correlationId,
+        error,
+      });
     }
 
     return agentJsonResponse({ run, abortedCurrentStream }, correlationId);

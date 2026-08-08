@@ -1087,7 +1087,27 @@ export class WebContainerRuntimeManager {
   }
 }
 
-export const webContainerRuntimeManager = new WebContainerRuntimeManager();
+type WebContainerRuntimeGlobal = typeof globalThis & {
+  __webpilotWebContainerRuntimeManager?: WebContainerRuntimeManager;
+};
+
+const runtimeGlobal = globalThis as WebContainerRuntimeGlobal;
+
+/**
+ * Next.js 开发环境的 Fast Refresh 可能重新执行客户端模块。如果每次都创建新
+ * Manager，旧 WebContainer 仍在运行，但 React 会看到一份 idle 快照并再次安装。
+ *
+ * 浏览器全局只保存当前标签页的 Manager，不跨刷新、更不写入持久化存储。生产
+ * 路由切换与开发热更新因此都能尽量复用同一份进程、URL 和运行镜像。
+ */
+export const webContainerRuntimeManager =
+  runtimeGlobal.__webpilotWebContainerRuntimeManager ??
+  new WebContainerRuntimeManager();
+
+if (typeof window !== "undefined") {
+  runtimeGlobal.__webpilotWebContainerRuntimeManager =
+    webContainerRuntimeManager;
+}
 
 // 只导出项目自己的最小接口，避免上层组件依赖 WebContainer SDK 的具体实现。
 export type WebContainerInstance = WebContainerAdapter;

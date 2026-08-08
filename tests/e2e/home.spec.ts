@@ -1,9 +1,10 @@
 import { expect, test, type Page } from "@playwright/test";
+import { postWithCsrf } from "./helpers/api";
 
 async function createProject(page: Page, name: string): Promise<string> {
   // 先访问页面让 proxy 建立匿名会话；API 与后续页面会共享同一个浏览器 Cookie。
   await page.goto("/");
-  const response = await page.request.post("/api/projects", {
+  const response = await postWithCsrf(page, "/api/projects", {
     data: {
       name,
       storageKind: "database",
@@ -37,7 +38,11 @@ test("creates a project, restores it after refresh, and opens the workbench", as
   // 工作台不再依赖 M0 阶段的临时 Agent 文案，改为校验真实 M1 编辑器骨架。
   await expect(page.getByText("E2E persisted project")).toBeVisible();
   await expect(page.getByLabel("Explorer")).toBeVisible();
-  await expect(page.getByLabel("Repository revision 1")).toBeVisible();
+  // 首页创建流程默认选择 Blank，空 Repository 从 revision 0 开始。
+  await expect(page.getByLabel("Repository revision 0")).toBeVisible();
+  await expect(
+    page.getByText(/暂无文件|No files yet\./, { exact: true }),
+  ).toBeVisible();
   await expect(
     page.getByRole("radio", { name: "Preview", exact: true }),
   ).toBeVisible();
@@ -65,7 +70,11 @@ test("soft deletes and restores a project from the workspace", async ({
     page.getByRole("link", { name: "打开 Recoverable project" }),
   ).toHaveCount(0);
 
-  await page.getByRole("button", { name: "恢复 Recoverable project" }).click();
+  await page
+    .getByRole("button", {
+      name: /^(恢复|Restore) Recoverable project$/,
+    })
+    .click();
   await expect(
     page.getByRole("link", { name: "打开 Recoverable project" }),
   ).toBeVisible();
@@ -100,6 +109,13 @@ test("serves the app with WebContainer isolation headers", async ({ page }) => {
   await expect
     .poll(() => page.evaluate(() => window.crossOriginIsolated))
     .toBe(true);
+  // 预览改为显式启动：进入工作台只展示 idle，不会在用户尚未写完代码时
+  // 自动安装依赖。点击运行后再验证 WebContainer 状态机确实开始推进。
+  await expect(page.getByTestId("webcontainer-runtime")).toHaveAttribute(
+    "data-phase",
+    "idle",
+  );
+  await page.getByRole("button", { name: /运行预览|Run preview/ }).click();
   await expect(page.getByTestId("webcontainer-runtime")).toHaveAttribute(
     "data-phase",
     /booting|mounting|installing|starting|failed/,
@@ -139,8 +155,10 @@ test("boots a real WebContainer preview when live smoke is enabled", async ({
 test("persists the dark theme preference", async ({ page }) => {
   await page.goto("/");
 
-  await page.getByRole("button", { name: "切换主题" }).click();
-  await page.getByRole("menuitemradio", { name: "暗色主题" }).click();
+  await page.getByRole("button", { name: /切换主题|Switch theme/ }).click();
+  await page
+    .getByRole("menuitemradio", { name: /暗色主题|Dark theme/ })
+    .click();
 
   await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
   await expect(page.locator("body")).toHaveCSS(

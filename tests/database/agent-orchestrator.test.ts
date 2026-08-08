@@ -18,10 +18,7 @@ import type {
   ProviderTurnInput,
 } from "@/domains/agent/provider";
 import { AgentStore } from "@/domains/agent/store";
-import type {
-  AgentRunBudget,
-  RepositoryIntent,
-} from "@/domains/agent/types";
+import type { AgentRunBudget, RepositoryIntent } from "@/domains/agent/types";
 import { DatabaseProjectRepository } from "@/domains/project/repository";
 import {
   agentRuns,
@@ -44,7 +41,8 @@ class ScriptedProvider implements LlmProvider {
         `测试 Provider 缺少第 ${this.inputs.length} 轮脚本，已收到 ${this.inputs.length - 1} 轮。最近消息：${JSON.stringify(
           input.messages.slice(-4).map((message) => ({
             role: message.role,
-            toolCallId: "toolCallId" in message ? message.toolCallId : undefined,
+            toolCallId:
+              "toolCallId" in message ? message.toolCallId : undefined,
             content:
               typeof message.content === "string"
                 ? message.content.slice(0, 80)
@@ -141,7 +139,7 @@ async function createFixture(
       ? createM3Profile(profile, project.id, project.revision)
       : options.profileVersion === "m4"
         ? createM4Profile(profile, project.id, project.revision)
-      : profile;
+        : profile;
   const store = new AgentStore(testDatabase.database);
   const run = await store.createRun({
     ownerId: "owner-1",
@@ -461,9 +459,7 @@ describe("AgentOrchestrator", () => {
         errorCode: AGENT_ERROR_CODES.toolInvalidArguments,
       });
       expect(
-        snapshot.events.some(
-          (event) => event.type === "client_tool.requested",
-        ),
+        snapshot.events.some((event) => event.type === "client_tool.requested"),
       ).toBe(false);
     } finally {
       await fixture.testDatabase.close();
@@ -1865,8 +1861,98 @@ describe("AgentOrchestrator", () => {
         }),
       ).resolves.toMatchObject({
         status: "budget_exhausted",
-        errorCode: AGENT_ERROR_CODES.budgetExhausted,
+        errorCode: AGENT_ERROR_CODES.modelTurnsExhausted,
       });
+    } finally {
+      await fixture.testDatabase.close();
+    }
+  });
+
+  it("预算耗尽后复用同一 Conversation 可以创建新 Run 并继续执行", async () => {
+    const fixture = await createFixture({ maxModelTurns: 1 });
+    const firstProvider = new ScriptedProvider([
+      [
+        {
+          type: "tool_call_delta",
+          index: 0,
+          toolCallId: "call-first-read",
+          toolName: "list_files",
+          argumentsDelta: "{}",
+        },
+        { type: "finish", reason: "tool_calls" },
+      ],
+    ]);
+
+    try {
+      await new AgentOrchestrator(
+        fixture.store,
+        firstProvider,
+        fixture.fileTools,
+      ).run({
+        ownerId: fixture.run.ownerId,
+        runId: fixture.run.id,
+      });
+
+      const exhaustedRun = await fixture.store.getRun({
+        ownerId: fixture.run.ownerId,
+        runId: fixture.run.id,
+      });
+      expect(exhaustedRun).toMatchObject({
+        status: "budget_exhausted",
+        usage: { modelTurns: 1 },
+      });
+
+      const continuationRun = await fixture.store.createRun({
+        ownerId: fixture.run.ownerId,
+        projectId: fixture.run.projectId,
+        conversationId: fixture.run.conversationId,
+        conversationTitle: "继续修改页面",
+        userMessage: "继续完成剩余工作",
+        profile: fixture.run,
+        startRevision: exhaustedRun.currentRevision,
+      });
+      const continuationProvider = new ScriptedProvider([
+        [
+          { type: "text_delta", text: "剩余工作已完成。" },
+          { type: "finish", reason: "stop" },
+        ],
+      ]);
+
+      await new AgentOrchestrator(
+        fixture.store,
+        continuationProvider,
+        fixture.fileTools,
+      ).run({
+        ownerId: continuationRun.ownerId,
+        runId: continuationRun.id,
+      });
+
+      const snapshot = await fixture.store.getConversationSnapshot({
+        ownerId: fixture.run.ownerId,
+        conversationId: fixture.run.conversationId,
+      });
+
+      expect(snapshot.runs).toHaveLength(2);
+      expect(snapshot.runs[0]).toMatchObject({
+        id: fixture.run.id,
+        status: "budget_exhausted",
+        usage: { modelTurns: 1 },
+      });
+      expect(snapshot.runs[1]).toMatchObject({
+        id: continuationRun.id,
+        status: "succeeded",
+        usage: { modelTurns: 1 },
+      });
+      expect(continuationProvider.inputs[0]?.messages.at(-1)).toMatchObject({
+        role: "user",
+        content: "继续完成剩余工作",
+      });
+      expect(
+        continuationProvider.inputs[0]?.messages.some(
+          (message) =>
+            message.role === "tool" && message.toolCallId === "call-first-read",
+        ),
+      ).toBe(true);
     } finally {
       await fixture.testDatabase.close();
     }
@@ -1938,7 +2024,7 @@ describe("AgentOrchestrator", () => {
       expect(run).toMatchObject({
         status: "budget_exhausted",
         currentRevision: 2,
-        errorCode: AGENT_ERROR_CODES.budgetExhausted,
+        errorCode: AGENT_ERROR_CODES.fileMutationsExhausted,
         usage: { fileMutations: 1 },
       });
       expect(file.content).toContain("第一次修改");

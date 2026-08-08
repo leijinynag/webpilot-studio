@@ -1,9 +1,5 @@
-import {
-  expect,
-  test,
-  type APIRequestContext,
-  type Browser,
-} from "@playwright/test";
+import { expect, test, type Browser, type Page } from "@playwright/test";
+import { postWithCsrf } from "./helpers/api";
 
 type ProjectResponse = {
   project: {
@@ -20,10 +16,10 @@ type FileResponse = {
 };
 
 async function createProject(
-  request: APIRequestContext,
+  page: Page,
   name: string,
 ): Promise<ProjectResponse["project"]> {
-  const response = await request.post("/api/projects", {
+  const response = await postWithCsrf(page, "/api/projects", {
     data: {
       name,
       storageKind: "database",
@@ -52,10 +48,11 @@ test("persists multiple file revisions and restores the latest snapshot", async 
 
   try {
     const project = await createProject(
-      owned.request,
+      owned.page,
       "M1 multi-file persistence",
     );
-    const firstWrite = await owned.request.post(
+    const firstWrite = await postWithCsrf(
+      owned.page,
       `/api/projects/${project.id}/files`,
       {
         data: {
@@ -70,7 +67,8 @@ test("persists multiple file revisions and restores the latest snapshot", async 
       result: { revision: number };
     };
 
-    const secondWrite = await owned.request.post(
+    const secondWrite = await postWithCsrf(
+      owned.page,
       `/api/projects/${project.id}/files`,
       {
         data: {
@@ -116,10 +114,13 @@ test("edits and saves multiple files from the Monaco workspace", async ({
   browser,
   baseURL,
 }) => {
+  // 数据库密集型 E2E 还包含 Monaco 动态 chunk 首次编译，测试总时限需要
+  // 覆盖页面加载、编辑器挂载和两次真实 Repository 写入。
+  test.setTimeout(90_000);
   const owned = await createOwnedContext(browser, baseURL!);
 
   try {
-    const project = await createProject(owned.request, "M1 Monaco workflow");
+    const project = await createProject(owned.page, "M1 Monaco workflow");
     await owned.page.goto(`/p/${project.id}`);
     await owned.page.getByRole("radio", { name: "Code" }).click();
 
@@ -133,12 +134,12 @@ test("edits and saves multiple files from the Monaco workspace", async ({
       "export function App() { return <main>M1 saved from Monaco</main>; }\n",
     );
     await expect(
-      owned.page.getByRole("button", { name: "Save" }),
+      owned.page.getByRole("button", { name: "Save", exact: true }),
     ).toBeEnabled();
-    await owned.page.getByRole("button", { name: "Save" }).click();
+    await owned.page.getByRole("button", { name: "Save", exact: true }).click();
     await expect(
-      owned.page.getByText("Revision 2 已保存", { exact: true }),
-    ).toBeVisible();
+      owned.page.getByText(/Revision 2 (?:已保存|saved)/, { exact: true }),
+    ).toBeVisible({ timeout: 15_000 });
 
     await owned.page
       .getByRole("button", { name: "styles.css", exact: true })
@@ -152,8 +153,8 @@ test("edits and saves multiple files from the Monaco workspace", async ({
     // Monaco 因而把 CtrlCmd 注册为 Control；这里直接验证对应快捷键。
     await owned.page.keyboard.press("Control+S");
     await expect(
-      owned.page.getByText("Revision 3 已保存", { exact: true }),
-    ).toBeVisible();
+      owned.page.getByText(/Revision 3 (?:已保存|saved)/, { exact: true }),
+    ).toBeVisible({ timeout: 15_000 });
 
     const [indexFile, stylesFile] = await Promise.all([
       owned.request.get(`/api/projects/${project.id}/files/src/index.tsx`),
@@ -180,9 +181,10 @@ test("rejects a stale revision without overwriting the winning content", async (
   const owned = await createOwnedContext(browser, baseURL!);
 
   try {
-    const project = await createProject(owned.request, "M1 conflict proof");
+    const project = await createProject(owned.page, "M1 conflict proof");
     const winningContent = "export const winner = 'first writer';\n";
-    const winningWrite = await owned.request.post(
+    const winningWrite = await postWithCsrf(
+      owned.page,
       `/api/projects/${project.id}/files`,
       {
         data: {
@@ -194,7 +196,8 @@ test("rejects a stale revision without overwriting the winning content", async (
     );
     expect(winningWrite.ok()).toBe(true);
 
-    const staleWrite = await owned.request.post(
+    const staleWrite = await postWithCsrf(
+      owned.page,
       `/api/projects/${project.id}/files`,
       {
         data: {
@@ -237,7 +240,7 @@ test("keeps projects isolated between anonymous owners", async ({
   const ownerB = await createOwnedContext(browser, baseURL!);
 
   try {
-    const project = await createProject(ownerA.request, "Owner A private");
+    const project = await createProject(ownerA.page, "Owner A private");
     const foreignProject = await ownerB.request.get(
       `/api/projects/${project.id}`,
     );

@@ -19,7 +19,7 @@ export type ImageProviderRuntime = {
 export function getImageProviderRuntime(): ImageProviderRuntime {
   if (serverEnv.IMAGE_GENERATION_ENABLED !== "true") {
     throw new ImageError(
-      IMAGE_ERROR_CODES.generationNotConfigured,
+      IMAGE_ERROR_CODES.featureDisabled,
       "图片生成尚未启用，请配置 IMAGE_GENERATION_ENABLED=true。",
       503,
     );

@@ -1,5 +1,10 @@
 export const IMAGE_ERROR_CODES = {
   invalidRequest: "IMAGE_INVALID_REQUEST",
+  featureDisabled: "FEATURE_DISABLED",
+  globalBudgetExhausted: "GLOBAL_BUDGET_EXHAUSTED",
+  globalBudgetPriceUnavailable: "GLOBAL_BUDGET_PRICE_UNAVAILABLE",
+  dailyQuotaExhausted: "DAILY_QUOTA_EXHAUSTED",
+  tooManyConcurrentRuns: "TOO_MANY_CONCURRENT_RUNS",
   uploadDisabled: "IMAGE_UPLOAD_DISABLED",
   blobNotConfigured: "IMAGE_BLOB_NOT_CONFIGURED",
   blobUnavailable: "IMAGE_BLOB_UNAVAILABLE",

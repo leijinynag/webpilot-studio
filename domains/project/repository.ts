@@ -15,6 +15,7 @@ import {
   chatAttachments,
   imageJobs,
   imageRuns,
+  quotaLeases,
   projectFileBlobs,
   projectAssets,
   projectFiles,
@@ -345,6 +346,17 @@ export class DatabaseProjectRepository<
           ),
         );
 
+      const activeImageRuns = await tx
+        .select({ id: imageRuns.id })
+        .from(imageRuns)
+        .where(
+          and(
+            eq(imageRuns.projectId, project.id),
+            eq(imageRuns.ownerId, input.ownerId),
+            inArray(imageRuns.status, ["queued", "running"]),
+          ),
+        );
+
       const now = new Date();
       await tx
         .update(chatAttachments)
@@ -468,6 +480,52 @@ export class DatabaseProjectRepository<
             },
           })),
         );
+      }
+
+      // 项目删除不经过 Agent runtime，因此需要在同一数据库事务里释放
+      // 已绑定的 Agent/Image quota lease。更新条件同时包含 resource，
+      // 避免同一 UUID 在不同事实表之间发生误匹配。
+      const activeAgentRunIds = activeRuns.map((run) => run.id);
+      const activeImageRunIds = activeImageRuns.map((run) => run.id);
+      if (activeAgentRunIds.length > 0) {
+        await tx
+          .update(quotaLeases)
+          .set({
+            status: "released",
+            releasedAt: now,
+            updatedAt: now,
+          })
+          .where(
+            and(
+              eq(quotaLeases.status, "active"),
+              eq(quotaLeases.ownerId, input.ownerId),
+              eq(quotaLeases.resource, "agent_run"),
+              sql`${quotaLeases.metadata}->>'resourceId' in (${sql.join(
+                activeAgentRunIds.map((id) => sql`${id}`),
+                sql`, `,
+              )})`,
+            ),
+          );
+      }
+      if (activeImageRunIds.length > 0) {
+        await tx
+          .update(quotaLeases)
+          .set({
+            status: "released",
+            releasedAt: now,
+            updatedAt: now,
+          })
+          .where(
+            and(
+              eq(quotaLeases.status, "active"),
+              eq(quotaLeases.ownerId, input.ownerId),
+              eq(quotaLeases.resource, "image_generation"),
+              sql`${quotaLeases.metadata}->>'resourceId' in (${sql.join(
+                activeImageRunIds.map((id) => sql`${id}`),
+                sql`, `,
+              )})`,
+            ),
+          );
       }
 
       await tx

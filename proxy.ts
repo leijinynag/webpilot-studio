@@ -15,6 +15,15 @@ import {
   buildShowcaseRuntimeLandingHtml,
   getShowcaseRuntimeLandingHeaders,
 } from "@/infrastructure/showcase/runtime-policy";
+import {
+  createCsrfToken,
+  getCsrfCookieName,
+  getCsrfCookieOptions,
+  getCsrfHeaderName,
+  getRequestOrigin,
+  shouldProtectBrowserMutation,
+  validateBrowserMutation,
+} from "@/infrastructure/http/request-security";
 
 /**
  * 页面首次访问即签发匿名会话，使后续客户端 API 请求可以直接恢复工作区。
@@ -46,21 +55,95 @@ export function proxy(request: NextRequest) {
   }
 
   const cookieName = getAnonymousSessionCookieName();
+  const csrfCookieName = getCsrfCookieName();
   const existing = verifyAnonymousSession(
     request.cookies.get(cookieName)?.value,
   );
+  const existingCsrfToken = request.cookies.get(csrfCookieName)?.value;
+  const protectsMutation = shouldProtectBrowserMutation({
+    pathname: request.nextUrl.pathname,
+    method: request.method,
+  });
 
-  if (existing) {
+  if (protectsMutation) {
+    const validation = validateBrowserMutation({
+      requestOrigin: request.headers.get("origin"),
+      // Next 本地开发服务器可能把 127.0.0.1 规范化成 localhost；
+      // CSRF 校验应以实际 Host 为准，否则同一个页面的同源写请求会被误拒绝。
+      expectedOrigin: getRequestOrigin(request),
+      csrfCookie: existingCsrfToken,
+      csrfHeader: request.headers.get(getCsrfHeaderName()),
+    });
+
+    // 写请求必须建立在已经签发的匿名会话上。否则直接访问 API 会在
+    // Route Handler 中创建新 owner，从而绕过 double-submit token 的首轮校验。
+    if (!existing) {
+      const response = NextResponse.json(
+        {
+          error: {
+            code: "CSRF_REJECTED",
+            message: "匿名会话尚未建立，请刷新页面后重试。",
+          },
+        },
+        { status: 403 },
+      );
+
+      // CSRF Cookie 被用户单独清除时，在拒绝响应中补发新 token。
+      // 客户端刷新后即可恢复，不需要清除仍然有效的匿名项目 Cookie。
+      if (!existingCsrfToken) {
+        response.cookies.set(
+          csrfCookieName,
+          createCsrfToken(),
+          getCsrfCookieOptions(),
+        );
+      }
+      return response;
+    }
+
+    if (!validation.ok) {
+      const response = NextResponse.json(
+        {
+          error: {
+            code: validation.code,
+            message: validation.message,
+          },
+        },
+        { status: 403 },
+      );
+
+      // CSRF Cookie 被用户单独清除时，在拒绝响应中补发新 token。
+      // 客户端刷新后即可恢复，不需要清除仍然有效的匿名项目 Cookie。
+      if (!existingCsrfToken) {
+        response.cookies.set(
+          csrfCookieName,
+          createCsrfToken(),
+          getCsrfCookieOptions(),
+        );
+      }
+      return response;
+    }
+  }
+
+  if (existing && existingCsrfToken) {
     return NextResponse.next();
   }
 
   const response = NextResponse.next();
-  const created = createAnonymousSession();
-  response.cookies.set(
-    cookieName,
-    created.cookieValue,
-    getAnonymousSessionCookieOptions(),
-  );
+  if (!existing) {
+    const created = createAnonymousSession();
+    response.cookies.set(
+      cookieName,
+      created.cookieValue,
+      getAnonymousSessionCookieOptions(),
+    );
+  }
+  if (!existingCsrfToken) {
+    response.cookies.set(
+      csrfCookieName,
+      createCsrfToken(),
+      getCsrfCookieOptions(),
+    );
+  }
 
   return response;
 }

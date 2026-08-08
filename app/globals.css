@@ -244,17 +244,26 @@ a {
 }
 
 .app-shell {
+  height: 100dvh;
   min-height: 100vh;
+  overflow: hidden;
   background: var(--background);
 }
 
 .app-frame {
+  box-sizing: border-box;
   width: min(100%, 1680px);
+  height: 100%;
+  min-height: 0;
   margin: 0 auto;
   padding: 22px;
 }
 
 .app-browser {
+  display: flex;
+  height: 100%;
+  min-height: 0;
+  flex-direction: column;
   overflow: hidden;
   border: 1px solid var(--border);
   border-radius: var(--radius-shell);
@@ -410,7 +419,9 @@ a {
 }
 
 .app-main {
-  min-height: calc(100vh - 114px);
+  min-height: 0;
+  flex: 1 1 auto;
+  overflow: auto;
   background: var(--surface);
 }
 
@@ -717,7 +728,7 @@ html[data-theme="dark"] .site-visual::after {
   }
 
   .app-browser {
-    min-height: 100vh;
+    min-height: 0;
     border-right: 0;
     border-left: 0;
     border-radius: 0;
@@ -3649,12 +3660,22 @@ html[data-theme="dark"] .piece-art.travel {
 }
 
 .workbench-page {
+  display: flex;
+  position: relative;
+  height: 100%;
   min-height: 0;
+  flex-direction: column;
+  overflow-x: auto;
+  overflow-y: hidden;
+  isolation: isolate;
   background: var(--surface);
 }
 
 .app-main:has(.workbench-page) {
+  display: flex;
+  flex-direction: column;
   min-height: 0;
+  overflow: hidden;
 }
 
 .workbench-top {
@@ -3728,9 +3749,12 @@ html[data-theme="dark"] .piece-art.travel {
 .workbench-grid {
   display: grid;
   grid-template-columns: minmax(300px, 360px) minmax(0, 1fr);
-  height: clamp(520px, calc(100dvh - 189px), 760px);
+  align-items: stretch;
+  height: auto;
+  flex: 1 1 auto;
   min-height: 0;
   min-width: 0;
+  position: relative;
 }
 
 .workspace-repository-loading,
@@ -3950,12 +3974,17 @@ html[data-theme="dark"] .piece-art.travel {
   grid-template-columns: 224px minmax(0, 1fr);
   grid-template-rows: minmax(0, 1fr);
   height: 100%;
+  min-height: 0;
   min-width: 0;
+  overflow: hidden;
   background: var(--surface-2);
 }
 
 .ide-sidebar {
+  display: flex;
+  min-height: 0;
   min-width: 0;
+  flex-direction: column;
   overflow: hidden;
   border-right: 1px solid var(--border);
   background: var(--surface);
@@ -3992,8 +4021,12 @@ html[data-theme="dark"] .piece-art.travel {
 }
 
 .file-tree {
-  height: calc(100% - 44px);
+  /* Explorer 标题固定，文件列表独立滚动，避免文件数量把 IDE 和状态栏撑开。 */
+  flex: 1 1 auto;
+  height: auto;
+  min-height: 0;
   overflow: auto;
+  overscroll-behavior: contain;
   padding: 8px;
   scrollbar-width: thin;
 }
@@ -4205,13 +4238,29 @@ html[data-theme="dark"] .piece-art.travel {
 }
 
 .ide-surface {
+  display: grid;
   min-width: 0;
   min-height: 0;
   overflow: hidden;
   background: var(--surface);
 }
 
-.ide-surface.is-preview {
+.ide-surface-panel {
+  grid-area: 1 / 1;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.ide-surface-panel[hidden] {
+  display: none;
+}
+
+.ide-code-surface {
+  height: 100%;
+}
+
+.ide-preview-surface {
   display: grid;
   grid-template-rows: 42px minmax(0, 1fr) 148px;
   background: var(--surface-2);
@@ -4377,21 +4426,26 @@ html[data-theme="dark"] .editor-tab.is-active {
 }
 
 html[data-theme="dark"] .workspace.workspace-ide,
-html[data-theme="dark"] .ide-surface.is-preview {
+html[data-theme="dark"] .ide-preview-surface {
   background: #050607;
 }
 
 .agent-panel-v2 {
   display: grid;
-  grid-template-rows: auto auto minmax(0, 1fr) auto auto auto;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: auto minmax(0, 1fr) auto auto auto;
+  position: sticky;
+  z-index: 30;
+  top: 0;
+  left: 0;
+  align-self: stretch;
   min-width: 0;
   overflow: hidden;
   border-right: 1px solid var(--border);
   background: var(--surface);
+  box-shadow: 10px 0 24px color-mix(in srgb, var(--foreground) 6%, transparent);
 }
 
-.agent-panel-header,
-.agent-run-status-top,
 .agent-run-status-detail,
 .agent-composer-footer {
   display: flex;
@@ -4401,26 +4455,20 @@ html[data-theme="dark"] .ide-surface.is-preview {
 }
 
 .agent-panel-header {
-  min-height: 62px;
-  padding: 12px 14px;
+  display: flex;
+  min-height: 46px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 10px;
   border-bottom: 1px solid var(--border);
 }
 
-.agent-panel-header > div:first-child {
-  display: grid;
-  gap: 4px;
+.agent-panel-header .agent-conversation-switcher {
+  flex: 1 1 auto;
   min-width: 0;
 }
 
-.agent-panel-header strong {
-  overflow: hidden;
-  color: var(--foreground);
-  font-size: 0.92rem;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.agent-eyebrow,
 .agent-message-label {
   display: inline-flex;
   align-items: center;
@@ -4432,7 +4480,6 @@ html[data-theme="dark"] .ide-surface.is-preview {
   text-transform: uppercase;
 }
 
-.agent-eyebrow svg,
 .agent-message-label svg {
   color: var(--accent);
 }
@@ -4445,7 +4492,6 @@ html[data-theme="dark"] .ide-surface.is-preview {
 
 .agent-conversation-switcher {
   position: relative;
-  border-bottom: 1px solid var(--border);
 }
 
 .agent-conversation-trigger,
@@ -4462,9 +4508,16 @@ html[data-theme="dark"] .ide-surface.is-preview {
 }
 
 .agent-conversation-trigger {
-  min-height: 38px;
-  padding: 0 14px;
-  font-size: 0.76rem;
+  justify-content: flex-start;
+  min-width: 0;
+  max-width: 100%;
+  min-height: 34px;
+  gap: 7px;
+  padding: 0 8px;
+  border-radius: 6px;
+  color: var(--foreground);
+  font-size: 0.8rem;
+  font-weight: 700;
 }
 
 .agent-conversation-trigger:hover,
@@ -4472,6 +4525,22 @@ html[data-theme="dark"] .ide-surface.is-preview {
 .agent-conversation-option.is-active {
   color: var(--foreground);
   background: var(--surface-2);
+}
+
+.agent-conversation-trigger > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-conversation-trigger > svg:first-child {
+  color: var(--accent);
+}
+
+.agent-conversation-trigger > svg:last-child {
+  margin-left: auto;
+  color: var(--faint-foreground);
+  transition: transform var(--motion-fast) ease;
 }
 
 .agent-conversation-trigger svg,
@@ -4484,9 +4553,9 @@ html[data-theme="dark"] .ide-surface.is-preview {
 .agent-conversation-menu {
   position: absolute;
   z-index: 5;
-  top: calc(100% + 4px);
-  left: 10px;
-  right: 10px;
+  top: calc(100% + 7px);
+  left: 0;
+  width: min(300px, calc(100vw - 32px));
   display: grid;
   max-height: 220px;
   overflow: auto;
@@ -4495,6 +4564,13 @@ html[data-theme="dark"] .ide-surface.is-preview {
   border-radius: var(--radius-compact);
   background: var(--surface);
   box-shadow: 0 12px 30px color-mix(in srgb, var(--foreground) 14%, transparent);
+}
+
+.agent-conversation-menu-label {
+  padding: 7px 8px 5px;
+  color: var(--faint-foreground);
+  font-size: 0.65rem;
+  font-weight: 700;
 }
 
 .agent-conversation-option {
@@ -4521,7 +4597,9 @@ html[data-theme="dark"] .ide-surface.is-preview {
 .agent-transcript {
   min-height: 0;
   overflow: auto;
-  padding: 16px 14px 12px;
+  padding: 18px 14px 14px;
+  overscroll-behavior: contain;
+  scroll-behavior: auto;
   scrollbar-width: thin;
 }
 
@@ -4548,20 +4626,20 @@ html[data-theme="dark"] .ide-surface.is-preview {
 }
 
 .agent-message {
-  margin-bottom: 14px;
+  margin-bottom: 18px;
 }
 
-.agent-message p {
-  margin: 5px 0 0;
+.agent-message-user p {
+  margin: 4px 0 0;
   color: var(--foreground);
-  font-size: 0.82rem;
-  line-height: 1.55;
+  font-size: 0.84rem;
+  line-height: 1.6;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
 
-.agent-message.is-streaming p {
-  min-height: 1.55em;
+.agent-message.is-streaming .agent-markdown {
+  min-height: 1.6em;
 }
 
 .agent-message.is-streaming .agent-message-label {
@@ -4574,11 +4652,157 @@ html[data-theme="dark"] .ide-surface.is-preview {
 }
 
 .agent-message-user {
-  margin-left: 20px;
-  padding: 10px 11px;
+  max-width: calc(100% - 24px);
+  margin-left: auto;
+  padding: 10px 12px;
   border: 1px solid var(--border);
-  border-radius: var(--radius-compact);
+  border-radius: 8px 8px 3px 8px;
   background: var(--surface-2);
+}
+
+.agent-message-assistant {
+  padding-right: 4px;
+}
+
+.agent-markdown {
+  margin-top: 6px;
+  color: var(--foreground);
+  font-size: 0.84rem;
+  line-height: 1.65;
+  overflow-wrap: anywhere;
+}
+
+.agent-markdown > :first-child {
+  margin-top: 0;
+}
+
+.agent-markdown > :last-child {
+  margin-bottom: 0;
+}
+
+.agent-markdown p,
+.agent-markdown ul,
+.agent-markdown ol,
+.agent-markdown blockquote,
+.agent-markdown pre,
+.agent-markdown table,
+.agent-markdown h1,
+.agent-markdown h2,
+.agent-markdown h3,
+.agent-markdown h4 {
+  margin: 0.65em 0;
+}
+
+.agent-markdown h1,
+.agent-markdown h2,
+.agent-markdown h3,
+.agent-markdown h4 {
+  color: var(--foreground);
+  line-height: 1.3;
+}
+
+.agent-markdown h1 {
+  font-size: 1.08rem;
+}
+
+.agent-markdown h2 {
+  font-size: 1rem;
+}
+
+.agent-markdown h3,
+.agent-markdown h4 {
+  font-size: 0.9rem;
+}
+
+.agent-markdown ul,
+.agent-markdown ol {
+  padding-left: 1.3rem;
+}
+
+.agent-markdown li + li {
+  margin-top: 0.25em;
+}
+
+.agent-markdown blockquote {
+  padding-left: 10px;
+  border-left: 2px solid var(--border-strong);
+  color: var(--muted-foreground);
+}
+
+.agent-markdown a {
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.agent-markdown :not(pre) > code {
+  padding: 0.12em 0.34em;
+  border: 1px solid var(--border-soft);
+  border-radius: 4px;
+  background: var(--surface-2);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.8em;
+}
+
+.agent-markdown table {
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+  border-collapse: collapse;
+  font-size: 0.76rem;
+}
+
+.agent-markdown th,
+.agent-markdown td {
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  text-align: left;
+  white-space: nowrap;
+}
+
+.agent-markdown th {
+  background: var(--surface-2);
+  font-weight: 750;
+}
+
+.agent-code-block {
+  max-width: 100%;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--surface-3) 72%, var(--surface));
+}
+
+.agent-code-toolbar {
+  display: flex;
+  min-height: 30px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 0 5px 0 10px;
+  border-bottom: 1px solid var(--border-soft);
+  color: var(--faint-foreground);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.64rem;
+}
+
+.agent-code-toolbar [data-slot="button"] {
+  width: 26px;
+  height: 26px;
+}
+
+.agent-code-block pre {
+  max-width: 100%;
+  margin: 0;
+  overflow: auto;
+  padding: 10px 11px;
+}
+
+.agent-code-block pre code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.72rem;
+  line-height: 1.55;
+  white-space: pre;
 }
 
 .agent-attachment-tray {
@@ -4679,35 +4903,45 @@ html[data-theme="dark"] .ide-surface.is-preview {
 
 .agent-attachment-id-list,
 .agent-generated-thumbnails {
-  display: flex;
-  flex-wrap: wrap;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 5px;
   margin-top: 8px;
 }
 
 .agent-attachment-id,
 .agent-generated-thumbnails a {
-  display: grid;
+  position: relative;
+  display: block;
   overflow: hidden;
   border: 1px solid var(--border);
-  border-radius: 5px;
+  border-radius: 9px;
   background: var(--surface-2);
   color: var(--muted-foreground);
   text-decoration: none;
 }
 
 .agent-attachment-id {
-  grid-template-columns: 28px auto;
-  gap: 5px;
-  align-items: center;
-  padding-right: 7px;
-  font-size: 0.62rem;
+  aspect-ratio: 1.35;
 }
 
-.agent-attachment-id img {
-  width: 28px;
-  height: 28px;
+.agent-attachment-id img,
+.agent-generated-thumbnails img {
+  display: block;
+  width: 100%;
+  height: 100%;
   object-fit: cover;
+}
+
+.agent-attachment-id span {
+  position: absolute;
+  right: 5px;
+  bottom: 5px;
+  padding: 2px 5px;
+  border-radius: 999px;
+  color: #fff;
+  background: rgb(0 0 0 / 58%);
+  font-size: 0.62rem;
 }
 
 .agent-generated-thumbnails a {
@@ -4917,9 +5151,6 @@ html[data-theme="dark"] .ide-surface.is-preview {
 }
 
 .agent-run-status {
-  display: grid;
-  gap: 7px;
-  padding: 10px 14px;
   border-top: 1px solid var(--border);
   color: var(--muted-foreground);
   background: var(--surface-2);
@@ -4942,8 +5173,60 @@ html[data-theme="dark"] .ide-surface.is-preview {
   border-top-color: color-mix(in srgb, var(--destructive) 42%, var(--border));
 }
 
-.agent-run-status-top {
+.agent-run-status > summary {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  min-height: 42px;
+  cursor: pointer;
+  list-style: none;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px 7px 14px;
+}
+
+.agent-run-status > summary::-webkit-details-marker {
+  display: none;
+}
+
+.agent-run-status > summary:hover {
+  background: color-mix(in srgb, var(--foreground) 3%, transparent);
+}
+
+.agent-run-status-summary-detail {
+  overflow: hidden;
   color: var(--faint-foreground);
+  font-size: 0.67rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-run-status-summary-end {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--faint-foreground);
+  font-size: 0.66rem;
+  white-space: nowrap;
+}
+
+.agent-run-status-summary-end svg {
+  width: 13px;
+  height: 13px;
+  transition: transform var(--motion-fast) ease;
+}
+
+.agent-run-status[open] .agent-run-status-summary-end svg {
+  transform: rotate(180deg);
+}
+
+.agent-run-status-content {
+  display: grid;
+  max-height: min(40dvh, 320px);
+  gap: 7px;
+  overflow-y: auto;
+  padding: 1px 14px 11px;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
 }
 
 .agent-run-status-label {
@@ -5258,7 +5541,7 @@ html[data-theme="dark"] .ide-surface.is-preview {
   color: var(--muted-foreground);
 }
 
-.agent-run-status .button {
+.agent-run-status-content > [data-slot="button"] {
   justify-self: start;
 }
 
@@ -5815,36 +6098,149 @@ html[data-theme="dark"] .ide-surface.is-preview {
 }
 
 .agent-composer-v2 {
-  display: grid;
-  gap: 7px;
-  padding: 10px;
-  border-top: 1px solid var(--border);
-  background: var(--surface);
+  /*
+   * Composer 可能会被 Agent 面板的 Grid 行拉伸。
+   * 让输入区吃掉剩余空间，底部工具栏始终作为最后一个固定高度的
+   * Flex item 排列，避免按钮和输入框一起被垂直居中。
+   */
+  display: flex;
+  min-height: 0;
+  flex-direction: column;
+  min-width: 0;
+  max-width: calc(100% - 18px);
+  gap: 4px;
+  margin: 0 9px 9px;
+  padding: 6px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--surface-2);
+  box-shadow: 0 5px 18px color-mix(in srgb, var(--foreground) 5%, transparent);
 }
 
 .agent-composer-v2 textarea {
-  min-height: 72px;
+  flex: 1 1 auto;
+  min-height: 62px;
   width: 100%;
-  resize: vertical;
-  padding: 9px 10px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-compact);
+  min-width: 0;
+  resize: none;
+  padding: 7px 8px;
+  border: 0;
+  border-radius: 5px;
   outline: 0;
   color: var(--foreground);
-  background: var(--surface-2);
+  background: transparent;
   font: inherit;
-  font-size: 0.78rem;
-  line-height: 1.45;
+  font-size: 0.84rem;
+  line-height: 1.5;
 }
 
 .agent-composer-v2 textarea:focus {
+  box-shadow: none;
+}
+
+.agent-composer-v2:focus-within {
   border-color: var(--focus-ring);
-  box-shadow: 0 0 0 2px color-mix(in srgb, var(--focus-ring) 20%, transparent);
+  box-shadow:
+    0 0 0 2px color-mix(in srgb, var(--focus-ring) 18%, transparent),
+    0 5px 18px color-mix(in srgb, var(--foreground) 5%, transparent);
 }
 
 .agent-composer-footer {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: space-between;
+  align-self: end;
+  min-width: 0;
+  min-height: 30px;
+  padding-left: 1px;
   color: var(--faint-foreground);
   font-size: 0.68rem;
+}
+
+.agent-composer-v2 .agent-composer-tools {
+  justify-content: flex-start;
+  min-width: 0;
+  margin-top: 0;
+  gap: 2px;
+}
+
+.agent-composer-v2 .agent-composer-tools > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-model-trigger {
+  max-width: 154px;
+  min-width: 0;
+  padding-inline: 7px;
+  color: var(--muted-foreground);
+}
+
+.agent-model-trigger span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-model-trigger svg {
+  width: 13px;
+  height: 13px;
+  flex: 0 0 auto;
+}
+
+.agent-primary-action {
+  flex: 0 0 auto;
+  border-radius: 7px;
+}
+
+.agent-primary-action.is-stop {
+  color: var(--background);
+  background: var(--foreground);
+}
+
+.agent-primary-action.is-stop:hover {
+  background: color-mix(in srgb, var(--foreground) 86%, transparent);
+}
+
+.agent-primary-action.is-stop svg {
+  width: 12px;
+  height: 12px;
+}
+
+@media (max-width: 420px) {
+  .agent-run-status > summary {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .agent-run-status-summary-detail {
+    grid-column: 1 / -1;
+    grid-row: 2;
+    padding-left: 20px;
+  }
+
+  .agent-run-status-summary-end {
+    grid-column: 2;
+    grid-row: 1;
+  }
+
+  .agent-run-metrics {
+    grid-template-columns: 1fr;
+  }
+
+  .agent-verification-state {
+    grid-template-columns: 14px minmax(0, 1fr);
+  }
+
+  .agent-verification-state small {
+    grid-column: 2;
+  }
+
+  .agent-attachment-tray {
+    grid-template-columns: 1fr;
+  }
 }
 
 @media (max-width: 900px) {
@@ -5869,13 +6265,28 @@ html[data-theme="dark"] .ide-surface.is-preview {
   }
 
   .workbench-grid {
-    grid-template-columns: minmax(260px, 320px) minmax(0, 1fr);
-    height: max(520px, calc(100dvh - 212px));
+    display: grid;
+    grid-template-columns: minmax(300px, 360px) minmax(660px, 1fr);
+    width: max(100%, 960px);
+    height: auto;
+    min-width: 0;
     min-height: 0;
+  }
+
+  .agent-panel-v2 {
+    /* 即使窄屏也保持完整的 Agent 工具列，消息区域自己滚动。 */
+    width: auto;
+    height: 100%;
+    min-height: 0;
+    border-right: 1px solid var(--border);
+    border-bottom: 0;
   }
 
   .workspace.workspace-ide {
     grid-template-columns: 190px minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr);
+    height: 100%;
+    min-height: 0;
   }
 
   .runtime-facts {
@@ -5910,37 +6321,20 @@ html[data-theme="dark"] .ide-surface.is-preview {
     display: none;
   }
 
-  .workbench-grid {
-    display: block;
-    height: auto;
-    min-height: 0;
-  }
-
-  .agent-panel-v2 {
-    min-height: 520px;
-    border-right: 0;
-    border-bottom: 1px solid var(--border);
-  }
-
-  .workspace.workspace-ide {
-    grid-template-columns: 1fr;
-    grid-template-rows: 168px minmax(640px, calc(100dvh - 168px));
-  }
-
   .ide-sidebar {
-    border-right: 0;
-    border-bottom: 1px solid var(--border);
+    border-right: 1px solid var(--border);
+    border-bottom: 0;
   }
 
   .ide-main {
-    min-height: 640px;
+    min-height: 0;
   }
 
   .file-tree-more {
     opacity: 1;
   }
 
-  .ide-surface.is-preview {
+  .ide-preview-surface {
     grid-template-rows: 42px minmax(320px, 1fr) 190px;
   }
 

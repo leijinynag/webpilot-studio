@@ -57,14 +57,19 @@ export type AgentRunBudget = {
 };
 
 export const DEFAULT_AGENT_RUN_ACTIVITY_LIMITS = {
-  maxFileMutations: 8,
-  maxClientResumes: 6,
+  // 大型项目会持续新增组件、样式、配置与测试。这里采用宽松的安全上限，
+  // 防止正常的多文件开发被误判为异常；真正的死循环仍由 no-progress
+  // 熔断、并发限制、成本限制和运行时间预算共同阻止。
+  maxFileMutations: 512,
+  maxClientResumes: 32,
   maxNoProgressRepeats: 2,
 } as const;
 
 // 空项目需要逐文件生成完整骨架，再依次完成 Preview、Browser Verify 和最终说明。
-// 16 轮为一次常规修复保留余量；该值只用于新建 Run 或读取缺失字段的旧数据。
-export const DEFAULT_MAX_AGENT_MODEL_TURNS = 16;
+// 128 轮可以覆盖较长的编码、验证与修复链路；该值只用于新建 Run 或读取
+// 缺失字段的旧数据，部署侧仍可通过 MAX_AGENT_MODEL_TURNS 收紧预算。
+export const DEFAULT_MAX_AGENT_MODEL_TURNS = 128;
+export const DEFAULT_MAX_AGENT_WALL_TIME_SECONDS = 1_800;
 
 export type AgentRunUsage = {
   modelTurns: number;
@@ -114,7 +119,10 @@ export function normalizeAgentRunBudget(
       value.maxModelTurns,
       DEFAULT_MAX_AGENT_MODEL_TURNS,
     ),
-    maxWallTimeSeconds: positiveInteger(value.maxWallTimeSeconds, 300),
+    maxWallTimeSeconds: positiveInteger(
+      value.maxWallTimeSeconds,
+      DEFAULT_MAX_AGENT_WALL_TIME_SECONDS,
+    ),
     maxOutputCharacters: positiveInteger(value.maxOutputCharacters, 24_000),
     maxToolResultCharacters: positiveInteger(
       value.maxToolResultCharacters,

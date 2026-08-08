@@ -57,6 +57,8 @@ type FetchLike = typeof fetch;
 export type DeepSeekProviderOptions = {
   apiKey: string;
   baseUrl?: string;
+  /** DeepSeek 专属 thinking 参数，其他 OpenAI-compatible Provider 不发送。 */
+  includeThinking?: boolean;
   timeoutMs?: number;
   firstEventTimeoutMs?: number;
   streamInactivityTimeoutMs?: number;
@@ -155,7 +157,9 @@ export class DeepSeekProvider implements LlmProvider {
             stream_options: { include_usage: true },
             max_tokens: input.maxOutputTokens,
             temperature: 0.2,
-            thinking: { type: "disabled" },
+            ...(this.options.includeThinking === false
+              ? {}
+              : { thinking: { type: "disabled" } }),
             ...(input.userId ? { user_id: normalizeUserId(input.userId) } : {}),
           }),
           signal,

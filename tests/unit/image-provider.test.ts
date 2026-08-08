@@ -81,6 +81,36 @@ describe("OpenAI-compatible image providers", () => {
     ).rejects.toMatchObject({ code: IMAGE_ERROR_CODES.visionTimeout });
   });
 
+  it("保留 Vision Provider 返回的短错误摘要", async () => {
+    const fetchImplementation = vi.fn<typeof fetch>(async () =>
+      Response.json(
+        {
+          error: {
+            message: "response_format is not supported for this model",
+          },
+        },
+        { status: 400 },
+      ),
+    );
+    const provider = new OpenAiCompatibleVisionProvider({
+      apiKey: "vision-key",
+      fetchImplementation,
+    });
+
+    await expect(
+      provider.inspect({ images: [], model: "vision-model" }),
+    ).rejects.toMatchObject({
+      code: IMAGE_ERROR_CODES.visionContentRejected,
+      status: 502,
+      message:
+        "Vision Provider 拒绝了当前图片分析请求：response_format is not supported for this model",
+      details: {
+        status: 400,
+        upstreamError: "response_format is not supported for this model",
+      },
+    });
+  });
+
   it("解析生图 Provider 的 base64 图片", async () => {
     const provider = new OpenAiCompatibleImageProvider({
       apiKey: "image-key",

@@ -59,11 +59,13 @@ describe("project workspace reducer", () => {
       content: "sent-to-server",
     });
     state = projectWorkspaceReducer(state, { type: "save-start" });
+    expect(state.statusDetail).toEqual({ kind: "saving" });
     state = projectWorkspaceReducer(state, {
       type: "edit",
       path: "src/index.tsx",
       content: "typed-while-saving",
     });
+    expect(state.statusDetail).toEqual({ kind: "saving" });
     state = projectWorkspaceReducer(state, {
       type: "save-success",
       path: "src/index.tsx",
@@ -77,6 +79,12 @@ describe("project workspace reducer", () => {
       draftContent: "typed-while-saving",
       dirty: true,
     });
+    expect(state.statusDetail).toEqual({
+      kind: "saved",
+      revision: 2,
+      hasNewDraft: true,
+    });
+    expect(state.statusMessage).toBe("");
   });
 
   it("服务端冲突刷新时保留本地草稿并更新服务端基线", () => {
@@ -152,6 +160,10 @@ describe("project workspace reducer", () => {
     expect(state.activePath).toBe("src/theme.css");
     expect(state.openPaths).toContain("src/theme.css");
     expect(state.files["src/styles.css"]).toBeUndefined();
+    expect(state.statusDetail).toEqual({
+      kind: "renamed",
+      path: "src/theme.css",
+    });
 
     state = projectWorkspaceReducer(state, {
       type: "delete-success",
@@ -160,5 +172,9 @@ describe("project workspace reducer", () => {
     });
     expect(state.activePath).toBe("src/index.tsx");
     expect(state.files["src/theme.css"]).toBeUndefined();
+    expect(state.statusDetail).toEqual({
+      kind: "deleted",
+      path: "src/theme.css",
+    });
   });
 });

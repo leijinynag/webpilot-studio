@@ -48,18 +48,26 @@ import { IMAGE_ERROR_CODES, ImageError } from "@/domains/image/errors";
 import { processNextImageJob } from "@/domains/image/worker";
 import { DatabaseProjectRepository } from "@/domains/project/repository";
 import {
+  agentRunEvents,
   imageJobs,
   projectAssets,
   projects,
+  quotaLeases,
+  transcriptMessages,
   toolInvocations,
+  usageLedger,
 } from "@/infrastructure/db/schema";
+import {
+  reserveQuota,
+  releaseAgentRunQuotaReservations,
+} from "@/infrastructure/quota/service";
+import type { RedisRateLimitReservation } from "@/infrastructure/rate-limit/upstash-store";
 import { createTestDatabase } from "@/tests/database/helpers/pglite-database";
 
 const OWNER_ID = "image-workflow-owner";
 const PNG_1X1 = Uint8Array.from([
-  0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
-  0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
-  0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+  0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49,
+  0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
 ]);
 
 const imageArguments = {
@@ -70,7 +78,9 @@ const imageArguments = {
 
 type ImageFixture = Awaited<ReturnType<typeof createImageFixture>>;
 
-async function createImageFixture() {
+async function createImageFixture(
+  redisReservation?: RedisRateLimitReservation,
+) {
   const testDatabase = await createTestDatabase();
   databaseRef.current = testDatabase.database as unknown as TestDatabase;
 
@@ -117,6 +127,11 @@ async function createImageFixture() {
     throw new Error("测试无法领取 Agent Run 执行租约。");
   }
 
+  const quotaReservation = await reserveQuota({
+    resource: "image_generation",
+    ownerId: OWNER_ID,
+    units: imageArguments.count,
+  });
   const suspended = await store.suspendForImageGeneration({
     ownerId: OWNER_ID,
     runId: parentRun.id,
@@ -131,6 +146,9 @@ async function createImageFixture() {
     model: "fake-image-model",
     profile: "test-image-profile",
     profileVersion: "test-image-profile-v1",
+    quotaReservation: redisReservation
+      ? { ...quotaReservation, redisReservation }
+      : quotaReservation,
   });
   const job = await getImageJob({ imageJobId: suspended.imageJobId });
   if (!job) {
@@ -159,7 +177,10 @@ function createBlobStore() {
   return {
     objects,
     async put(pathname: string, body: Uint8Array | string) {
-      objects.set(pathname, typeof body === "string" ? new TextEncoder().encode(body) : body);
+      objects.set(
+        pathname,
+        typeof body === "string" ? new TextEncoder().encode(body) : body,
+      );
       return {
         pathname,
         url: `blob://test/${pathname}`,
@@ -308,6 +329,111 @@ describe("image job store", () => {
     }
   });
 
+  it("最大次数的过期租约直接收口父 Agent，不会发起第 4 次 Provider 调用", async () => {
+    const fixture = await createImageFixture();
+    const provider: ImageProvider = {
+      generate: vi.fn(async () => {
+        throw new Error("达到最大次数后不应再次调用 Provider。");
+      }),
+    };
+    try {
+      await fixture.testDatabase.database
+        .update(imageJobs)
+        .set({
+          status: "running",
+          attempt: 3,
+          leaseId: crypto.randomUUID(),
+          leaseExpiresAt: new Date(0),
+        })
+        .where(eq(imageJobs.id, fixture.imageJobId));
+
+      await processNextImageJob({
+        expectedJobId: fixture.imageJobId,
+        dependencies: {
+          provider,
+          blobStore: createBlobStore(),
+          agentStore: fixture.store,
+          launchAgentRun: vi.fn(async () => undefined),
+        },
+      });
+      // 重复投递是队列的正常语义，第二次调用必须保持幂等。
+      await processNextImageJob({
+        expectedJobId: fixture.imageJobId,
+        dependencies: {
+          provider,
+          blobStore: createBlobStore(),
+          agentStore: fixture.store,
+          launchAgentRun: vi.fn(async () => undefined),
+        },
+      });
+
+      const finalJob = await getImageJob({ imageJobId: fixture.imageJobId });
+      const parent = await fixture.store.getRun({
+        ownerId: OWNER_ID,
+        runId: fixture.parentRun.id,
+      });
+      const [invocation] = await fixture.testDatabase.database
+        .select({
+          status: toolInvocations.status,
+          errorCode: toolInvocations.errorCode,
+        })
+        .from(toolInvocations)
+        .where(
+          and(
+            eq(toolInvocations.runId, fixture.parentRun.id),
+            eq(toolInvocations.toolCallId, "call-image-1"),
+          ),
+        );
+      const toolResults = await fixture.testDatabase.database
+        .select({ id: transcriptMessages.id })
+        .from(transcriptMessages)
+        .where(
+          and(
+            eq(transcriptMessages.runId, fixture.parentRun.id),
+            eq(transcriptMessages.kind, "tool_result"),
+          ),
+        );
+      const completionEvents = await fixture.testDatabase.database
+        .select({ id: agentRunEvents.id })
+        .from(agentRunEvents)
+        .where(
+          and(
+            eq(agentRunEvents.runId, fixture.parentRun.id),
+            eq(agentRunEvents.type, "tool.completed"),
+          ),
+        );
+      const imageUsage = await fixture.testDatabase.database
+        .select()
+        .from(usageLedger)
+        .where(eq(usageLedger.imageRunId, fixture.imageRunId));
+      const imageLeases = await fixture.testDatabase.database
+        .select({ status: quotaLeases.status })
+        .from(quotaLeases)
+        .where(eq(quotaLeases.resource, "image_generation"));
+
+      expect(provider.generate).not.toHaveBeenCalled();
+      expect(finalJob?.job.status).toBe("failed");
+      expect(finalJob?.run.status).toBe("failed");
+      expect(parent.status).toBe("failed");
+      expect(invocation).toEqual({
+        status: "failed",
+        errorCode: IMAGE_ERROR_CODES.generationFailed,
+      });
+      expect(toolResults).toHaveLength(1);
+      expect(completionEvents).toHaveLength(1);
+      expect(imageUsage).toHaveLength(1);
+      expect(imageUsage[0]?.metadata).toMatchObject({
+        attempt: 3,
+        costEstimation: "pending_price_table",
+      });
+      expect(imageLeases.every((lease) => lease.status === "released")).toBe(
+        true,
+      );
+    } finally {
+      await closeFixture(fixture);
+    }
+  });
+
   it("相同生图请求返回原任务，参数变化则拒绝重复 Tool Call", async () => {
     const fixture = await createImageFixture();
     try {
@@ -398,6 +524,23 @@ describe("image worker", () => {
         ownerId: OWNER_ID,
         runId: fixture.parentRun.id,
       });
+      const imageUsage = await fixture.testDatabase.database
+        .select()
+        .from(usageLedger)
+        .where(eq(usageLedger.imageRunId, fixture.imageRunId));
+      const imageLeases = await fixture.testDatabase.database
+        .select({ status: quotaLeases.status })
+        .from(quotaLeases)
+        .where(eq(quotaLeases.resource, "image_generation"));
+      expect(imageUsage).toHaveLength(1);
+      expect(imageUsage[0]?.metadata).toMatchObject({
+        providerJobId: "provider-job-1",
+        attempt: 1,
+        costEstimation: "pending_price_table",
+      });
+      expect(imageLeases.every((lease) => lease.status === "released")).toBe(
+        true,
+      );
     } finally {
       await closeFixture(fixture);
     }
@@ -472,7 +615,10 @@ describe("image worker", () => {
         .select({ revision: projects.revision })
         .from(projects)
         .where(
-          and(eq(projects.id, fixture.project.id), eq(projects.ownerId, OWNER_ID)),
+          and(
+            eq(projects.id, fixture.project.id),
+            eq(projects.ownerId, OWNER_ID),
+          ),
         );
       const [invocation] = await fixture.testDatabase.database
         .select({ status: toolInvocations.status })
@@ -489,6 +635,162 @@ describe("image worker", () => {
       expect(project?.revision).toBe(fixture.project.revision);
       expect(invocation?.status).toBe("cancelled");
       expect(launchAgentRun).not.toHaveBeenCalled();
+    } finally {
+      await closeFixture(fixture);
+    }
+  });
+
+  it("取消父 Agent 只释放它关联的 Agent 和生图租约", async () => {
+    const fixture = await createImageFixture();
+    const unrelatedResourceId = crypto.randomUUID();
+    try {
+      await fixture.testDatabase.database.insert(quotaLeases).values([
+        {
+          resource: "agent_run",
+          ownerId: OWNER_ID,
+          subjectKey: OWNER_ID,
+          expiresAt: new Date(Date.now() + 60_000),
+          metadata: {
+            subjectType: "owner",
+            resourceId: fixture.parentRun.id,
+          },
+        },
+        {
+          resource: "image_generation",
+          ownerId: OWNER_ID,
+          subjectKey: OWNER_ID,
+          expiresAt: new Date(Date.now() + 60_000),
+          metadata: {
+            subjectType: "owner",
+            resourceId: unrelatedResourceId,
+          },
+        },
+      ]);
+
+      await releaseAgentRunQuotaReservations({
+        ownerId: OWNER_ID,
+        runId: fixture.parentRun.id,
+      });
+
+      const leases = await fixture.testDatabase.database
+        .select({
+          resource: quotaLeases.resource,
+          status: quotaLeases.status,
+          metadata: quotaLeases.metadata,
+        })
+        .from(quotaLeases);
+      const related = leases.filter(
+        (lease) =>
+          lease.metadata.resourceId === fixture.parentRun.id ||
+          lease.metadata.resourceId === fixture.imageRunId,
+      );
+      const unrelated = leases.filter(
+        (lease) => lease.metadata.resourceId === unrelatedResourceId,
+      );
+
+      expect(related.length).toBeGreaterThan(0);
+      expect(related.every((lease) => lease.status === "released")).toBe(true);
+      expect(unrelated).toHaveLength(1);
+      expect(unrelated[0]?.status).toBe("active");
+    } finally {
+      await closeFixture(fixture);
+    }
+  });
+
+  it("生图租约绑定时保留 Redis reservation，便于 Worker 终态按 imageRun 清理", async () => {
+    const redisReservation: RedisRateLimitReservation = {
+      leaseId: "redis-image-lease",
+      resource: "image_generation",
+      ownerId: OWNER_ID,
+      ipSubjectKey: "hashed-ip",
+      units: 1,
+      countTowardDailyQuota: true,
+    };
+    const fixture = await createImageFixture(redisReservation);
+
+    try {
+      const leases = await fixture.testDatabase.database
+        .select({
+          metadata: quotaLeases.metadata,
+        })
+        .from(quotaLeases);
+      const imageLeases = leases.filter(
+        (lease) => lease.metadata.resourceId === fixture.imageRunId,
+      );
+
+      expect(imageLeases).toHaveLength(2);
+      expect(
+        imageLeases.every((lease) =>
+          expect(lease.metadata.redisReservation).toEqual(redisReservation),
+        ),
+      ).toBe(true);
+    } finally {
+      await closeFixture(fixture);
+    }
+  });
+
+  it("删除项目会释放该项目的 Agent 和生图租约，不影响其他资源", async () => {
+    const fixture = await createImageFixture();
+    const unrelatedResourceId = crypto.randomUUID();
+    try {
+      await fixture.testDatabase.database.insert(quotaLeases).values([
+        {
+          resource: "agent_run",
+          ownerId: OWNER_ID,
+          subjectKey: OWNER_ID,
+          expiresAt: new Date(Date.now() + 60_000),
+          metadata: {
+            subjectType: "owner",
+            resourceId: fixture.parentRun.id,
+          },
+        },
+        {
+          resource: "agent_run",
+          ownerId: OWNER_ID,
+          subjectKey: OWNER_ID,
+          expiresAt: new Date(Date.now() + 60_000),
+          metadata: {
+            subjectType: "owner",
+            resourceId: unrelatedResourceId,
+          },
+        },
+      ]);
+
+      await fixture.repository.deleteProject({
+        ownerId: OWNER_ID,
+        projectId: fixture.project.id,
+      });
+
+      const leases = await fixture.testDatabase.database
+        .select({
+          resource: quotaLeases.resource,
+          status: quotaLeases.status,
+          metadata: quotaLeases.metadata,
+        })
+        .from(quotaLeases);
+      const related = leases.filter(
+        (lease) =>
+          lease.metadata.resourceId === fixture.parentRun.id ||
+          lease.metadata.resourceId === fixture.imageRunId,
+      );
+      const unrelated = leases.filter(
+        (lease) => lease.metadata.resourceId === unrelatedResourceId,
+      );
+      const deletedJob = await getImageJob({
+        imageJobId: fixture.imageJobId,
+      });
+      const deletedParent = await fixture.store.getRun({
+        ownerId: OWNER_ID,
+        runId: fixture.parentRun.id,
+      });
+
+      expect(related.length).toBeGreaterThan(0);
+      expect(related.every((lease) => lease.status === "released")).toBe(true);
+      expect(unrelated).toHaveLength(1);
+      expect(unrelated[0]?.status).toBe("active");
+      expect(deletedJob?.job.status).toBe("cancelled");
+      expect(deletedJob?.run.status).toBe("cancelled");
+      expect(deletedParent.status).toBe("cancelled");
     } finally {
       await closeFixture(fixture);
     }

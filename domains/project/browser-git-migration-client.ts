@@ -8,6 +8,7 @@ import {
   getBrowserGitClient,
   type BrowserGitClient,
 } from "@/infrastructure/browser-git/client";
+import { browserApiFetch } from "@/infrastructure/http/browser-api";
 
 export type BrowserGitMigrationStage =
   | "preparing"
@@ -232,8 +233,7 @@ export class BrowserGitMigrationController {
           action: "finalize",
           sessionId: proof.preparation.sessionId,
           token: proof.preparation.token,
-          candidateRepositoryId:
-            proof.preparation.candidateRepositoryId,
+          candidateRepositoryId: proof.preparation.candidateRepositoryId,
           manifestHash: proof.preparation.manifestHash,
           head: proof.head,
         }),
@@ -282,18 +282,15 @@ export class BrowserGitMigrationController {
 }
 
 export function createBrowserGitMigrationController() {
-  // 浏览器原生 fetch 对 this 有调用约束；传入 Controller 后必须先绑定
-  // globalThis，否则迁移在真实 Chromium 中会抛出 Illegal invocation。
   return new BrowserGitMigrationController(
     getBrowserGitClient(),
-    fetch.bind(globalThis),
+    browserApiFetch,
   );
 }
 
 async function readApiBody<T>(response: Response): Promise<T> {
   const body = (await response.json().catch(() => ({}))) as
-    | T
-    | MigrationApiErrorBody;
+    T | MigrationApiErrorBody;
 
   if (!response.ok) {
     const errorBody = body as MigrationApiErrorBody;

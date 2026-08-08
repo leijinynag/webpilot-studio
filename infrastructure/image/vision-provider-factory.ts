@@ -36,6 +36,7 @@ export function getVisionProviderRuntime(): VisionProviderRuntime {
     provider: new OpenAiCompatibleVisionProvider({
       apiKey,
       baseUrl: serverEnv.VISION_BASE_URL || "https://api.openai.com/v1",
+      timeoutMs: serverEnv.VISION_TIMEOUT_MS,
     }),
     providerName,
     model: serverEnv.VISION_MODEL?.trim() || "gpt-4.1-mini",

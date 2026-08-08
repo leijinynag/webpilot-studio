@@ -23,6 +23,7 @@ import type {
   ProjectDescription,
   ProjectFileSnapshot,
 } from "@/domains/project/types";
+import { browserApiFetch } from "@/infrastructure/http/browser-api";
 import { useUiI18n } from "@/infrastructure/i18n/ui";
 import {
   type WebContainerRuntimeAsset,
@@ -135,9 +136,12 @@ export function PublishPage({
 
     async function loadRuntimeAssets() {
       try {
-        const response = await fetch(`/api/projects/${project.id}/assets`, {
-          cache: "no-store",
-        });
+        const response = await browserApiFetch(
+          `/api/projects/${project.id}/assets`,
+          {
+            cache: "no-store",
+          },
+        );
         const body = (await response.json().catch(() => ({}))) as {
           assets?: Array<WebContainerRuntimeAsset & { downloadUrl?: string }>;
           error?: { message?: string };
@@ -288,7 +292,7 @@ export function PublishPage({
     });
 
     try {
-      const response = await fetch("/api/showcase/admin/publish", {
+      const response = await browserApiFetch("/api/showcase/admin/publish", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -360,7 +364,7 @@ export function PublishPage({
     });
 
     try {
-      const response = await fetch("/api/showcase/admin/candidates", {
+      const response = await browserApiFetch("/api/showcase/admin/candidates", {
         headers: {
           "x-showcase-admin-token": token,
         },
@@ -429,7 +433,7 @@ export function PublishPage({
     });
 
     try {
-      const response = await fetch(
+      const response = await browserApiFetch(
         `/api/showcase/admin/${publishCaseId}/revoke`,
         {
           method: "POST",
@@ -847,7 +851,7 @@ async function loadDatabaseSnapshot(
   projectId: string,
   translate: (key: string) => string,
 ) {
-  const response = await fetch(`/api/projects/${projectId}/files`, {
+  const response = await browserApiFetch(`/api/projects/${projectId}/files`, {
     cache: "no-store",
   });
   const body = (await response.json().catch(() => ({}))) as {
@@ -881,7 +885,7 @@ async function loadProjectRevision(
   projectId: string,
   translate: (key: string) => string,
 ): Promise<number> {
-  const response = await fetch(`/api/projects/${projectId}`, {
+  const response = await browserApiFetch(`/api/projects/${projectId}`, {
     cache: "no-store",
   });
   const body = (await response.json().catch(() => ({}))) as {
