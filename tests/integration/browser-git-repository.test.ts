@@ -2,7 +2,7 @@ import "fake-indexeddb/auto";
 
 import { randomUUID } from "node:crypto";
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { deserializeBrowserGitError } from "@/infrastructure/browser-git/errors";
 import {
@@ -138,6 +138,74 @@ describe("Browser Git provision recovery boundary", () => {
         message: "conflict",
       }),
     ).toMatchObject({ code: PROJECT_ERROR_CODES.revisionConflict });
+  });
+});
+
+describe("Browser Git batch mutation rollback", () => {
+  it("元数据落盘失败时可以回滚 directory -> file 形态转换", async () => {
+    const projectId = randomUUID();
+    const runtime = new BrowserGitRuntime(projectId, { wipe: true });
+    const execute = async <TOperation extends BrowserGitWorkerOperation>(
+      operation: TOperation,
+      payload: BrowserGitWorkerPayloadMap[TOperation],
+    ) =>
+      runtime.execute({
+        protocol: "webpilot.browser-git.v1",
+        type: "request",
+        requestId: randomUUID(),
+        projectId,
+        operation,
+        payload,
+      });
+
+    await execute("initialize", {
+      projectId,
+      projectName: "Atomic rollback",
+      initialFiles: [
+        {
+          path: "config/app.ts",
+          content: "export const original = true;\n",
+        },
+      ],
+      allowCreate: true,
+    });
+    const baseRevision = await runtime.getRevision();
+
+    // Browser Git 没有数据库事务。这里故障注入到批次唯一一次 revision flush，
+    // 模拟文件已改写但元数据无法持久化；后续回滚 flush 保持正常，用来验证
+    // 补偿事务确实恢复文件形态、内容和 revision。
+    const fs = (
+      runtime as unknown as {
+        fs: { flush(): Promise<void> };
+      }
+    ).fs;
+    vi.spyOn(fs, "flush").mockRejectedValueOnce(
+      Object.assign(new Error("simulated metadata flush failure"), {
+        code: "EIO",
+      }),
+    );
+
+    await expect(
+      execute("batch_mutate_files", {
+        expectedRevision: baseRevision,
+        mutations: [
+          { type: "delete", path: "config/app.ts" },
+          {
+            type: "write",
+            path: "config",
+            content: "temporary replacement\n",
+          },
+        ],
+      }),
+    ).rejects.toThrow("simulated metadata flush failure");
+
+    await expect(runtime.getRevision()).resolves.toBe(baseRevision);
+    await expect(execute("list_files", {})).resolves.toEqual([
+      expect.objectContaining({
+        path: "config/app.ts",
+        content: "export const original = true;\n",
+      }),
+    ]);
   });
 });
 

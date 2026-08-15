@@ -538,7 +538,7 @@ export function ProjectWorkspace({
     dispatch({ type: "error", message });
   }
 
-  const refreshRepositorySnapshot = useCallback(async () => {
+  const refreshRepositorySnapshot = useCallback(async (): Promise<boolean> => {
     try {
       if (browserGitRepository) {
         const [files, gitState] = await Promise.all([
@@ -551,7 +551,7 @@ export function ProjectWorkspace({
           revision: gitState.revision,
         });
         setAgentRevision(gitState.revision);
-        return;
+        return true;
       }
 
       const [projectResponse, filesResponse] = await Promise.all([
@@ -566,7 +566,7 @@ export function ProjectWorkspace({
           type: "error",
           message: t("workbench.repositoryReadFailed"),
         });
-        return;
+        return false;
       }
 
       const projectBody = (await projectResponse.json()) as {
@@ -581,11 +581,13 @@ export function ProjectWorkspace({
         revision: projectBody.project.revision,
       });
       setAgentRevision(projectBody.project.revision);
+      return true;
     } catch {
       dispatch({
         type: "error",
         message: t("workbench.repositoryConnectionFailed"),
       });
+      return false;
     }
   }, [browserGitRepository, project.id, t]);
 
@@ -684,7 +686,16 @@ export function ProjectWorkspace({
         // 运行时导入是 Repository 事实更新。刷新快照会把新 revision 和文件内容
         // 重新灌入工作台；reducer 仍会保护未保存草稿，但此处已先阻止重叠路径。
         setAgentRevision(result.revision);
-        await refreshRepositorySnapshot();
+        const refreshed = await refreshRepositorySnapshot();
+        if (!refreshed) {
+          return {
+            status: "imported_refresh_failed",
+            revision: result.revision,
+            message: t("runtimeDiff.importedRefreshFailed", {
+              revision: result.revision,
+            }),
+          };
+        }
         return { status: "imported", revision: result.revision };
       } catch (error) {
         if (isRevisionConflictError(error)) {

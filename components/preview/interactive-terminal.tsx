@@ -21,12 +21,7 @@ type InteractiveTerminalProps = {
 };
 
 type TerminalConnectionState =
-  | "loading"
-  | "waiting"
-  | "connecting"
-  | "connected"
-  | "exited"
-  | "failed";
+  "loading" | "waiting" | "connecting" | "connected" | "exited" | "failed";
 
 type XtermModule = typeof import("@xterm/xterm");
 type XtermTerminal = InstanceType<XtermModule["Terminal"]>;
@@ -57,9 +52,7 @@ export function InteractiveTerminal({
     runtimeReady ? "loading" : "waiting",
   );
   const [connectionState, setConnectionState] =
-    useState<TerminalConnectionState>(
-      runtimeReady ? "loading" : "waiting",
-    );
+    useState<TerminalConnectionState>(runtimeReady ? "loading" : "waiting");
   const [connectionError, setConnectionError] = useState<string | null>(null);
 
   const updateConnectionState = useCallback(
@@ -149,9 +142,7 @@ export function InteractiveTerminal({
           return;
         }
         setConnectionError(toErrorMessage(error));
-        updateConnectionState(
-          runtimeReadyRef.current ? "failed" : "waiting",
-        );
+        updateConnectionState(runtimeReadyRef.current ? "failed" : "waiting");
       }
     },
     [bindProcess, projectId, updateConnectionState],
@@ -356,9 +347,7 @@ export function InteractiveTerminal({
             <CircleStop />
           </TerminalActionButton>
           <TerminalActionButton
-            disabled={
-              !runtimeReady || visibleConnectionState === "connecting"
-            }
+            disabled={!runtimeReady || visibleConnectionState === "connecting"}
             label="重启终端"
             onClick={() => {
               terminalRef.current?.reset();

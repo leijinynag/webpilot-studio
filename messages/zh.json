@@ -619,6 +619,7 @@
     "importSelected": "导入 {count} 个文件",
     "importing": "正在导入...",
     "imported": "已导入到 Repository r{revision}",
+    "importedRefreshFailed": "已导入到 Repository r{revision}，但工作台刷新失败。请刷新页面后继续，不要重复导入。",
     "staleReview": "Repository 已变化，请重新检测运行时变更。",
     "importConflict": "Repository 已被其他操作更新，导入已拒绝，请重新检测。",
     "importFailed": "运行时变更导入失败，请稍后重试。",

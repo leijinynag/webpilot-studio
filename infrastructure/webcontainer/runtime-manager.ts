@@ -770,10 +770,7 @@ export class WebContainerRuntimeManager {
     }
 
     for (const [path, content] of input.baseline) {
-      if (
-        shouldIgnoreRuntimeDiffPath(path, false) ||
-        runtimeFiles.has(path)
-      ) {
+      if (shouldIgnoreRuntimeDiffPath(path, false) || runtimeFiles.has(path)) {
         continue;
       }
 
@@ -1301,8 +1298,7 @@ export class WebContainerRuntimeManager {
         .split(/\r?\n/)
         .map((value) => value.trimEnd())
         .filter(
-          (value) =>
-            value.length > 0 && !NPM_SPINNER_LINE_PATTERN.test(value),
+          (value) => value.length > 0 && !NPM_SPINNER_LINE_PATTERN.test(value),
         )) {
         this.appendLog(`[${source}] ${line}`);
         collectedLogs?.push(line);
@@ -1438,21 +1434,23 @@ function createWebContainerProcessAdapter(
     error: null,
   };
 
-  const outputResult = process.output.pipeTo(
-    new WritableStream<string>({
-      write(chunk) {
-        replayBuffer = `${replayBuffer}${chunk}`.slice(
-          -MAX_PROCESS_REPLAY_CHARACTERS,
-        );
-        for (const listener of outputListeners) {
-          listener(chunk);
-        }
-      },
-    }),
-  ).then(
-    () => ({ ok: true as const }),
-    (error: unknown) => ({ ok: false as const, error }),
-  );
+  const outputResult = process.output
+    .pipeTo(
+      new WritableStream<string>({
+        write(chunk) {
+          replayBuffer = `${replayBuffer}${chunk}`.slice(
+            -MAX_PROCESS_REPLAY_CHARACTERS,
+          );
+          for (const listener of outputListeners) {
+            listener(chunk);
+          }
+        },
+      }),
+    )
+    .then(
+      () => ({ ok: true as const }),
+      (error: unknown) => ({ ok: false as const, error }),
+    );
 
   // 这里始终注册 rejection 分支。WebContainer 在 kill 后可能 reject exit，
   // 适配层将其归一化成状态，而不是把预期的用户操作泄漏成 unhandled rejection。
@@ -1640,12 +1638,7 @@ async function readRuntimeTextFiles(
     const absolutePath =
       directory === "." ? relativePath : `${directory}/${entry.name}`;
     if (entry.isDirectory()) {
-      await readRuntimeTextFiles(
-        instance,
-        absolutePath,
-        relativePath,
-        files,
-      );
+      await readRuntimeTextFiles(instance, absolutePath, relativePath, files);
       continue;
     }
 
@@ -1676,9 +1669,7 @@ function shouldIgnoreRuntimeDiffPath(
   }
 
   if (
-    segments.some((segment) =>
-      RUNTIME_DIFF_IGNORED_DIRECTORIES.has(segment),
-    )
+    segments.some((segment) => RUNTIME_DIFF_IGNORED_DIRECTORIES.has(segment))
   ) {
     return true;
   }
@@ -1717,10 +1708,7 @@ function decodeRuntimeTextFile(bytes: Uint8Array): string | null {
         controlCharacters += 1;
       }
     }
-    if (
-      controlCharacters >
-      Math.max(4, Math.floor(content.length * 0.01))
-    ) {
+    if (controlCharacters > Math.max(4, Math.floor(content.length * 0.01))) {
       return null;
     }
 

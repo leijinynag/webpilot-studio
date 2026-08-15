@@ -145,9 +145,7 @@ function ProjectWebContainerPreview({
   const retryTimerIdsRef = useRef(new Map<string, number>());
   const [frameRevision, setFrameRevision] = useState(0);
   const [compactViewport, setCompactViewport] = useState(false);
-  const [runtimePanel, setRuntimePanel] = useState<"logs" | "terminal">(
-    "logs",
-  );
+  const [runtimePanel, setRuntimePanel] = useState<"logs" | "terminal">("logs");
   const [terminalOpened, setTerminalOpened] = useState(false);
   const [clientToolRetryNonce, setClientToolRetryNonce] = useState(0);
   const [runtimeRequested, setRuntimeRequested] = useState(() =>
@@ -156,6 +154,7 @@ function ProjectWebContainerPreview({
   const [runtimeAssets, setRuntimeAssets] = useState<
     WebContainerRuntimeAsset[]
   >([]);
+  const [runtimeAssetsResolved, setRuntimeAssetsResolved] = useState(false);
   const [assetLoadError, setAssetLoadError] = useState<string | null>(null);
   const [runtimeDiffOpen, setRuntimeDiffOpen] = useState(false);
   const [runtimeDiff, setRuntimeDiff] = useState<RuntimeFileDiff | null>(null);
@@ -235,6 +234,7 @@ function ProjectWebContainerPreview({
             ),
           );
           setAssetLoadError(null);
+          setRuntimeAssetsResolved(true);
         }
       } catch (error) {
         if (!cancelled) {
@@ -244,6 +244,9 @@ function ProjectWebContainerPreview({
               ? error.message
               : "项目资产列表加载失败，请刷新后重试。",
           );
+          // 资产服务失败不能永久阻塞代码预览。标记请求已经决议后，Runtime
+          // 会使用空资产列表继续启动，并由页面保留上方错误供用户诊断。
+          setRuntimeAssetsResolved(true);
         }
       }
     }
@@ -258,6 +261,7 @@ function ProjectWebContainerPreview({
     if (
       clientToolExecutionKey ||
       !runtimeRequested ||
+      !runtimeAssetsResolved ||
       projectTreeIsEmpty(projectTree)
     ) {
       return;
@@ -284,10 +288,17 @@ function ProjectWebContainerPreview({
     projectTree,
     revision,
     runtimeAssets,
+    runtimeAssetsResolved,
     runtimeRequested,
   ]);
 
   useEffect(() => {
+    // Agent 浏览器工具也必须等待资产列表完成加载，否则第一次 start 会冻结空资产，
+    // 图片等 Blob 文件稍后抵达时还会触发第二次运行镜像切换，拉长工具首结果时间。
+    if (!runtimeAssetsResolved) {
+      return;
+    }
+
     const requestResult = clientToolRequestSchema.safeParse(clientToolRequest);
     if (
       !requestResult.success ||
@@ -599,6 +610,8 @@ function ProjectWebContainerPreview({
     clientToolRetryNonce,
     projectId,
     revision,
+    runtimeAssets,
+    runtimeAssetsResolved,
   ]);
 
   useEffect(
@@ -1000,9 +1013,7 @@ function ProjectWebContainerPreview({
             </button>
             <button
               aria-selected={runtimePanel === "terminal"}
-              className={
-                runtimePanel === "terminal" ? "is-active" : undefined
-              }
+              className={runtimePanel === "terminal" ? "is-active" : undefined}
               onClick={() => {
                 setTerminalOpened(true);
                 setRuntimePanel("terminal");
@@ -1056,8 +1067,7 @@ function ProjectWebContainerPreview({
                 active={runtimePanel === "terminal"}
                 projectId={projectId}
                 runtimeReady={
-                  runtimeBelongsToProject &&
-                  visibleSnapshot.phase === "ready"
+                  runtimeBelongsToProject && visibleSnapshot.phase === "ready"
                 }
               />
             </div>

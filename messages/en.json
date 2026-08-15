@@ -619,6 +619,7 @@
     "importSelected": "Import {count} files",
     "importing": "Importing...",
     "imported": "Imported into Repository r{revision}",
+    "importedRefreshFailed": "Imported into Repository r{revision}, but the workbench refresh failed. Refresh the page before continuing; do not import the same diff again.",
     "staleReview": "The Repository changed. Rescan runtime changes.",
     "importConflict": "The Repository was updated by another operation. Import was rejected; rescan first.",
     "importFailed": "Runtime change import failed. Try again shortly.",

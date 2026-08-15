@@ -1,6 +1,14 @@
 import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  describe,
+  expect,
+  it,
+  vi,
+} from "vitest";
 
 import {
   waitForRuntimeRender,
@@ -59,10 +67,11 @@ const {
           projectId?: string,
           revision?: number,
           runtimeKey?: string,
+          assets?: unknown,
         ]
       ) => {
-        // 保留真实 Manager 的四参数签名，测试会通过 runtimeKey 判断是否发生
-        // Repository/Agent 镜像切换；void 仅声明其余参数在此桩中无需解释。
+        // 保留真实 Manager 的五参数签名，测试会通过 runtimeKey 与 assets 判断是否
+        // 发生 Repository/Agent 镜像切换，以及首次启动是否携带完整项目资产。
         void args;
         runtimeActiveProject.value = args[1] ?? null;
         return snapshot;
@@ -224,6 +233,43 @@ describe("WebContainerPreview 客户端工具执行", () => {
     runtimeActivateProject.mockClear();
     runtimeDetectRuntimeChanges.mockClear();
     runtimeStart.mockClear();
+    vi.restoreAllMocks();
+  });
+
+  it("等待项目资产请求完成后再首次启动 Agent 运行镜像", async () => {
+    const assetsRequest = Promise.withResolvers<Response>();
+    vi.spyOn(globalThis, "fetch").mockImplementation(
+      () => assetsRequest.promise,
+    );
+    const onClientToolResult = vi.fn(async () => "accepted" as const);
+
+    renderPreview({
+      files: createFiles("export const title = 'with-assets';"),
+      onClientToolResult,
+    });
+
+    // 工具请求已经进入页面，但资产快照尚未确定时不能用空数组抢先启动。
+    await waitFor(() => expect(globalThis.fetch).toHaveBeenCalledTimes(1));
+    expect(runtimeStart).not.toHaveBeenCalled();
+
+    assetsRequest.resolve(
+      Response.json({
+        assets: [
+          {
+            assetPath: "/__webpilot/assets/hero.png",
+            downloadUrl: "/api/project-assets/asset-1/content",
+            mimeType: "image/png",
+          },
+        ],
+      }),
+    );
+
+    await waitFor(() => expect(runtimeStart).toHaveBeenCalledTimes(1));
+    expect(runtimeStart.mock.calls[0]?.[4]).toEqual([
+      expect.objectContaining({
+        assetPath: "/__webpilot/assets/hero.png",
+      }),
+    ]);
   });
 
   it("普通进入 Preview 不启动运行时，用户点击后才开始准备环境", async () => {
@@ -415,7 +461,9 @@ describe("WebContainerPreview 客户端工具执行", () => {
     runtimeActiveProject.value = request.projectId;
     const onImportRuntimeChanges = vi.fn<
       NonNullable<
-        React.ComponentProps<typeof WebContainerPreview>["onImportRuntimeChanges"]
+        React.ComponentProps<
+          typeof WebContainerPreview
+        >["onImportRuntimeChanges"]
       >
     >(async () => ({
       status: "imported" as const,
@@ -436,9 +484,7 @@ describe("WebContainerPreview 客户端工具执行", () => {
       </TooltipProvider>,
     );
 
-    await user.click(
-      screen.getByRole("button", { name: "检测运行时变更" }),
-    );
+    await user.click(screen.getByRole("button", { name: "检测运行时变更" }));
 
     await waitFor(() =>
       expect(runtimeDetectRuntimeChanges).toHaveBeenCalledWith({
@@ -451,7 +497,9 @@ describe("WebContainerPreview 客户端工具执行", () => {
 
     await user.click(screen.getByRole("button", { name: "导入 1 个文件" }));
 
-    await waitFor(() => expect(onImportRuntimeChanges).toHaveBeenCalledTimes(1));
+    await waitFor(() =>
+      expect(onImportRuntimeChanges).toHaveBeenCalledTimes(1),
+    );
     expect(onImportRuntimeChanges.mock.calls[0]?.[0]).toMatchObject({
       baseRevision: 2,
       projectKey: request.projectId,
@@ -483,9 +531,7 @@ describe("WebContainerPreview 客户端工具执行", () => {
       </TooltipProvider>,
     );
 
-    await user.click(
-      screen.getByRole("button", { name: "检测运行时变更" }),
-    );
+    await user.click(screen.getByRole("button", { name: "检测运行时变更" }));
 
     expect(
       await screen.findByRole("button", { name: /src\/index\.tsx/ }),
@@ -494,6 +540,53 @@ describe("WebContainerPreview 客户端工具执行", () => {
       screen.getByRole("button", { name: "导入 1 个文件" }),
     ).toBeDisabled();
     expect(onImportRuntimeChanges).not.toHaveBeenCalled();
+  });
+
+  it("Repository 已导入但工作台刷新失败时保留明确警告", async () => {
+    const user = userEvent.setup();
+    runtimeActiveProject.value = request.projectId;
+    const onImportRuntimeChanges = vi.fn<
+      NonNullable<
+        React.ComponentProps<
+          typeof WebContainerPreview
+        >["onImportRuntimeChanges"]
+      >
+    >(async () => ({
+      status: "imported_refresh_failed" as const,
+      revision: 3,
+      message:
+        "已导入到 Repository r3，但工作台刷新失败。请刷新页面后继续，不要重复导入。",
+    }));
+
+    render(
+      <TooltipProvider>
+        <WebContainerPreview
+          clientToolRequest={null}
+          dirtyPaths={[]}
+          files={createFiles("export const title = 'runtime';")}
+          onClientToolResult={vi.fn()}
+          onImportRuntimeChanges={onImportRuntimeChanges}
+          projectId={request.projectId}
+          revision={2}
+        />
+      </TooltipProvider>,
+    );
+
+    await user.click(screen.getByRole("button", { name: "检测运行时变更" }));
+    expect(
+      await screen.findByRole("button", { name: /src\/index\.tsx/ }),
+    ).toBeVisible();
+
+    await user.click(screen.getByRole("button", { name: "导入 1 个文件" }));
+
+    expect(
+      await screen.findByText(
+        "已导入到 Repository r3，但工作台刷新失败。请刷新页面后继续，不要重复导入。",
+      ),
+    ).toBeVisible();
+    expect(
+      screen.getByRole("dialog", { name: "检测并导入运行时变更" }),
+    ).toBeVisible();
   });
 });
 

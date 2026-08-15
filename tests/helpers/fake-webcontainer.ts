@@ -31,8 +31,7 @@ export class FakeWebContainerProcess implements WebContainerProcessAdapter {
     this.exit = Promise.resolve(exitCode);
     // 默认让输出流与进程一起结束；需要模拟“exit 已完成但 stdout 未关闭”时，
     // 测试可以单独传入一个 pending Promise，保持两条生命周期彼此独立。
-    this.outputCompletion =
-      outputCompletion ?? this.exit.then(() => undefined);
+    this.outputCompletion = outputCompletion ?? this.exit.then(() => undefined);
     this.replayBuffer = lines.map((line) => `${line}\n`).join("");
     void this.exit.then(
       (code) => {

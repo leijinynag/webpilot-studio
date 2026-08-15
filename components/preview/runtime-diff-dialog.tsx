@@ -43,6 +43,7 @@ const MonacoDiffEditor = dynamic(
 
 export type RuntimeImportResult =
   | { status: "imported"; revision: number }
+  | { status: "imported_refresh_failed"; revision: number; message: string }
   | { status: "stale"; message: string }
   | { status: "failed"; message: string };
 
@@ -169,7 +170,7 @@ function RuntimeDiffReview({
     () => new Map(diff.entries.map((entry) => [entry.path, entry])),
     [diff],
   );
-  const activeEntry = activePath ? entryByPath.get(activePath) ?? null : null;
+  const activeEntry = activePath ? (entryByPath.get(activePath) ?? null) : null;
   const selectedEntries = useMemo(
     () => diff.entries.filter((entry) => selectedPaths.has(entry.path)),
     [diff, selectedPaths],
@@ -180,9 +181,7 @@ function RuntimeDiffReview({
     .map((entry) => entry.path);
   const counts = countRuntimeDiffEntries(diff.entries);
   const canImport =
-    selectedEntries.length > 0 &&
-    selectedDirtyPaths.length === 0 &&
-    !importing;
+    selectedEntries.length > 0 && selectedDirtyPaths.length === 0 && !importing;
 
   function togglePath(path: string) {
     setSelectedPaths((current) => {
@@ -209,11 +208,21 @@ function RuntimeDiffReview({
       // 这里仅提交用户勾选的运行时差异；真正写入 Repository 时还会由上层用
       // baseRevision 做 CAS 校验，避免把过期运行镜像覆盖到较新的项目版本。
       const result = await onImport(diff, selectedEntries);
-      if (result.status === "imported") {
+      if (
+        result.status === "imported" ||
+        result.status === "imported_refresh_failed"
+      ) {
         setImportMessage(
-          t("runtimeDiff.imported", { revision: result.revision }),
+          result.status === "imported"
+            ? t("runtimeDiff.imported", { revision: result.revision })
+            : result.message,
         );
-        onOpenChange(false);
+        // Repository 已经提交时不能把结果留在可重试状态，否则用户再次点击
+        // 会用旧 baseRevision 制造必然冲突。刷新失败则保留对话框和明确警告，
+        // 让用户知道源码事实已经更新，只是工作台需要手动刷新。
+        if (result.status === "imported") {
+          onOpenChange(false);
+        }
       } else {
         // stale/failed 都不会修改本地选择，让用户能保留审查上下文再决定重扫或关闭。
         setImportMessage(result.message);
@@ -241,7 +250,10 @@ function RuntimeDiffReview({
               label={t("runtimeDiff.modified")}
               value={counts.modified}
             />
-            <DiffCount label={t("runtimeDiff.deleted")} value={counts.deleted} />
+            <DiffCount
+              label={t("runtimeDiff.deleted")}
+              value={counts.deleted}
+            />
           </div>
 
           <div className="runtime-diff-selection-actions">

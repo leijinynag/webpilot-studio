@@ -1519,10 +1519,7 @@ async function removeEmptyMutationDirectories(
     try {
       await fs.rmdir(directory);
     } catch (error) {
-      if (
-        !isMissingFileError(error) &&
-        !hasErrorCode(error, "ENOTEMPTY")
-      ) {
+      if (!isMissingFileError(error) && !hasErrorCode(error, "ENOTEMPTY")) {
         throw error;
       }
     }
@@ -1543,7 +1540,7 @@ async function removeEmptyDirectoryAtPath(
       await fs.rmdir(absolutePath);
     }
   } catch (error) {
-    if (!isMissingFileError(error)) {
+    if (!isMissingMutationPathError(error)) {
       throw error;
     }
   }
@@ -1580,7 +1577,7 @@ async function rollbackWorkspaceMutations(
       }
     } catch (error) {
       if (
-        !isMissingFileError(error) &&
+        !isMissingMutationPathError(error) &&
         !hasErrorCode(error, "ENOTEMPTY")
       ) {
         throw error;
@@ -1598,11 +1595,7 @@ async function rollbackWorkspaceMutations(
       continue;
     }
     await removeEmptyDirectoryAtPath(fs, repositoryPath(snapshot.path));
-    await writeBinaryFile(
-      fs,
-      repositoryPath(snapshot.path),
-      snapshot.content,
-    );
+    await writeBinaryFile(fs, repositoryPath(snapshot.path), snapshot.content);
   }
 
   await writeJsonFile(fs, PROJECT_METADATA_PATH, metadata);
@@ -1619,6 +1612,16 @@ function isReservedRepositoryPath(path: string) {
 
 function isMissingFileError(error: unknown) {
   return hasErrorCode(error, "ENOENT");
+}
+
+/**
+ * file/directory 形态转换失败后，较短路径可能已经变成普通文件。例如批次把
+ * `config/app.ts` 删除并把 `config` 写成文件，此时访问旧子路径会返回
+ * ENOTDIR 而不是 ENOENT。对回滚清理而言两者都表示“当前路径不存在”，
+ * 必须继续清理祖先并恢复快照，不能把补偿事务提前中断。
+ */
+function isMissingMutationPathError(error: unknown) {
+  return isMissingFileError(error) || hasErrorCode(error, "ENOTDIR");
 }
 
 function isAlreadyExistsError(error: unknown) {
