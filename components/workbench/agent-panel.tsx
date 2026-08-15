@@ -73,6 +73,7 @@ import { AGENT_ERROR_CODES } from "@/domains/agent/errors";
 import { verificationFailureSchema } from "@/domains/agent/verification";
 import type {
   AgentConversationSnapshot,
+  AgentRunEvent,
   AgentRunRecord,
   ConversationRecord,
   ToolInvocationRecord,
@@ -94,6 +95,10 @@ type AgentPanelProps = {
   revision: number;
   dirtyPaths: readonly string[];
   onClientToolRequest?: (request: ClientToolRequest) => void;
+  onFileStreamEvents?: (
+    conversationId: string,
+    events: readonly AgentRunEvent[],
+  ) => void;
   onRevisionChange?: (revision: number) => void;
   onRestoreComplete: (revision: number) => Promise<void> | void;
 };
@@ -183,6 +188,19 @@ const IMMEDIATE_SNAPSHOT_EVENT_TYPES = new Set([
   "verification.completed",
   "verification.completion_blocked",
 ]);
+const FILE_PROJECTION_EVENT_TYPES = new Set([
+  "file.stream_started",
+  "file.stream_delta",
+  "file.stream_completed",
+  "file.stream_discarded",
+  "tool.completed",
+]);
+const FILE_STREAM_EVENT_TYPES = new Set([
+  "file.stream_started",
+  "file.stream_delta",
+  "file.stream_completed",
+  "file.stream_discarded",
+]);
 const MAX_AGENT_SNAPSHOT_CACHE_ENTRIES = 16;
 const LATEST_CONVERSATION_CACHE_KEY = "__latest__";
 const TRANSCRIPT_BOTTOM_THRESHOLD_PX = 40;
@@ -205,6 +223,7 @@ export function AgentPanel({
   revision,
   dirtyPaths,
   onClientToolRequest,
+  onFileStreamEvents,
   onRevisionChange,
   onRestoreComplete,
 }: AgentPanelProps) {
@@ -462,6 +481,15 @@ export function AgentPanel({
       setConversations(body.conversations);
       setSnapshot(body.snapshot);
       setSelectedConversationId(body.snapshot?.conversation.id ?? null);
+      if (body.snapshot) {
+        // Snapshot 用于页面刷新、断线重连和切换会话后的恢复。这里把完整事件
+        // 交给工作台投影层；投影层以 runId + sequence 去重，因此可以同时接收
+        // SSE 与历史快照，而不会重复追加代码或重新打开用户已关闭的临时文件。
+        onFileStreamEvents?.(
+          body.snapshot.conversation.id,
+          body.snapshot.events,
+        );
+      }
       const activeSnapshotRun = findActiveRun(body.snapshot?.runs ?? []);
       setStreamingAssistantText(
         projectPendingAssistantText(
@@ -487,7 +515,7 @@ export function AgentPanel({
       });
       setErrorMessage(null);
     },
-    [clearStreamingDeltaBuffer, projectId],
+    [clearStreamingDeltaBuffer, onFileStreamEvents, projectId],
   );
 
   const loadAgentSnapshot = useCallback(
@@ -665,6 +693,18 @@ export function AgentPanel({
 
       if (
         persistedEvent?.runId === runId &&
+        FILE_PROJECTION_EVENT_TYPES.has(persistedEvent.type)
+      ) {
+        const conversationId = selectedConversationRef.current;
+        if (conversationId) {
+          // 高频文件 delta 必须在到达浏览器后直接投影，不能等待完整快照。
+          // 正式 tool.completed 也走同一通道，让临时标签进入 Repository 交接态。
+          onFileStreamEvents?.(conversationId, [persistedEvent]);
+        }
+      }
+
+      if (
+        persistedEvent?.runId === runId &&
         persistedEvent.type === "assistant.delta" &&
         typeof persistedEvent.payload.text === "string"
       ) {
@@ -694,6 +734,12 @@ export function AgentPanel({
         persistedEvent.payload.toolName === "generate_image"
       ) {
         void loadAssets();
+      }
+
+      if (persistedEvent && FILE_STREAM_EVENT_TYPES.has(persistedEvent.type)) {
+        // 临时文件内容已经由 SSE 即时呈现。若每个几十字符的 delta 都读取完整
+        // Conversation 快照，会放大数据库和网络开销，也会让 Monaco 展示反而变慢。
+        return;
       }
 
       // assistant.delta 先即时投影；普通高频事件进入 160ms 合并窗口，终态、
@@ -743,6 +789,10 @@ export function AgentPanel({
       "model.finished",
       "tool.started",
       "tool.completed",
+      "file.stream_started",
+      "file.stream_delta",
+      "file.stream_completed",
+      "file.stream_discarded",
       "client_tool.requested",
       "client_tool.completed",
       "client_tool.result_ignored",
@@ -757,6 +807,7 @@ export function AgentPanel({
     clearStreamingDeltaBuffer,
     flushAgentSnapshotRefresh,
     onClientToolRequest,
+    onFileStreamEvents,
     loadAssets,
     queueStreamingDelta,
     scheduleAgentSnapshotRefresh,
@@ -2829,32 +2880,44 @@ function hasSuccessfulReadBeforeMutation(input: {
   );
 }
 
-function parsePersistedEvent(value: string): {
-  runId: string;
-  type: string;
-  payload: Record<string, unknown>;
-} | null {
+function parsePersistedEvent(value: string): AgentRunEvent | null {
   try {
     const parsed = JSON.parse(value) as {
+      id?: unknown;
       runId?: unknown;
+      sequence?: unknown;
       type?: unknown;
       payload?: unknown;
+      createdAt?: unknown;
     };
 
     if (
+      typeof parsed.id !== "string" ||
       typeof parsed.runId !== "string" ||
+      typeof parsed.sequence !== "number" ||
+      !Number.isInteger(parsed.sequence) ||
+      parsed.sequence < 0 ||
       typeof parsed.type !== "string" ||
       !parsed.payload ||
       typeof parsed.payload !== "object" ||
-      Array.isArray(parsed.payload)
+      Array.isArray(parsed.payload) ||
+      typeof parsed.createdAt !== "string"
     ) {
       return null;
     }
 
+    const createdAt = new Date(parsed.createdAt);
+    if (Number.isNaN(createdAt.getTime())) {
+      return null;
+    }
+
     return {
+      id: parsed.id,
       runId: parsed.runId,
+      sequence: parsed.sequence,
       type: parsed.type,
       payload: parsed.payload as Record<string, unknown>,
+      createdAt,
     };
   } catch {
     return null;

@@ -486,6 +486,158 @@ describe("AgentPanel", () => {
     );
   });
 
+  it("从 SSE 转发完整文件流事件，且高频增量不触发聚合快照", async () => {
+    const runningSnapshot = createSnapshot("running");
+    runningSnapshot.events = [];
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
+      Response.json({
+        conversations: [conversation],
+        snapshot: runningSnapshot,
+      }),
+    );
+    installModelAwareFetchMock(fetchMock);
+    vi.stubGlobal("EventSource", MockEventSource);
+    const onFileStreamEvents = vi.fn();
+
+    render(
+      <AgentPanel
+        dirtyPaths={[]}
+        onFileStreamEvents={onFileStreamEvents}
+        onRestoreComplete={vi.fn()}
+        projectId={conversation.projectId}
+        revision={2}
+      />,
+    );
+
+    await screen.findByText("执行中", { exact: true });
+    const stream = MockEventSource.instances[0];
+    expect(stream).toBeDefined();
+    for (const eventType of [
+      "file.stream_started",
+      "file.stream_delta",
+      "file.stream_completed",
+      "file.stream_discarded",
+    ]) {
+      expect(stream?.listeners.has(eventType)).toBe(true);
+    }
+
+    await act(async () => {
+      stream?.emit(
+        "file.stream_delta",
+        {
+          id: "event-file-delta",
+          runId: createRun("running").id,
+          sequence: 3,
+          type: "file.stream_delta",
+          payload: {
+            toolCallId: "tool-write-1",
+            path: "src/app.tsx",
+            text: "export default",
+          },
+          createdAt: "2026-08-15T01:00:00.000Z",
+        },
+        "3",
+      );
+    });
+
+    expect(onFileStreamEvents).toHaveBeenLastCalledWith(conversation.id, [
+      expect.objectContaining({
+        id: "event-file-delta",
+        runId: createRun("running").id,
+        sequence: 3,
+        type: "file.stream_delta",
+        payload: expect.objectContaining({
+          toolCallId: "tool-write-1",
+          text: "export default",
+        }),
+        createdAt: new Date("2026-08-15T01:00:00.000Z"),
+      }),
+    ]);
+
+    // 等过普通事件的 160ms 合并窗口，文件流事件仍不应额外读取完整快照。
+    await new Promise((resolve) => window.setTimeout(resolve, 220));
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("从快照恢复文件流事件，并让正式工具完成事件继续触发收敛刷新", async () => {
+    const runningSnapshot = createSnapshot("running");
+    const runId = runningSnapshot.runs[0]!.id;
+    runningSnapshot.events = [
+      {
+        id: "event-stream-start",
+        runId,
+        sequence: 1,
+        type: "file.stream_started",
+        payload: {
+          toolCallId: "tool-write-1",
+          path: "src/app.tsx",
+        },
+        createdAt: new Date("2026-08-15T01:00:00.000Z"),
+      },
+    ];
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
+      Response.json({
+        conversations: [conversation],
+        snapshot: runningSnapshot,
+      }),
+    );
+    installModelAwareFetchMock(fetchMock);
+    vi.stubGlobal("EventSource", MockEventSource);
+    const onFileStreamEvents = vi.fn();
+
+    render(
+      <AgentPanel
+        dirtyPaths={[]}
+        onFileStreamEvents={onFileStreamEvents}
+        onRestoreComplete={vi.fn()}
+        projectId={conversation.projectId}
+        revision={2}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(onFileStreamEvents).toHaveBeenCalledWith(
+        conversation.id,
+        expect.arrayContaining([
+          expect.objectContaining({
+            id: "event-stream-start",
+            type: "file.stream_started",
+          }),
+        ]),
+      );
+    });
+
+    const stream = MockEventSource.instances[0];
+    await act(async () => {
+      stream?.emit(
+        "tool.completed",
+        {
+          id: "event-tool-completed",
+          runId,
+          sequence: 2,
+          type: "tool.completed",
+          payload: {
+            toolCallId: "tool-write-1",
+            toolName: "write_file",
+            ok: true,
+            revision: 3,
+          },
+          createdAt: "2026-08-15T01:00:01.000Z",
+        },
+        "2",
+      );
+    });
+
+    expect(onFileStreamEvents).toHaveBeenLastCalledWith(conversation.id, [
+      expect.objectContaining({
+        id: "event-tool-completed",
+        type: "tool.completed",
+        sequence: 2,
+      }),
+    ]);
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+  });
+
   it("项目切换后忽略迟到的旧首屏快照", async () => {
     let resolveOldRequest: ((response: Response) => void) | undefined;
     const oldRequest = new Promise<Response>((resolve) => {
