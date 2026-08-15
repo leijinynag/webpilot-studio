@@ -11,6 +11,7 @@ export const serverEnv = serverEnvSchema.parse({
   LLM_API_KEY: process.env.LLM_API_KEY,
   LLM_AGENT_MODEL: process.env.LLM_AGENT_MODEL,
   LLM_FAST_MODEL: process.env.LLM_FAST_MODEL,
+  LLM_SUMMARY_MODEL: process.env.LLM_SUMMARY_MODEL,
   VISION_PROVIDER: process.env.VISION_PROVIDER,
   VISION_BASE_URL: process.env.VISION_BASE_URL,
   VISION_API_KEY: process.env.VISION_API_KEY,

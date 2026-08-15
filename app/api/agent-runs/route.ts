@@ -7,7 +7,6 @@ import { deriveRepositoryIntent } from "@/domains/agent/repository-intent";
 import { AGENT_ERROR_CODES, AgentError } from "@/domains/agent/errors";
 import {
   DEFAULT_AGENT_RUN_ACTIVITY_LIMITS,
-  DEFAULT_MAX_AGENT_MODEL_TURNS,
   DEFAULT_MAX_AGENT_WALL_TIME_SECONDS,
 } from "@/domains/agent/types";
 import { launchAgentRun } from "@/infrastructure/agent/runtime";
@@ -121,8 +120,9 @@ export async function POST(request: Request) {
         },
         provider: providerRuntime.providerName,
         model: providerRuntime.model,
-        maxModelTurns:
-          serverEnv.MAX_AGENT_MODEL_TURNS ?? DEFAULT_MAX_AGENT_MODEL_TURNS,
+        // 默认不设置固定轮次上限。部署方只有显式配置环境变量时才启用
+        // 紧急硬上限，普通长任务交给时间、费用和无进展熔断共同保护。
+        maxModelTurns: serverEnv.MAX_AGENT_MODEL_TURNS ?? null,
         maxFileMutations:
           serverEnv.MAX_AGENT_FILE_MUTATIONS ??
           DEFAULT_AGENT_RUN_ACTIVITY_LIMITS.maxFileMutations,

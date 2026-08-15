@@ -54,6 +54,12 @@ const conversation: ConversationRecord = {
   projectId: "22222222-2222-4222-8222-222222222222",
   ownerId: "owner-1",
   title: "恢复终态",
+  contextCheckpoint: {
+    summary: null,
+    transcriptSeq: 0,
+    version: 0,
+    updatedAt: null,
+  },
   createdAt: new Date("2026-07-30T00:00:00.000Z"),
   updatedAt: new Date("2026-07-30T00:01:00.000Z"),
 };

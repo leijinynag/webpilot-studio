@@ -49,6 +49,7 @@ import type {
   AgentRunRecord,
   AgentRunStatus,
   AgentConversationSnapshot,
+  ContextCheckpoint,
   ConversationRecord,
   FrozenAgentRunProfile,
   ToolInvocationRecord,
@@ -698,6 +699,74 @@ export class AgentStore<TQueryResult extends PgQueryResultHKT> {
       .orderBy(asc(transcriptMessages.seq));
 
     return rows.map(toTranscriptMessage);
+  }
+
+  async getContextCheckpoint(input: {
+    ownerId: string;
+    conversationId: string;
+  }): Promise<ContextCheckpoint> {
+    const [conversation] = await this.db
+      .select({
+        summary: conversations.contextCheckpointSummary,
+        transcriptSeq: conversations.contextCheckpointTranscriptSeq,
+        version: conversations.contextCheckpointVersion,
+        updatedAt: conversations.contextCheckpointUpdatedAt,
+      })
+      .from(conversations)
+      .where(
+        and(
+          eq(conversations.id, input.conversationId),
+          eq(conversations.ownerId, input.ownerId),
+          isNull(conversations.deletedAt),
+        ),
+      );
+
+    if (!conversation) {
+      throw new AgentError(
+        AGENT_ERROR_CODES.runNotFound,
+        "Conversation 不存在或不属于当前匿名工作区。",
+        404,
+      );
+    }
+
+    return conversation;
+  }
+
+  /**
+   * 摘要生成发生在数据库事务之外，避免长时间占用连接和行锁。最终写入使用
+   * version CAS：多个 Run 即使同时基于同一旧版本生成摘要，也只有一个可以
+   * 推进 Checkpoint；失败者必须重新读取最新投影，不能覆盖赢家。
+   */
+  async compareAndSetContextCheckpoint(input: {
+    ownerId: string;
+    conversationId: string;
+    expectedVersion: number;
+    summary: string;
+    transcriptSeq: number;
+    updatedAt?: Date;
+  }): Promise<boolean> {
+    const updatedAt = input.updatedAt ?? new Date();
+    const [updated] = await this.db
+      .update(conversations)
+      .set({
+        contextCheckpointSummary: input.summary,
+        contextCheckpointTranscriptSeq: input.transcriptSeq,
+        contextCheckpointVersion: sql`${conversations.contextCheckpointVersion} + 1`,
+        contextCheckpointUpdatedAt: updatedAt,
+        updatedAt,
+      })
+      .where(
+        and(
+          eq(conversations.id, input.conversationId),
+          eq(conversations.ownerId, input.ownerId),
+          isNull(conversations.deletedAt),
+          eq(conversations.contextCheckpointVersion, input.expectedVersion),
+          lt(conversations.contextCheckpointTranscriptSeq, input.transcriptSeq),
+        ),
+      )
+      .returning({ id: conversations.id });
+
+    return Boolean(updated);
   }
 
   async appendTranscript(
@@ -3022,6 +3091,12 @@ function toConversationRecord(
     projectId: row.projectId,
     ownerId: row.ownerId,
     title: row.title,
+    contextCheckpoint: {
+      summary: row.contextCheckpointSummary,
+      transcriptSeq: row.contextCheckpointTranscriptSeq,
+      version: row.contextCheckpointVersion,
+      updatedAt: row.contextCheckpointUpdatedAt,
+    },
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
   };

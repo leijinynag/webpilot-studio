@@ -47,7 +47,11 @@ export type RepositoryCapability = {
 };
 
 export type AgentRunBudget = {
-  maxModelTurns: number;
+  /**
+   * null 表示没有固定模型轮次上限。长任务仍然受 wall-time、费用、
+   * mutation、无进展熔断、用户取消和执行租约保护。
+   */
+  maxModelTurns: number | null;
   maxWallTimeSeconds: number;
   maxOutputCharacters: number;
   maxToolResultCharacters: number;
@@ -65,9 +69,8 @@ export const DEFAULT_AGENT_RUN_ACTIVITY_LIMITS = {
   maxNoProgressRepeats: 2,
 } as const;
 
-// 空项目需要逐文件生成完整骨架，再依次完成 Preview、Browser Verify 和最终说明。
-// 128 轮可以覆盖较长的编码、验证与修复链路；该值只用于新建 Run 或读取
-// 缺失字段的旧数据，部署侧仍可通过 MAX_AGENT_MODEL_TURNS 收紧预算。
+// 128 曾经是系统默认轮次上限。读取历史 JSONB 时需要识别这个旧默认并
+// 归一化为无限；其他正整数仍被视为用户或部署显式冻结的安全上限。
 export const DEFAULT_MAX_AGENT_MODEL_TURNS = 128;
 export const DEFAULT_MAX_AGENT_WALL_TIME_SECONDS = 1_800;
 
@@ -75,6 +78,12 @@ export type AgentRunUsage = {
   modelTurns: number;
   inputTokens: number;
   outputTokens: number;
+  /**
+   * 供应商可能返回 finish_reason=tool_calls，却没有任何 tool_call_delta。
+   * 该计数必须持久化，避免 Serverless 实例重启或执行租约接管后从零开始，
+   * 让无限轮次 Run 在无有效输出时永久空转。
+   */
+  consecutiveEmptyToolCallTurns: number;
   fileMutations: number;
   clientResumes: number;
   repairRounds: number;
@@ -93,6 +102,7 @@ export const EMPTY_AGENT_RUN_USAGE: AgentRunUsage = {
   modelTurns: 0,
   inputTokens: 0,
   outputTokens: 0,
+  consecutiveEmptyToolCallTurns: 0,
   fileMutations: 0,
   clientResumes: 0,
   repairRounds: 0,
@@ -115,10 +125,7 @@ export function normalizeAgentRunBudget(
   value: Record<string, unknown>,
 ): AgentRunBudget {
   return {
-    maxModelTurns: positiveInteger(
-      value.maxModelTurns,
-      DEFAULT_MAX_AGENT_MODEL_TURNS,
-    ),
+    maxModelTurns: normalizeMaxModelTurns(value.maxModelTurns),
     maxWallTimeSeconds: positiveInteger(
       value.maxWallTimeSeconds,
       DEFAULT_MAX_AGENT_WALL_TIME_SECONDS,
@@ -143,6 +150,23 @@ export function normalizeAgentRunBudget(
   };
 }
 
+function normalizeMaxModelTurns(value: unknown): number | null {
+  if (value === null || value === undefined) {
+    return null;
+  }
+
+  if (
+    typeof value === "number" &&
+    Number.isInteger(value) &&
+    value > 0 &&
+    value !== DEFAULT_MAX_AGENT_MODEL_TURNS
+  ) {
+    return value;
+  }
+
+  return null;
+}
+
 export function normalizeAgentRunUsage(
   value: Record<string, unknown>,
 ): AgentRunUsage {
@@ -150,6 +174,9 @@ export function normalizeAgentRunUsage(
     modelTurns: nonnegativeInteger(value.modelTurns),
     inputTokens: nonnegativeInteger(value.inputTokens),
     outputTokens: nonnegativeInteger(value.outputTokens),
+    consecutiveEmptyToolCallTurns: nonnegativeInteger(
+      value.consecutiveEmptyToolCallTurns,
+    ),
     fileMutations: nonnegativeInteger(value.fileMutations),
     clientResumes: nonnegativeInteger(value.clientResumes),
     repairRounds: nonnegativeInteger(value.repairRounds),
@@ -376,8 +403,20 @@ export type ConversationRecord = {
   projectId: string;
   ownerId: string;
   title: string;
+  contextCheckpoint: ContextCheckpoint;
   createdAt: Date;
   updatedAt: Date;
+};
+
+/**
+ * Checkpoint 是发给模型的上下文投影，不是 Transcript 的替代品。
+ * transcriptSeq 表示 summary 已覆盖到的最后一条审计消息；原始消息永久保留。
+ */
+export type ContextCheckpoint = {
+  summary: string | null;
+  transcriptSeq: number;
+  version: number;
+  updatedAt: Date | null;
 };
 
 export type AgentConversationSnapshot = {

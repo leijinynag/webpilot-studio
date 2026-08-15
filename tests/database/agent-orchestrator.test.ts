@@ -75,7 +75,7 @@ class LeaseTakeoverProvider implements LlmProvider {
 
 async function createFixture(
   options: {
-    maxModelTurns?: number;
+    maxModelTurns?: number | null;
     promptDigest?: string;
     budget?: Partial<AgentRunBudget>;
     profileVersion?: "m3" | "m4";
@@ -131,7 +131,10 @@ async function createFixture(
     },
     provider: "deepseek",
     model: "deepseek-v4-pro",
-    maxModelTurns: options.maxModelTurns ?? 6,
+    // 测试默认仍保留 6 轮，便于快速发现意外循环；但显式传入 null 时必须
+    // 原样冻结为无限轮次，不能被空值合并运算符悄悄替换掉。
+    maxModelTurns:
+      "maxModelTurns" in options ? (options.maxModelTurns ?? null) : 6,
     maxWallTimeSeconds: 300,
   });
   const frozenProfile =
@@ -681,17 +684,22 @@ describe("AgentOrchestrator", () => {
 
       expect(snapshot.runs.at(-1)).toMatchObject({
         status: "awaiting_client_tool",
-        usage: { modelTurns: 3 },
+        usage: {
+          modelTurns: 3,
+          consecutiveEmptyToolCallTurns: 0,
+        },
       });
       expect(
         snapshot.events.filter((event) => event.type === "model.turn_retried"),
       ).toEqual([
         expect.objectContaining({
-          payload: {
+          payload: expect.objectContaining({
             reason: "empty_tool_calls",
             discardedCharacterCount: 9,
             consumedModelTurns: 1,
-          },
+            consecutiveEmptyToolCallTurns: 1,
+            maxNoProgressRepeats: 2,
+          }),
         }),
       ]);
       expect(
@@ -706,6 +714,68 @@ describe("AgentOrchestrator", () => {
         role: "tool",
         toolCallId: "call-list-after-retry",
       });
+    } finally {
+      await fixture.testDatabase.close();
+    }
+  });
+
+  it("无限轮次下连续空 Tool Call 会被持久化无进展熔断", async () => {
+    const fixture = await createFixture({
+      maxModelTurns: null,
+      budget: { maxNoProgressRepeats: 2 },
+    });
+    const provider = new ScriptedProvider([
+      [
+        { type: "text_delta", text: "第一次缺帧。" },
+        { type: "finish", reason: "tool_calls" },
+      ],
+      [
+        { type: "text_delta", text: "第二次缺帧。" },
+        { type: "finish", reason: "tool_calls" },
+      ],
+    ]);
+
+    try {
+      await new AgentOrchestrator(
+        fixture.store,
+        provider,
+        fixture.fileTools,
+      ).run({
+        ownerId: fixture.run.ownerId,
+        runId: fixture.run.id,
+      });
+
+      const snapshot = await fixture.store.getConversationSnapshot({
+        ownerId: fixture.run.ownerId,
+        conversationId: fixture.run.conversationId,
+      });
+
+      expect(snapshot.runs.at(-1)).toMatchObject({
+        status: "budget_exhausted",
+        errorCode: AGENT_ERROR_CODES.noProgress,
+        usage: {
+          modelTurns: 2,
+          consecutiveEmptyToolCallTurns: 2,
+        },
+      });
+      expect(
+        snapshot.events.filter((event) => event.type === "model.turn_retried"),
+      ).toHaveLength(2);
+      expect(snapshot.events).toContainEqual(
+        expect.objectContaining({
+          type: "run.no_progress",
+          payload: expect.objectContaining({
+            reason: "consecutive_empty_tool_calls",
+            consecutiveEmptyToolCallTurns: 2,
+            maxNoProgressRepeats: 2,
+          }),
+        }),
+      );
+      expect(
+        snapshot.transcript.filter(
+          (message) => message.kind === "assistant_message",
+        ),
+      ).toEqual([]);
     } finally {
       await fixture.testDatabase.close();
     }
@@ -1868,8 +1938,95 @@ describe("AgentOrchestrator", () => {
     }
   });
 
+  it("无限轮次 Run 从持久化的第 128 轮恢复后仍可执行下一轮", async () => {
+    const fixture = await createFixture({ maxModelTurns: null });
+    const provider = new ScriptedProvider([
+      [
+        {
+          type: "tool_call_delta",
+          index: 0,
+          toolCallId: "call-browser-after-legacy-limit",
+          toolName: "browser_verify",
+          argumentsDelta: JSON.stringify({
+            revision: 1,
+            steps: [
+              {
+                action: "assert_text",
+                text: "旧标题",
+                target: { strategy: "css", selector: "h1" },
+              },
+            ],
+          }),
+        },
+        { type: "finish", reason: "tool_calls" },
+      ],
+    ]);
+
+    try {
+      await fixture.store.updateRunProgress({
+        ownerId: fixture.run.ownerId,
+        runId: fixture.run.id,
+        usage: {
+          ...fixture.run.usage,
+          modelTurns: 128,
+        },
+      });
+
+      await new AgentOrchestrator(
+        fixture.store,
+        provider,
+        fixture.fileTools,
+      ).run({
+        ownerId: fixture.run.ownerId,
+        runId: fixture.run.id,
+      });
+
+      await expect(
+        fixture.store.getRun({
+          ownerId: fixture.run.ownerId,
+          runId: fixture.run.id,
+        }),
+      ).resolves.toMatchObject({
+        status: "awaiting_client_tool",
+        budget: { maxModelTurns: null },
+        usage: { modelTurns: 129 },
+      });
+      expect(provider.inputs).toHaveLength(1);
+    } finally {
+      await fixture.testDatabase.close();
+    }
+  });
+
+  it("数据库读取时将历史默认 128 轮归一化为无限", async () => {
+    const fixture = await createFixture({ maxModelTurns: 12 });
+
+    try {
+      await fixture.testDatabase.database
+        .update(agentRuns)
+        .set({
+          budget: {
+            ...fixture.run.budget,
+            maxModelTurns: 128,
+          },
+        })
+        .where(eq(agentRuns.id, fixture.run.id));
+
+      await expect(
+        fixture.store.getRun({
+          ownerId: fixture.run.ownerId,
+          runId: fixture.run.id,
+        }),
+      ).resolves.toMatchObject({
+        budget: { maxModelTurns: null },
+      });
+    } finally {
+      await fixture.testDatabase.close();
+    }
+  });
+
   it("预算耗尽后复用同一 Conversation 可以创建新 Run 并继续执行", async () => {
     const fixture = await createFixture({ maxModelTurns: 1 });
+    const oldExecutionController = new AbortController();
     const firstProvider = new ScriptedProvider([
       [
         {
@@ -1891,6 +2048,7 @@ describe("AgentOrchestrator", () => {
       ).run({
         ownerId: fixture.run.ownerId,
         runId: fixture.run.id,
+        signal: oldExecutionController.signal,
       });
 
       const exhaustedRun = await fixture.store.getRun({
@@ -1901,6 +2059,7 @@ describe("AgentOrchestrator", () => {
         status: "budget_exhausted",
         usage: { modelTurns: 1 },
       });
+      oldExecutionController.abort();
 
       const continuationRun = await fixture.store.createRun({
         ownerId: fixture.run.ownerId,
@@ -1941,7 +2100,10 @@ describe("AgentOrchestrator", () => {
       expect(snapshot.runs[1]).toMatchObject({
         id: continuationRun.id,
         status: "succeeded",
-        usage: { modelTurns: 1 },
+        usage: {
+          modelTurns: 1,
+          consecutiveEmptyToolCallTurns: 0,
+        },
       });
       expect(continuationProvider.inputs[0]?.messages.at(-1)).toMatchObject({
         role: "user",

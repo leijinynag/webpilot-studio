@@ -13,7 +13,10 @@ import { ImageToolExecutor } from "@/domains/agent/image-tools";
 import { AssetToolExecutor } from "@/domains/image/asset-tool";
 import { VisionToolExecutor } from "@/domains/agent/vision-tools";
 import { withAgentRunController } from "@/infrastructure/agent/run-controller";
-import { getAgentProviderRuntime } from "@/infrastructure/agent/provider-factory";
+import {
+  getAgentProviderRuntime,
+  getContextSummaryProviderRuntime,
+} from "@/infrastructure/agent/provider-factory";
 import { getImageProviderRuntime } from "@/infrastructure/image/image-provider-factory";
 import { getVisionProviderRuntime } from "@/infrastructure/image/vision-provider-factory";
 import { getAgentPersistence } from "@/infrastructure/http/agent-api";
@@ -25,7 +28,10 @@ import {
   getQuotaIpSubjectKey,
   releaseQuotaReservation,
   recordModelUsage,
+  recordContextCheckpointUsage,
+  reserveContextCheckpointUsageBudget,
   reserveModelUsageBudget,
+  settleContextCheckpointUsageBudget,
   settleModelUsageBudget,
 } from "@/infrastructure/quota/service";
 
@@ -60,6 +66,22 @@ export async function launchAgentRun(input: {
     // Run 创建时已经冻结了模型。恢复执行必须沿用这个模型，
     // 否则用户选择 gpt-5.5 后，后台重启会悄悄退回 DeepSeek。
     const { provider } = getAgentProviderRuntime(currentRun.model);
+    let checkpointRuntime:
+      ReturnType<typeof getContextSummaryProviderRuntime> | undefined;
+    try {
+      checkpointRuntime = getContextSummaryProviderRuntime();
+    } catch (error) {
+      // ContextCheckpoint 是长对话优化层，不是普通 Agent 的启动前提。
+      // 摘要模型配置错误时关闭本次 Run 的压缩能力，主循环仍使用原始
+      // Transcript 的 96k 安全裁剪继续执行，并把原因留在服务端日志。
+      console.error(
+        "[agent-runtime] context checkpoint runtime unavailable",
+        JSON.stringify({
+          runId: currentRun.id,
+          ...serializeAgentError(error),
+        }),
+      );
+    }
     let visionTools: VisionToolExecutor | undefined;
     let attachmentContextResolver:
       ReturnType<typeof createAttachmentContextResolver> | undefined;
@@ -121,6 +143,16 @@ export async function launchAgentRun(input: {
       recordModelUsage,
       reserveModelUsageBudget,
       settleModelUsageBudget,
+      checkpointRuntime
+        ? {
+            ...checkpointRuntime,
+            usage: {
+              record: recordContextCheckpointUsage,
+              reserve: reserveContextCheckpointUsageBudget,
+              settle: settleContextCheckpointUsageBudget,
+            },
+          }
+        : undefined,
     );
 
     await withAgentRunController(input.runId, (signal) =>

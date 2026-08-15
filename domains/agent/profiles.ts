@@ -357,7 +357,7 @@ export function createFrozenAgentProfile(input: {
   repositoryCapability: RepositoryCapability;
   provider: string;
   model: string;
-  maxModelTurns: number;
+  maxModelTurns: number | null;
   maxFileMutations?: number;
   maxWallTimeSeconds: number;
 }): FrozenAgentRunProfile {

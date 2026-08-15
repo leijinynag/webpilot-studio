@@ -1,6 +1,6 @@
 import "server-only";
 
-import { createHmac } from "node:crypto";
+import { createHmac, randomUUID } from "node:crypto";
 
 import { and, eq, gt, inArray, lte, sql } from "drizzle-orm";
 
@@ -29,6 +29,9 @@ import {
 export type QuotaResource =
   "agent_run" | "image_generation" | "attachment_upload";
 
+export type UsageResource =
+  QuotaResource | "context_checkpoint" | "code_completion";
+
 type QuotaSubjectType = "ip" | "owner" | "global";
 
 export type QuotaReservation = {
@@ -49,6 +52,19 @@ export type UsageBudgetReservation = {
   idempotencyKey: string;
   bucketDate: string;
   reservedCostUsd: string;
+  /**
+   * acquired 表示本次调用是否真正取得 Provider 调用资格。普通模型与生图
+   * reservation 始终为 true；ContextCheckpoint 会用短租约 Claim 防止同一
+   * Conversation 边界在多个 Run 中重复调用摘要模型。
+   */
+  acquired: boolean;
+  claimId?: string;
+  claimExpiresAt?: string;
+  /**
+   * 同一幂等键已经完成结算时，调用方不得再次发起真实 Provider 请求。
+   * 该标记和 reservedCostUsd 分离，避免用金额字符串猜测账本状态。
+   */
+  alreadySettled: boolean;
 };
 
 /**
@@ -98,6 +114,12 @@ const DEFAULT_POLICIES: Record<QuotaResource, QuotaPolicy> = {
 // 一个合法的占位值来满足数据库约束，不能写入 Number.MAX_SAFE_INTEGER。
 const POSTGRES_INTEGER_MAX = 2_147_483_647;
 const USD_SCALE = 1_000_000;
+const CONTEXT_CHECKPOINT_CLAIM_TTL_MS = 10 * 60 * 1_000;
+
+type UsageExclusiveClaim = {
+  claimId: string;
+  claimExpiresAt: string;
+};
 
 /**
  * 额度和并发保护先使用 PostgreSQL 事实层。
@@ -799,6 +821,158 @@ export async function settleModelUsageBudget(input: {
   });
 }
 
+export async function reserveContextCheckpointUsageBudget(input: {
+  ownerId: string;
+  agentRunId: string;
+  conversationId: string;
+  checkpointVersion: number;
+  transcriptSeq: number;
+  provider: string;
+  model: string;
+  estimatedInputTokens: number;
+  maxOutputTokens: number;
+}): Promise<UsageBudgetReservation | null> {
+  if (getGlobalDailyBudgetLimitMicros() === null) {
+    // 即使未启用费用预算，也要在 Provider 调用前占用幂等键。否则同一 Run
+    // 对同一 Checkpoint 源版本失败后再次进入主循环，会产生无法区分的重复
+    // 摘要调用，而事后 onConflictDoNothing 只能隐藏第二次调用，不能阻止它。
+    return reserveContextCheckpointUsageWithoutGlobalBudget(input);
+  }
+
+  const pricing = requireTokenPricing(getModelPricingKind(input.provider));
+  const reservedInputTokens = Math.max(
+    1,
+    Math.ceil(input.estimatedInputTokens),
+  );
+  const reservedOutputTokens = Math.max(1, Math.ceil(input.maxOutputTokens));
+
+  return reserveUsageBudget({
+    ownerId: input.ownerId,
+    resource: "context_checkpoint",
+    agentRunId: input.agentRunId,
+    provider: input.provider,
+    model: input.model,
+    // Checkpoint 属于 Conversation，而不是某一条 Run。同一摘要边界只能有
+    // 一个调用者取得 Claim，其他并发 Run 复用赢家结果，避免重复调用和计费。
+    idempotencyKey: `context-checkpoint:${input.conversationId}:${input.checkpointVersion}:${input.transcriptSeq}`,
+    reservedInputTokens,
+    reservedOutputTokens,
+    reservedCostMicros: estimateTokenCostMicros({
+      inputTokens: reservedInputTokens,
+      outputTokens: reservedOutputTokens,
+      inputCostPerMillionUsd: pricing.inputCostPerMillionUsd,
+      outputCostPerMillionUsd: pricing.outputCostPerMillionUsd,
+    }),
+    metadata: {
+      conversationId: input.conversationId,
+      checkpointVersion: input.checkpointVersion,
+      transcriptSeq: input.transcriptSeq,
+      costEstimation: "configured_token_price",
+    },
+    exclusiveClaimTtlMilliseconds: CONTEXT_CHECKPOINT_CLAIM_TTL_MS,
+  });
+}
+
+export async function settleContextCheckpointUsageBudget(input: {
+  reservation: UsageBudgetReservation | null;
+  provider: string;
+  inputTokens: number;
+  outputTokens: number;
+  providerRequestStarted: boolean;
+  usageObserved: boolean;
+  latencyMs: number;
+}): Promise<void> {
+  if (!input.reservation) {
+    return;
+  }
+  const reservation = input.reservation;
+  if (reservation.alreadySettled || !reservation.acquired) {
+    return;
+  }
+  if (getGlobalDailyBudgetLimitMicros() === null) {
+    await settleContextCheckpointUsageWithoutGlobalBudget({
+      ...input,
+      reservation,
+    });
+    return;
+  }
+  if (!input.providerRequestStarted) {
+    await releaseUsageBudget(reservation);
+    return;
+  }
+
+  const pricing = requireTokenPricing(getModelPricingKind(input.provider));
+  await settleUsageBudget({
+    reservation,
+    inputTokens: input.inputTokens,
+    outputTokens: input.outputTokens,
+    actualCostMicros: input.usageObserved
+      ? estimateTokenCostMicros({
+          inputTokens: input.inputTokens,
+          outputTokens: input.outputTokens,
+          inputCostPerMillionUsd: pricing.inputCostPerMillionUsd,
+          outputCostPerMillionUsd: pricing.outputCostPerMillionUsd,
+        })
+      : undefined,
+    metadata: {
+      usageObserved: input.usageObserved,
+      latencyMs: input.latencyMs,
+      costEstimation: input.usageObserved
+        ? "configured_token_price"
+        : "reserved_upper_bound",
+    },
+  });
+}
+
+async function settleContextCheckpointUsageWithoutGlobalBudget(input: {
+  reservation: UsageBudgetReservation;
+  inputTokens: number;
+  outputTokens: number;
+  providerRequestStarted: boolean;
+  usageObserved: boolean;
+  latencyMs: number;
+}): Promise<void> {
+  const db = getDatabase();
+  const [ledger] = await db
+    .select()
+    .from(usageLedger)
+    .where(eq(usageLedger.idempotencyKey, input.reservation.idempotencyKey))
+    .limit(1);
+  if (
+    !ledger ||
+    ledger.status !== "reserved" ||
+    !reservationOwnsUsageClaim(input.reservation, ledger.metadata)
+  ) {
+    return;
+  }
+
+  const now = new Date();
+  await db
+    .update(usageLedger)
+    .set({
+      status: input.providerRequestStarted ? "settled" : "released",
+      inputTokens: Math.max(0, Math.floor(input.inputTokens)),
+      outputTokens: Math.max(0, Math.floor(input.outputTokens)),
+      metadata: {
+        ...ledger.metadata,
+        usageObserved: input.usageObserved,
+        latencyMs: input.latencyMs,
+        costEstimation: input.providerRequestStarted
+          ? "pending_price_table"
+          : "released_before_provider_request",
+      },
+      settledAt: input.providerRequestStarted ? now : null,
+      updatedAt: now,
+    })
+    .where(
+      and(
+        eq(usageLedger.idempotencyKey, input.reservation.idempotencyKey),
+        eq(usageLedger.status, "reserved"),
+        usageClaimCondition(input.reservation.claimId),
+      ),
+    );
+}
+
 export async function reserveImageUsageBudget(input: {
   ownerId: string;
   imageRunId: string;
@@ -908,7 +1082,7 @@ export async function assertGlobalBudgetAvailable(): Promise<void> {
  */
 async function reserveUsageBudget(input: {
   ownerId: string;
-  resource: QuotaResource;
+  resource: UsageResource;
   agentRunId?: string;
   imageRunId?: string;
   provider: string;
@@ -918,6 +1092,11 @@ async function reserveUsageBudget(input: {
   reservedOutputTokens: number;
   reservedCostMicros: number;
   metadata: Record<string, unknown>;
+  /**
+   * 仅需要“一个幂等边界最多一次真实 Provider 调用”的资源传入。
+   * 普通模型轮次和生图已有自己的执行租约，不在这里叠加独占语义。
+   */
+  exclusiveClaimTtlMilliseconds?: number;
 }): Promise<UsageBudgetReservation> {
   const limitMicros = getGlobalDailyBudgetLimitMicros();
   if (limitMicros === null) {
@@ -930,8 +1109,18 @@ async function reserveUsageBudget(input: {
 
   const bucketDate = getUtcDateKey();
   const requestedCostMicros = Math.max(0, Math.ceil(input.reservedCostMicros));
+  const requestedClaim = input.exclusiveClaimTtlMilliseconds
+    ? createUsageExclusiveClaim(input.exclusiveClaimTtlMilliseconds)
+    : null;
 
   return runDatabaseTransaction(async (tx) => {
+    // “记录尚不存在”时 SELECT FOR UPDATE 无法锁住任何行。这里先按幂等键
+    // 获取事务级 advisory lock，使首个 insert 也具备串行化语义；锁只影响
+    // 相同调用边界，不会把不同模型请求压到一把全局锁上。
+    await tx.execute(
+      sql`select pg_advisory_xact_lock(hashtext(${input.idempotencyKey}))`,
+    );
+
     const [existing] = await tx
       .select({
         idempotencyKey: usageLedger.idempotencyKey,
@@ -944,11 +1133,105 @@ async function reserveUsageBudget(input: {
       .for("update");
 
     if (existing) {
-      if (existing.status !== "reserved") {
+      if (existing.status === "settled") {
         return {
           idempotencyKey: existing.idempotencyKey,
           bucketDate,
           reservedCostUsd: "0",
+          acquired: false,
+          alreadySettled: true,
+        };
+      }
+
+      if (existing.status === "released") {
+        // released 表示上一次执行尚未进入 Provider。恢复时允许重新占用同一
+        // 幂等行，但必须重新经过预算桶检查，不能把已释放金额直接复活。
+        const existingBucketDate =
+          typeof existing.metadata.bucketDate === "string"
+            ? existing.metadata.bucketDate
+            : bucketDate;
+        await tx
+          .insert(dailyBudgetBuckets)
+          .values({
+            bucketDate: existingBucketDate,
+            limitUsd: microsToUsdString(limitMicros),
+            reservedUsd: "0",
+            consumedUsd: "0",
+          })
+          .onConflictDoNothing({
+            target: dailyBudgetBuckets.bucketDate,
+          });
+        const [bucket] = await tx
+          .select()
+          .from(dailyBudgetBuckets)
+          .where(eq(dailyBudgetBuckets.bucketDate, existingBucketDate))
+          .for("update");
+        if (!bucket) {
+          throw new QuotaError(
+            QUOTA_ERROR_CODES.storageUnavailable,
+            "全局预算存储暂不可用，请稍后重试。",
+            503,
+          );
+        }
+
+        const reservedMicros = usdStringToMicros(bucket.reservedUsd);
+        const consumedMicros = usdStringToMicros(bucket.consumedUsd);
+        const usedMicros = reservedMicros + consumedMicros;
+        if (usedMicros + requestedCostMicros > limitMicros) {
+          throw createGlobalBudgetError({
+            bucketDate: existingBucketDate,
+            limitMicros,
+            usedMicros,
+            requestedMicros: requestedCostMicros,
+          });
+        }
+
+        const reservationMetadata = {
+          ...input.metadata,
+          bucketDate: existingBucketDate,
+          reservedCostUsd: microsToUsdString(requestedCostMicros),
+          ...(requestedClaim ?? {}),
+        };
+        const now = new Date();
+        await tx
+          .update(usageLedger)
+          .set({
+            status: "reserved",
+            provider: input.provider,
+            model: input.model,
+            reservedInputTokens: Math.max(
+              0,
+              Math.floor(input.reservedInputTokens),
+            ),
+            reservedOutputTokens: Math.max(
+              0,
+              Math.floor(input.reservedOutputTokens),
+            ),
+            inputTokens: 0,
+            outputTokens: 0,
+            estimatedCostUsd: microsToUsdString(requestedCostMicros),
+            metadata: reservationMetadata,
+            settledAt: null,
+            updatedAt: now,
+          })
+          .where(eq(usageLedger.idempotencyKey, input.idempotencyKey));
+        await tx
+          .update(dailyBudgetBuckets)
+          .set({
+            reservedUsd: microsToUsdString(
+              reservedMicros + requestedCostMicros,
+            ),
+            updatedAt: now,
+          })
+          .where(eq(dailyBudgetBuckets.id, bucket.id));
+
+        return {
+          idempotencyKey: existing.idempotencyKey,
+          bucketDate: existingBucketDate,
+          reservedCostUsd: microsToUsdString(requestedCostMicros),
+          acquired: true,
+          ...(requestedClaim ?? {}),
+          alreadySettled: false,
         };
       }
 
@@ -956,10 +1239,54 @@ async function reserveUsageBudget(input: {
         typeof existing.metadata.bucketDate === "string"
           ? existing.metadata.bucketDate
           : bucketDate;
+
+      if (requestedClaim) {
+        const existingClaim = readUsageExclusiveClaim(existing.metadata);
+        if (isUsageExclusiveClaimActive(existingClaim)) {
+          return {
+            idempotencyKey: existing.idempotencyKey,
+            bucketDate: existingBucketDate,
+            reservedCostUsd: existing.estimatedCostUsd,
+            acquired: false,
+            alreadySettled: false,
+          };
+        }
+
+        // 事务已经用 FOR UPDATE 锁住幂等账本行。旧 Claim 过期后，只有当前
+        // 事务可以写入新 Claim；后续竞争者读取时会看到新的有效租约并退出。
+        await tx
+          .update(usageLedger)
+          .set({
+            agentRunId: input.agentRunId,
+            provider: input.provider,
+            model: input.model,
+            metadata: {
+              ...existing.metadata,
+              ...input.metadata,
+              bucketDate: existingBucketDate,
+              reservedCostUsd: existing.estimatedCostUsd,
+              ...requestedClaim,
+            },
+            updatedAt: new Date(),
+          })
+          .where(eq(usageLedger.idempotencyKey, input.idempotencyKey));
+
+        return {
+          idempotencyKey: existing.idempotencyKey,
+          bucketDate: existingBucketDate,
+          reservedCostUsd: existing.estimatedCostUsd,
+          acquired: true,
+          ...requestedClaim,
+          alreadySettled: false,
+        };
+      }
+
       return {
         idempotencyKey: existing.idempotencyKey,
         bucketDate: existingBucketDate,
         reservedCostUsd: existing.estimatedCostUsd,
+        acquired: true,
+        alreadySettled: false,
       };
     }
 
@@ -1005,6 +1332,7 @@ async function reserveUsageBudget(input: {
       ...input.metadata,
       bucketDate,
       reservedCostUsd: microsToUsdString(requestedCostMicros),
+      ...(requestedClaim ?? {}),
     };
     await tx.insert(usageLedger).values({
       ownerId: input.ownerId,
@@ -1032,8 +1360,183 @@ async function reserveUsageBudget(input: {
       idempotencyKey: input.idempotencyKey,
       bucketDate,
       reservedCostUsd: microsToUsdString(requestedCostMicros),
+      acquired: true,
+      ...(requestedClaim ?? {}),
+      alreadySettled: false,
     };
   });
+}
+
+/**
+ * 未启用费用预算时仍先写一条零金额 reserved 账本，作为 Checkpoint 调用的
+ * 幂等声明。这里只服务摘要调用，普通模型与图片继续沿用原有兼容记录路径。
+ */
+async function reserveContextCheckpointUsageWithoutGlobalBudget(input: {
+  ownerId: string;
+  agentRunId: string;
+  conversationId: string;
+  checkpointVersion: number;
+  transcriptSeq: number;
+  provider: string;
+  model: string;
+  estimatedInputTokens: number;
+  maxOutputTokens: number;
+}): Promise<UsageBudgetReservation> {
+  const idempotencyKey = `context-checkpoint:${input.conversationId}:${input.checkpointVersion}:${input.transcriptSeq}`;
+  const bucketDate = getUtcDateKey();
+  const db = getDatabase();
+  const requestedClaim = createUsageExclusiveClaim(
+    CONTEXT_CHECKPOINT_CLAIM_TTL_MS,
+  );
+  const metadata = {
+    conversationId: input.conversationId,
+    checkpointVersion: input.checkpointVersion,
+    transcriptSeq: input.transcriptSeq,
+    bucketDate,
+    costEstimation: "pending_price_table",
+    ...requestedClaim,
+  };
+
+  const [created] = await db
+    .insert(usageLedger)
+    .values({
+      ownerId: input.ownerId,
+      resource: "context_checkpoint",
+      agentRunId: input.agentRunId,
+      provider: input.provider,
+      model: input.model,
+      status: "reserved",
+      idempotencyKey,
+      reservedInputTokens: Math.max(1, Math.ceil(input.estimatedInputTokens)),
+      reservedOutputTokens: Math.max(1, Math.ceil(input.maxOutputTokens)),
+      estimatedCostUsd: "0",
+      metadata,
+    })
+    .onConflictDoNothing({ target: usageLedger.idempotencyKey })
+    .returning({ id: usageLedger.id });
+
+  if (created) {
+    return {
+      idempotencyKey,
+      bucketDate,
+      reservedCostUsd: "0",
+      acquired: true,
+      ...requestedClaim,
+      alreadySettled: false,
+    };
+  }
+
+  const [existing] = await db
+    .select({
+      status: usageLedger.status,
+      metadata: usageLedger.metadata,
+    })
+    .from(usageLedger)
+    .where(eq(usageLedger.idempotencyKey, idempotencyKey))
+    .limit(1);
+  if (!existing) {
+    throw new QuotaError(
+      QUOTA_ERROR_CODES.storageUnavailable,
+      "Checkpoint 用量账本暂不可用，请稍后重试。",
+      503,
+    );
+  }
+
+  const existingBucketDate =
+    typeof existing.metadata.bucketDate === "string"
+      ? existing.metadata.bucketDate
+      : bucketDate;
+  if (existing.status === "released") {
+    const [reacquired] = await db
+      .update(usageLedger)
+      .set({
+        status: "reserved",
+        agentRunId: input.agentRunId,
+        provider: input.provider,
+        model: input.model,
+        reservedInputTokens: Math.max(1, Math.ceil(input.estimatedInputTokens)),
+        reservedOutputTokens: Math.max(1, Math.ceil(input.maxOutputTokens)),
+        inputTokens: 0,
+        outputTokens: 0,
+        metadata: {
+          ...metadata,
+          bucketDate: existingBucketDate,
+        },
+        settledAt: null,
+        updatedAt: new Date(),
+      })
+      .where(
+        and(
+          eq(usageLedger.idempotencyKey, idempotencyKey),
+          eq(usageLedger.status, "released"),
+        ),
+      )
+      .returning({ id: usageLedger.id });
+
+    return {
+      idempotencyKey,
+      bucketDate: existingBucketDate,
+      reservedCostUsd: "0",
+      acquired: Boolean(reacquired),
+      ...(reacquired ? requestedClaim : {}),
+      alreadySettled: false,
+    };
+  }
+
+  if (existing.status === "settled") {
+    return {
+      idempotencyKey,
+      bucketDate: existingBucketDate,
+      reservedCostUsd: "0",
+      acquired: false,
+      alreadySettled: true,
+    };
+  }
+
+  const existingClaim = readUsageExclusiveClaim(existing.metadata);
+  if (isUsageExclusiveClaimActive(existingClaim)) {
+    return {
+      idempotencyKey,
+      bucketDate: existingBucketDate,
+      reservedCostUsd: "0",
+      acquired: false,
+      alreadySettled: false,
+    };
+  }
+
+  // 预算关闭时没有预算桶事务可复用，因此使用“旧 Claim 值 + returning”
+  // 完成数据库级 CAS。两个请求即使同时读到过期 Claim，也只有一个更新成功。
+  const [reclaimed] = await db
+    .update(usageLedger)
+    .set({
+      agentRunId: input.agentRunId,
+      provider: input.provider,
+      model: input.model,
+      reservedInputTokens: Math.max(1, Math.ceil(input.estimatedInputTokens)),
+      reservedOutputTokens: Math.max(1, Math.ceil(input.maxOutputTokens)),
+      metadata: {
+        ...metadata,
+        bucketDate: existingBucketDate,
+      },
+      updatedAt: new Date(),
+    })
+    .where(
+      and(
+        eq(usageLedger.idempotencyKey, idempotencyKey),
+        eq(usageLedger.status, "reserved"),
+        usageClaimCondition(existingClaim?.claimId),
+      ),
+    )
+    .returning({ id: usageLedger.id });
+
+  return {
+    idempotencyKey,
+    bucketDate: existingBucketDate,
+    reservedCostUsd: "0",
+    acquired: Boolean(reclaimed),
+    ...(reclaimed ? requestedClaim : {}),
+    alreadySettled: false,
+  };
 }
 
 /**
@@ -1055,6 +1558,9 @@ async function settleUsageBudget(input: {
       .for("update");
 
     if (!ledger || ledger.status !== "reserved") {
+      return;
+    }
+    if (!reservationOwnsUsageClaim(input.reservation, ledger.metadata)) {
       return;
     }
 
@@ -1130,6 +1636,9 @@ async function releaseUsageBudget(
     if (!ledger || ledger.status !== "reserved") {
       return;
     }
+    if (!reservationOwnsUsageClaim(reservation, ledger.metadata)) {
+      return;
+    }
 
     const bucketDate =
       typeof ledger.metadata.bucketDate === "string"
@@ -1201,6 +1710,37 @@ export async function recordModelUsage(input: {
   });
 }
 
+export async function recordContextCheckpointUsage(input: {
+  ownerId: string;
+  agentRunId: string;
+  conversationId: string;
+  checkpointVersion: number;
+  transcriptSeq: number;
+  provider: string;
+  model: string;
+  inputTokens: number;
+  outputTokens: number;
+  latencyMs: number;
+}): Promise<void> {
+  await recordUsageWithoutGlobalBudget({
+    ownerId: input.ownerId,
+    resource: "context_checkpoint",
+    agentRunId: input.agentRunId,
+    provider: input.provider,
+    model: input.model,
+    idempotencyKey: `context-checkpoint:${input.conversationId}:${input.checkpointVersion}:${input.transcriptSeq}`,
+    inputTokens: input.inputTokens,
+    outputTokens: input.outputTokens,
+    metadata: {
+      conversationId: input.conversationId,
+      checkpointVersion: input.checkpointVersion,
+      transcriptSeq: input.transcriptSeq,
+      latencyMs: input.latencyMs,
+      costEstimation: "pending_price_table",
+    },
+  });
+}
+
 export async function recordImageUsage(input: {
   ownerId: string;
   imageRunId: string;
@@ -1232,7 +1772,7 @@ export async function recordImageUsage(input: {
 
 async function recordUsageWithoutGlobalBudget(input: {
   ownerId: string;
-  resource: QuotaResource;
+  resource: UsageResource;
   agentRunId?: string;
   imageRunId?: string;
   provider: string;
@@ -1261,6 +1801,76 @@ async function recordUsageWithoutGlobalBudget(input: {
       settledAt: input.status === "released" ? null : new Date(),
     })
     .onConflictDoNothing({ target: usageLedger.idempotencyKey });
+}
+
+/**
+ * 为需要独占 Provider 调用权的 Usage reservation 创建短租约。
+ *
+ * Claim 只解决并发重复调用，不替代 Agent Run 执行租约。到期后允许其他实例
+ * 接管，避免 Serverless 实例在 Provider 调用前崩溃时永久卡死摘要边界。
+ */
+function createUsageExclusiveClaim(
+  ttlMilliseconds: number,
+): UsageExclusiveClaim {
+  const now = Date.now();
+  return {
+    claimId: randomUUID(),
+    claimExpiresAt: new Date(
+      now + Math.max(1, Math.floor(ttlMilliseconds)),
+    ).toISOString(),
+  };
+}
+
+function readUsageExclusiveClaim(
+  metadata: Record<string, unknown>,
+): UsageExclusiveClaim | null {
+  const claimId = metadata.claimId;
+  const claimExpiresAt = metadata.claimExpiresAt;
+  if (
+    typeof claimId !== "string" ||
+    claimId.length === 0 ||
+    typeof claimExpiresAt !== "string" ||
+    claimExpiresAt.length === 0
+  ) {
+    return null;
+  }
+
+  return { claimId, claimExpiresAt };
+}
+
+function isUsageExclusiveClaimActive(
+  claim: UsageExclusiveClaim | null,
+): boolean {
+  if (!claim) {
+    return false;
+  }
+
+  const expiresAt = Date.parse(claim.claimExpiresAt);
+  return Number.isFinite(expiresAt) && expiresAt > Date.now();
+}
+
+/**
+ * 无预算路径没有可复用的预算桶事务，因此更新 Claim 时必须把旧 Claim 值
+ * 放进 WHERE。即使两个实例同时读到过期租约，也只有一个能成功 returning。
+ */
+function usageClaimCondition(claimId: string | undefined) {
+  return claimId
+    ? sql`${usageLedger.metadata}->>'claimId' = ${claimId}`
+    : sql`${usageLedger.metadata}->>'claimId' is null`;
+}
+
+/**
+ * 普通模型和图片 reservation 没有 Claim，维持原有结算语义；存在 Claim 时
+ * 必须由当前持有者结算或释放，防止过期持有者覆盖接管者的新账本状态。
+ */
+function reservationOwnsUsageClaim(
+  reservation: UsageBudgetReservation,
+  metadata: Record<string, unknown>,
+): boolean {
+  return (
+    reservation.claimId === undefined ||
+    metadata.claimId === reservation.claimId
+  );
 }
 
 function getModelPricingKind(provider: string): ModelPricingKind {

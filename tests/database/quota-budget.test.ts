@@ -50,8 +50,10 @@ import { DatabaseProjectRepository } from "@/domains/project/repository";
 import {
   assertGlobalBudgetAvailable,
   isGlobalBudgetEnabled,
+  reserveContextCheckpointUsageBudget,
   reserveImageUsageBudget,
   reserveModelUsageBudget,
+  settleContextCheckpointUsageBudget,
   settleImageUsageBudget,
   settleModelUsageBudget,
 } from "@/infrastructure/quota/service";
@@ -88,8 +90,12 @@ function utcDateKey() {
  * 这里创建最小合法领域 fixture，让测试继续聚焦预算服务本身，同时复用
  * 生产项目创建和 Agent Run 创建路径，避免把 schema 必填字段复制到测试里。
  */
-async function createAgentRunFixture(
+async function createAgentRunRecordFixture(
   database: ConstructorParameters<typeof DatabaseProjectRepository>[0],
+  input?: {
+    conversationId?: string;
+    title?: string;
+  },
 ) {
   const repository = new DatabaseProjectRepository(database);
   const project = await repository.createProject({
@@ -116,13 +122,56 @@ async function createAgentRunFixture(
   const run = await store.createRun({
     ownerId: OWNER_ID,
     projectId: project.id,
-    conversationTitle: "预算测试",
+    conversationId: input?.conversationId,
+    conversationTitle: input?.title ?? "预算测试",
     userMessage: "预算测试消息",
     profile,
     startRevision: project.revision,
   });
 
-  return run.id;
+  return run;
+}
+
+async function createAgentRunFixture(
+  database: ConstructorParameters<typeof DatabaseProjectRepository>[0],
+) {
+  return (await createAgentRunRecordFixture(database)).id;
+}
+
+async function createFollowUpAgentRunFixture(
+  database: ConstructorParameters<typeof DatabaseProjectRepository>[0],
+  firstRun: Awaited<ReturnType<typeof createAgentRunRecordFixture>>,
+) {
+  const store = new AgentStore(database);
+  // 同一项目只允许一个 active Run。测试先让首条夹具进入终态，再在同一
+  // Conversation 创建后续 Run，以模拟不同 Serverless 实例争抢同一摘要边界。
+  await store.transitionRun({
+    ownerId: OWNER_ID,
+    runId: firstRun.id,
+    status: "failed",
+    errorCode: "TEST_FIXTURE_COMPLETED",
+    errorMessage: "预算测试释放 active Run 约束。",
+  });
+  const profile = createFrozenAgentProfile({
+    locale: "zh-CN",
+    projectId: firstRun.projectId,
+    revision: firstRun.currentRevision,
+    repositoryCapability: firstRun.repositoryCapability,
+    provider: firstRun.provider,
+    model: firstRun.model,
+    maxModelTurns: null,
+    maxWallTimeSeconds: 60,
+  });
+
+  return store.createRun({
+    ownerId: OWNER_ID,
+    projectId: firstRun.projectId,
+    conversationId: firstRun.conversationId,
+    conversationTitle: "并发摘要预算测试",
+    userMessage: "后续 Run",
+    profile,
+    startRevision: firstRun.currentRevision,
+  });
 }
 
 async function createImageRunFixture(
@@ -233,6 +282,493 @@ describe("global usage budget", () => {
       });
     } finally {
       await database.close();
+    }
+  });
+
+  it("Checkpoint 在 Provider 前失败时释放 reservation，之后可重新预留", async () => {
+    enableBudget({ MAX_GLOBAL_DAILY_COST_USD: 0.01 });
+    const database = await createTestDatabase();
+    databaseRef.current = database.database as unknown as TestDatabase;
+    try {
+      const run = await createAgentRunRecordFixture(database.database);
+      const input = {
+        ownerId: OWNER_ID,
+        agentRunId: run.id,
+        conversationId: run.conversationId,
+        checkpointVersion: 0,
+        transcriptSeq: 12,
+        provider: "deepseek",
+        model: "deepseek-v4-flash",
+        estimatedInputTokens: 100,
+        maxOutputTokens: 200,
+      } as const;
+      const first = await reserveContextCheckpointUsageBudget(input);
+      if (!first) {
+        throw new Error("Checkpoint 必须创建预算 reservation。");
+      }
+
+      await settleContextCheckpointUsageBudget({
+        reservation: first,
+        provider: "deepseek",
+        inputTokens: 0,
+        outputTokens: 0,
+        providerRequestStarted: false,
+        usageObserved: false,
+        latencyMs: 7,
+      });
+      const retried = await reserveContextCheckpointUsageBudget(input);
+
+      expect(retried).toMatchObject({
+        idempotencyKey: first.idempotencyKey,
+        alreadySettled: false,
+        reservedCostUsd: first.reservedCostUsd,
+      });
+      const [ledger] = await database.database
+        .select()
+        .from(usageLedger)
+        .where(eq(usageLedger.idempotencyKey, first.idempotencyKey));
+      const [bucket] = await database.database
+        .select()
+        .from(dailyBudgetBuckets)
+        .where(eq(dailyBudgetBuckets.bucketDate, utcDateKey()));
+      expect(ledger).toMatchObject({
+        resource: "context_checkpoint",
+        status: "reserved",
+      });
+      expect(bucket).toMatchObject({
+        reservedUsd: first.reservedCostUsd,
+        consumedUsd: "0.000000",
+      });
+    } finally {
+      await database.close();
+      databaseRef.current = null;
+    }
+  });
+
+  it("Checkpoint 已启动但没有 usage 时按预留上限幂等结算", async () => {
+    enableBudget({ MAX_GLOBAL_DAILY_COST_USD: 0.01 });
+    const database = await createTestDatabase();
+    databaseRef.current = database.database as unknown as TestDatabase;
+    try {
+      const run = await createAgentRunRecordFixture(database.database);
+      const reservation = await reserveContextCheckpointUsageBudget({
+        ownerId: OWNER_ID,
+        agentRunId: run.id,
+        conversationId: run.conversationId,
+        checkpointVersion: 2,
+        transcriptSeq: 48,
+        provider: "deepseek",
+        model: "deepseek-v4-flash",
+        estimatedInputTokens: 100,
+        maxOutputTokens: 200,
+      });
+      if (!reservation) {
+        throw new Error("Checkpoint 必须创建预算 reservation。");
+      }
+
+      const settlement = {
+        reservation,
+        provider: "deepseek",
+        inputTokens: 0,
+        outputTokens: 0,
+        providerRequestStarted: true,
+        usageObserved: false,
+        latencyMs: 321,
+      } as const;
+      await settleContextCheckpointUsageBudget(settlement);
+      await settleContextCheckpointUsageBudget(settlement);
+
+      const [ledger] = await database.database
+        .select()
+        .from(usageLedger)
+        .where(eq(usageLedger.idempotencyKey, reservation.idempotencyKey));
+      const [bucket] = await database.database
+        .select()
+        .from(dailyBudgetBuckets)
+        .where(eq(dailyBudgetBuckets.bucketDate, utcDateKey()));
+      expect(ledger).toMatchObject({
+        resource: "context_checkpoint",
+        status: "settled",
+        estimatedCostUsd: reservation.reservedCostUsd,
+        metadata: expect.objectContaining({
+          checkpointVersion: 2,
+          transcriptSeq: 48,
+          latencyMs: 321,
+          usageObserved: false,
+          costEstimation: "reserved_upper_bound",
+        }),
+      });
+      expect(bucket).toMatchObject({
+        reservedUsd: "0.000000",
+        consumedUsd: reservation.reservedCostUsd,
+      });
+
+      const replay = await reserveContextCheckpointUsageBudget({
+        ownerId: OWNER_ID,
+        agentRunId: run.id,
+        conversationId: run.conversationId,
+        checkpointVersion: 2,
+        transcriptSeq: 48,
+        provider: "deepseek",
+        model: "deepseek-v4-flash",
+        estimatedInputTokens: 100,
+        maxOutputTokens: 200,
+      });
+      expect(replay).toMatchObject({
+        alreadySettled: true,
+        reservedCostUsd: "0",
+      });
+    } finally {
+      await database.close();
+      databaseRef.current = null;
+    }
+  });
+
+  it("预算开启时同一 Checkpoint 边界只有一个 Run 取得 Claim 并计费", async () => {
+    enableBudget({ MAX_GLOBAL_DAILY_COST_USD: 0.02 });
+    const database = await createTestDatabase();
+    databaseRef.current = database.database as unknown as TestDatabase;
+    try {
+      const firstRun = await createAgentRunRecordFixture(database.database);
+      const secondRun = await createFollowUpAgentRunFixture(
+        database.database,
+        firstRun,
+      );
+
+      const reservations = await Promise.all(
+        [firstRun, secondRun].map((run) =>
+          reserveContextCheckpointUsageBudget({
+            ownerId: OWNER_ID,
+            agentRunId: run.id,
+            conversationId: firstRun.conversationId,
+            checkpointVersion: 3,
+            transcriptSeq: 72,
+            provider: "deepseek",
+            model: "deepseek-v4-flash",
+            estimatedInputTokens: 80,
+            maxOutputTokens: 120,
+          }),
+        ),
+      );
+      if (reservations.some((reservation) => !reservation)) {
+        throw new Error("Checkpoint 幂等 Claim 必须返回 reservation 状态。");
+      }
+      const acquired = reservations.filter(
+        (reservation) => reservation?.acquired,
+      );
+      expect(acquired).toHaveLength(1);
+      expect(
+        reservations.filter((reservation) => !reservation?.acquired),
+      ).toHaveLength(1);
+
+      await settleContextCheckpointUsageBudget({
+        reservation: acquired[0]!,
+        provider: "deepseek",
+        inputTokens: 60,
+        outputTokens: 20,
+        providerRequestStarted: true,
+        usageObserved: true,
+        latencyMs: 88,
+      });
+
+      const ledgers = await database.database
+        .select()
+        .from(usageLedger)
+        .where(
+          and(
+            eq(usageLedger.resource, "context_checkpoint"),
+            eq(usageLedger.ownerId, OWNER_ID),
+          ),
+        );
+      const [bucket] = await database.database
+        .select()
+        .from(dailyBudgetBuckets)
+        .where(eq(dailyBudgetBuckets.bucketDate, utcDateKey()));
+      expect(ledgers).toHaveLength(1);
+      expect(ledgers[0]).toMatchObject({
+        status: "settled",
+        agentRunId: acquired[0]!.claimId
+          ? reservations[0]?.claimId === acquired[0]!.claimId
+            ? firstRun.id
+            : secondRun.id
+          : expect.any(String),
+        inputTokens: 60,
+        outputTokens: 20,
+        estimatedCostUsd: "0.000100",
+        metadata: expect.objectContaining({
+          checkpointVersion: 3,
+          transcriptSeq: 72,
+          latencyMs: 88,
+        }),
+      });
+      expect(bucket).toMatchObject({
+        reservedUsd: "0.000000",
+        consumedUsd: "0.000100",
+      });
+    } finally {
+      await database.close();
+      databaseRef.current = null;
+    }
+  });
+
+  it("预算关闭时同一 Checkpoint 边界仍只生成一条用量账本", async () => {
+    const database = await createTestDatabase();
+    databaseRef.current = database.database as unknown as TestDatabase;
+    try {
+      const firstRun = await createAgentRunRecordFixture(database.database);
+      const secondRun = await createFollowUpAgentRunFixture(
+        database.database,
+        firstRun,
+      );
+      const reservations = await Promise.all(
+        [firstRun, secondRun].map((run) =>
+          reserveContextCheckpointUsageBudget({
+            ownerId: OWNER_ID,
+            agentRunId: run.id,
+            conversationId: firstRun.conversationId,
+            checkpointVersion: 4,
+            transcriptSeq: 96,
+            provider: "deepseek",
+            model: "deepseek-v4-flash",
+            estimatedInputTokens: 80,
+            maxOutputTokens: 120,
+          }),
+        ),
+      );
+      const acquired = reservations.filter(
+        (reservation) => reservation?.acquired,
+      );
+      expect(acquired).toHaveLength(1);
+      expect(
+        reservations.filter((reservation) => !reservation?.acquired),
+      ).toHaveLength(1);
+
+      await settleContextCheckpointUsageBudget({
+        reservation: acquired[0]!,
+        provider: "deepseek",
+        inputTokens: 55,
+        outputTokens: 15,
+        providerRequestStarted: true,
+        usageObserved: true,
+        latencyMs: 76,
+      });
+
+      const ledgers = await database.database
+        .select()
+        .from(usageLedger)
+        .where(
+          and(
+            eq(usageLedger.resource, "context_checkpoint"),
+            eq(usageLedger.ownerId, OWNER_ID),
+          ),
+        );
+      expect(ledgers).toHaveLength(1);
+      expect(ledgers[0]).toMatchObject({
+        status: "settled",
+        inputTokens: 55,
+        outputTokens: 15,
+        estimatedCostUsd: "0.000000",
+        metadata: expect.objectContaining({
+          checkpointVersion: 4,
+          transcriptSeq: 96,
+          latencyMs: 76,
+          costEstimation: "pending_price_table",
+        }),
+      });
+    } finally {
+      await database.close();
+      databaseRef.current = null;
+    }
+  });
+
+  it("Checkpoint Claim 过期后可被后续 Run 接管且不重复占用预算", async () => {
+    enableBudget({ MAX_GLOBAL_DAILY_COST_USD: 0.02 });
+    const database = await createTestDatabase();
+    databaseRef.current = database.database as unknown as TestDatabase;
+    try {
+      const firstRun = await createAgentRunRecordFixture(database.database);
+      const secondRun = await createFollowUpAgentRunFixture(
+        database.database,
+        firstRun,
+      );
+      const input = {
+        ownerId: OWNER_ID,
+        conversationId: firstRun.conversationId,
+        checkpointVersion: 5,
+        transcriptSeq: 120,
+        provider: "deepseek",
+        model: "deepseek-v4-flash",
+        estimatedInputTokens: 100,
+        maxOutputTokens: 200,
+      } as const;
+      const first = await reserveContextCheckpointUsageBudget({
+        ...input,
+        agentRunId: firstRun.id,
+      });
+      if (!first?.claimId) {
+        throw new Error("首个 Checkpoint reservation 必须取得 Claim。");
+      }
+
+      const [ledgerBeforeTakeover] = await database.database
+        .select()
+        .from(usageLedger)
+        .where(eq(usageLedger.idempotencyKey, first.idempotencyKey));
+      await database.database
+        .update(usageLedger)
+        .set({
+          metadata: {
+            ...ledgerBeforeTakeover!.metadata,
+            claimExpiresAt: new Date(Date.now() - 60_000).toISOString(),
+          },
+        })
+        .where(eq(usageLedger.idempotencyKey, first.idempotencyKey));
+
+      const second = await reserveContextCheckpointUsageBudget({
+        ...input,
+        agentRunId: secondRun.id,
+      });
+      expect(second).toMatchObject({
+        acquired: true,
+        alreadySettled: false,
+        reservedCostUsd: first.reservedCostUsd,
+      });
+      expect(second?.claimId).not.toBe(first.claimId);
+
+      const [ledgerAfterTakeover] = await database.database
+        .select()
+        .from(usageLedger)
+        .where(eq(usageLedger.idempotencyKey, first.idempotencyKey));
+      const [bucket] = await database.database
+        .select()
+        .from(dailyBudgetBuckets)
+        .where(eq(dailyBudgetBuckets.bucketDate, utcDateKey()));
+      expect(ledgerAfterTakeover).toMatchObject({
+        status: "reserved",
+        agentRunId: secondRun.id,
+        estimatedCostUsd: first.reservedCostUsd,
+        metadata: expect.objectContaining({
+          claimId: second?.claimId,
+        }),
+      });
+      expect(bucket).toMatchObject({
+        reservedUsd: first.reservedCostUsd,
+        consumedUsd: "0.000000",
+      });
+    } finally {
+      await database.close();
+      databaseRef.current = null;
+    }
+  });
+
+  it("旧 Checkpoint Claim 无法释放或结算接管后的新 Claim", async () => {
+    enableBudget({ MAX_GLOBAL_DAILY_COST_USD: 0.02 });
+    const database = await createTestDatabase();
+    databaseRef.current = database.database as unknown as TestDatabase;
+    try {
+      const firstRun = await createAgentRunRecordFixture(database.database);
+      const secondRun = await createFollowUpAgentRunFixture(
+        database.database,
+        firstRun,
+      );
+      const input = {
+        ownerId: OWNER_ID,
+        conversationId: firstRun.conversationId,
+        checkpointVersion: 6,
+        transcriptSeq: 144,
+        provider: "deepseek",
+        model: "deepseek-v4-flash",
+        estimatedInputTokens: 100,
+        maxOutputTokens: 200,
+      } as const;
+      const first = await reserveContextCheckpointUsageBudget({
+        ...input,
+        agentRunId: firstRun.id,
+      });
+      if (!first?.claimId) {
+        throw new Error("首个 Checkpoint reservation 必须取得 Claim。");
+      }
+
+      const [ledger] = await database.database
+        .select()
+        .from(usageLedger)
+        .where(eq(usageLedger.idempotencyKey, first.idempotencyKey));
+      await database.database
+        .update(usageLedger)
+        .set({
+          metadata: {
+            ...ledger!.metadata,
+            claimExpiresAt: new Date(Date.now() - 60_000).toISOString(),
+          },
+        })
+        .where(eq(usageLedger.idempotencyKey, first.idempotencyKey));
+      const second = await reserveContextCheckpointUsageBudget({
+        ...input,
+        agentRunId: secondRun.id,
+      });
+      if (!second?.claimId || second.claimId === first.claimId) {
+        throw new Error("过期 Claim 必须由新的持有者接管。");
+      }
+
+      // 旧实例可能在租约过期后才收到 Provider 结果，甚至执行异常清理。
+      // 两条路径都必须被 claimId 校验拦截，不能释放或结算新持有者的账本。
+      await settleContextCheckpointUsageBudget({
+        reservation: first,
+        provider: "deepseek",
+        inputTokens: 0,
+        outputTokens: 0,
+        providerRequestStarted: false,
+        usageObserved: false,
+        latencyMs: 10,
+      });
+      await settleContextCheckpointUsageBudget({
+        reservation: first,
+        provider: "deepseek",
+        inputTokens: 999,
+        outputTokens: 999,
+        providerRequestStarted: true,
+        usageObserved: true,
+        latencyMs: 999,
+      });
+
+      const [stillReserved] = await database.database
+        .select()
+        .from(usageLedger)
+        .where(eq(usageLedger.idempotencyKey, first.idempotencyKey));
+      expect(stillReserved).toMatchObject({
+        status: "reserved",
+        inputTokens: 0,
+        outputTokens: 0,
+        metadata: expect.objectContaining({
+          claimId: second.claimId,
+        }),
+      });
+
+      await settleContextCheckpointUsageBudget({
+        reservation: second,
+        provider: "deepseek",
+        inputTokens: 40,
+        outputTokens: 10,
+        providerRequestStarted: true,
+        usageObserved: true,
+        latencyMs: 42,
+      });
+      const [settled] = await database.database
+        .select()
+        .from(usageLedger)
+        .where(eq(usageLedger.idempotencyKey, first.idempotencyKey));
+      expect(settled).toMatchObject({
+        status: "settled",
+        inputTokens: 40,
+        outputTokens: 10,
+        estimatedCostUsd: "0.000060",
+        metadata: expect.objectContaining({
+          claimId: second.claimId,
+          latencyMs: 42,
+        }),
+      });
+    } finally {
+      await database.close();
+      databaseRef.current = null;
     }
   });
 

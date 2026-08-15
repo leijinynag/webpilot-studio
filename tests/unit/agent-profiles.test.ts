@@ -6,6 +6,7 @@ import {
   DEFAULT_MAX_AGENT_MODEL_TURNS,
   DEFAULT_MAX_AGENT_WALL_TIME_SECONDS,
   normalizeAgentRunBudget,
+  normalizeAgentRunUsage,
 } from "@/domains/agent/types";
 import {
   assertFrozenProfilesAvailable,
@@ -92,7 +93,7 @@ describe("Agent profiles", () => {
   it("旧 Run 缺少预算字段时补齐当前默认值，并保留已冻结的显式值", () => {
     const normalized = normalizeAgentRunBudget({});
 
-    expect(normalized.maxModelTurns).toBe(DEFAULT_MAX_AGENT_MODEL_TURNS);
+    expect(normalized.maxModelTurns).toBeNull();
     expect(normalized.maxFileMutations).toBe(
       DEFAULT_AGENT_RUN_ACTIVITY_LIMITS.maxFileMutations,
     );
@@ -106,6 +107,11 @@ describe("Agent profiles", () => {
     expect(DEFAULT_AGENT_RUN_ACTIVITY_LIMITS.maxFileMutations).toBe(512);
     expect(DEFAULT_AGENT_RUN_ACTIVITY_LIMITS.maxClientResumes).toBe(32);
     expect(DEFAULT_MAX_AGENT_WALL_TIME_SECONDS).toBe(1_800);
+    expect(
+      normalizeAgentRunBudget({
+        maxModelTurns: DEFAULT_MAX_AGENT_MODEL_TURNS,
+      }).maxModelTurns,
+    ).toBeNull();
     // 已冻结的显式预算仍保持原值，避免恢复旧 Run 时悄然改变执行边界。
     expect(
       normalizeAgentRunBudget({
@@ -119,6 +125,21 @@ describe("Agent profiles", () => {
       maxFileMutations: 8,
       maxClientResumes: 6,
       maxWallTimeSeconds: 300,
+    });
+  });
+
+  it("旧 Run 缺少空工具调用计数时按零恢复", () => {
+    expect(
+      normalizeAgentRunUsage({
+        modelTurns: 7,
+        inputTokens: 100,
+        outputTokens: 20,
+      }),
+    ).toMatchObject({
+      modelTurns: 7,
+      inputTokens: 100,
+      outputTokens: 20,
+      consecutiveEmptyToolCallTurns: 0,
     });
   });
 

@@ -55,6 +55,7 @@ function createRun(
       outputTokens: 0,
       fileMutations: options.fileMutations ?? 0,
       clientResumes: 0,
+      consecutiveEmptyToolCallTurns: 0,
       repairRounds: 0,
       repeatedFailureCount: 0,
       activeExecutionDurationMs: 0,

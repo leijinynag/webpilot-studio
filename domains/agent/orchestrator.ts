@@ -35,6 +35,10 @@ import type { ProviderFinishReason } from "@/domains/agent/provider";
 import type { AgentStore } from "@/domains/agent/store";
 import { assembleProviderMessages } from "@/domains/agent/transcript";
 import {
+  ensureContextCheckpoint,
+  type ContextCheckpointStore,
+} from "@/domains/agent/context-checkpoint";
+import {
   FILE_TOOL_NAMES,
   FILE_TOOL_SCHEMAS,
   GIT_TOOL_NAMES,
@@ -78,6 +82,7 @@ type AgentStorePort = Pick<
   | "findReplayableSmokePlan"
   | "findSuccessfulRead"
   | "getLatestVerificationRun"
+  | "getContextCheckpoint"
   | "hasPendingClientToolWait"
   | "registerToolInvocation"
   | "markToolInvocationRunning"
@@ -89,6 +94,7 @@ type AgentStorePort = Pick<
   | "suspendForClientTool"
   | "transitionRun"
   | "updateRunProgress"
+  | "compareAndSetContextCheckpoint"
 >;
 
 type FileToolExecutorPort = Pick<FileToolExecutor, "execute">;
@@ -150,6 +156,12 @@ export class AgentOrchestrator {
     private readonly onModelUsage?: typeof recordModelUsage,
     private readonly reserveModelBudget?: typeof reserveModelUsageBudget,
     private readonly settleModelBudget?: typeof settleModelUsageBudget,
+    private readonly checkpointRuntime?: {
+      provider: LlmProvider;
+      providerName: string;
+      model: string;
+      usage?: Parameters<typeof ensureContextCheckpoint>[0]["usage"];
+    },
   ) {}
 
   async run(input: {
@@ -233,7 +245,10 @@ export class AgentOrchestrator {
       let partialProviderStreamRetries = 0;
       let attachmentContexts = new Map<string, string>();
 
-      modelLoop: while (run.usage.modelTurns < run.budget.maxModelTurns) {
+      modelLoop: while (
+        run.budget.maxModelTurns === null ||
+        run.usage.modelTurns < run.budget.maxModelTurns
+      ) {
         assertWithinWallTime(run);
         await this.assertNotCancelled(run, input.signal);
         await this.store.renewExecutionLease({
@@ -279,27 +294,53 @@ export class AgentOrchestrator {
             runId: run.id,
           },
         );
+        const systemPrompt = [
+          profiles.prompt.content,
+          buildAgentVerificationDirective({
+            run,
+            transcript,
+            latestVerificationRun,
+          }),
+        ].join("\n\n");
+        const contextCheckpoint = this.checkpointRuntime
+          ? await ensureContextCheckpoint({
+              store: this.store as ContextCheckpointStore,
+              provider: this.checkpointRuntime.provider,
+              providerName: this.checkpointRuntime.providerName,
+              model: this.checkpointRuntime.model,
+              run,
+              transcript,
+              systemPrompt,
+              signal: input.signal,
+              usage: this.checkpointRuntime.usage,
+            })
+          : await this.store.getContextCheckpoint({
+              ownerId: run.ownerId,
+              conversationId: run.conversationId,
+            });
         const turn = await this.streamModelTurn({
           run,
           transcript,
-          systemPrompt: [
-            profiles.prompt.content,
-            buildAgentVerificationDirective({
-              run,
-              transcript,
-              latestVerificationRun,
-            }),
-          ].join("\n\n"),
+          systemPrompt,
+          contextCheckpoint,
           tools: profiles.toolset.tools,
           attachmentContexts,
           leaseId,
           signal: input.signal,
         });
+        const retryableEmptyToolCallTurn =
+          !turn.interruption && isRetryableEmptyToolCallTurn(turn);
+        const consecutiveEmptyToolCallTurns = retryableEmptyToolCallTurn
+          ? run.usage.consecutiveEmptyToolCallTurns + 1
+          : turn.interruption
+            ? run.usage.consecutiveEmptyToolCallTurns
+            : 0;
         const nextUsage = {
           ...run.usage,
           modelTurns: run.usage.modelTurns + 1,
           inputTokens: run.usage.inputTokens + turn.inputTokens,
           outputTokens: run.usage.outputTokens + turn.outputTokens,
+          consecutiveEmptyToolCallTurns,
         };
         run = await this.store.updateRunProgress({
           ownerId: run.ownerId,
@@ -348,9 +389,9 @@ export class AgentOrchestrator {
 
         // DeepSeek 偶发只返回 finish_reason=tool_calls，却没有发送任何
         // tool_call_delta。这类响应没有可执行副作用，也没有形成可持久化的
-        // Assistant 消息，因此安全地按同一 Transcript 重试；模型轮次照常
-        // 计入冻结预算，避免供应商持续缺帧时形成无限循环。
-        if (isRetryableEmptyToolCallTurn(turn)) {
+        // Assistant 消息，因此可以按同一 Transcript 重试。连续次数与用量
+        // 一起持久化，实例重启或租约接管也不能绕过无进展熔断。
+        if (retryableEmptyToolCallTurn) {
           await this.store.appendEvent({
             runId: run.id,
             type: "model.turn_retried",
@@ -358,8 +399,35 @@ export class AgentOrchestrator {
               reason: "empty_tool_calls",
               discardedCharacterCount: turn.assistantText.length,
               consumedModelTurns: run.usage.modelTurns,
+              consecutiveEmptyToolCallTurns:
+                run.usage.consecutiveEmptyToolCallTurns,
+              maxNoProgressRepeats: run.budget.maxNoProgressRepeats,
             },
           });
+
+          if (
+            run.usage.consecutiveEmptyToolCallTurns >=
+            run.budget.maxNoProgressRepeats
+          ) {
+            await this.store.appendEvent({
+              runId: run.id,
+              type: "run.no_progress",
+              payload: {
+                reason: "consecutive_empty_tool_calls",
+                consecutiveEmptyToolCallTurns:
+                  run.usage.consecutiveEmptyToolCallTurns,
+                maxNoProgressRepeats: run.budget.maxNoProgressRepeats,
+                consumedModelTurns: run.usage.modelTurns,
+              },
+            });
+            await this.finishRun(
+              run,
+              "budget_exhausted",
+              AGENT_ERROR_CODES.noProgress,
+              "模型连续返回空工具调用，Agent 已停止无进展循环，可发送“继续”恢复执行。",
+            );
+            return;
+          }
           continue;
         }
 
@@ -758,12 +826,17 @@ export class AgentOrchestrator {
         });
       }
 
-      await this.finishRun(
-        run,
-        "budget_exhausted",
-        AGENT_ERROR_CODES.modelTurnsExhausted,
-        "Agent 已达到最大模型轮次。",
-      );
+      // 只有显式配置的硬上限才能到达这里。budget_exhausted 是可恢复终态，
+      // 后续“继续”会创建新 Run，并从持久化 Transcript/Checkpoint 重新组装
+      // 上下文，不复用旧 AbortSignal 或旧 Run 的循环计数。
+      if (run.budget.maxModelTurns !== null) {
+        await this.finishRun(
+          run,
+          "budget_exhausted",
+          AGENT_ERROR_CODES.modelTurnsExhausted,
+          "Agent 已达到显式配置的最大模型轮次，可发送“继续”恢复执行。",
+        );
+      }
     } catch (error) {
       await this.handleTerminalError(input, error, leaseId);
     } finally {
@@ -779,6 +852,9 @@ export class AgentOrchestrator {
     run: AgentRunRecord;
     transcript: readonly TranscriptMessage[];
     systemPrompt: string;
+    contextCheckpoint: Awaited<
+      ReturnType<AgentStorePort["getContextCheckpoint"]>
+    >;
     tools: readonly {
       name: string;
       description: string;
@@ -831,6 +907,10 @@ export class AgentOrchestrator {
           // 这里保留最近上下文，避免“继续”请求超过模型上下文窗口。
           maxContextCharacters: 96_000,
           attachmentContexts: input.attachmentContexts,
+          contextCheckpoint: input.contextCheckpoint,
+          // Checkpoint 属于 Conversation，而模型循环属于当前 Run。并发 Run
+          // 推进摘要后，当前 Run 已持久化的早期消息仍必须完整进入本轮上下文。
+          protectedRunId: input.run.id,
         });
         const maxOutputTokens = Math.max(
           256,

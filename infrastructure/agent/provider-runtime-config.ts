@@ -187,3 +187,55 @@ export function createAgentProviderRuntime(
     }),
   };
 }
+
+/**
+ * Checkpoint 摘要是内部维护调用，不进入前端模型白名单。它仍复用同一套
+ * DeepSeek 凭证和 Base URL，但模型名优先读取专用配置，避免占用主 Agent
+ * 的高成本模型；未配置时回退快速模型。
+ */
+export function createContextSummaryProviderRuntime(
+  environment: Pick<
+    ServerEnv,
+    | "AGENT_ENABLED"
+    | "LLM_PROVIDER"
+    | "LLM_API_KEY"
+    | "LLM_BASE_URL"
+    | "LLM_FAST_MODEL"
+    | "LLM_SUMMARY_MODEL"
+  >,
+): AgentProviderRuntime {
+  if (environment.AGENT_ENABLED !== "true") {
+    throw new AgentError(
+      AGENT_ERROR_CODES.featureDisabled,
+      "Agent 功能尚未启用。",
+      503,
+    );
+  }
+  if (environment.LLM_PROVIDER?.toLowerCase() !== "deepseek") {
+    throw new AgentError(
+      AGENT_ERROR_CODES.providerNotConfigured,
+      "ContextCheckpoint 当前需要 DeepSeek Provider。",
+      503,
+    );
+  }
+  const apiKey = environment.LLM_API_KEY?.trim();
+  if (!apiKey) {
+    throw new AgentError(
+      AGENT_ERROR_CODES.providerNotConfigured,
+      "请配置 LLM_API_KEY 后再生成 ContextCheckpoint。",
+      503,
+    );
+  }
+
+  return {
+    providerName: "deepseek",
+    model:
+      environment.LLM_SUMMARY_MODEL?.trim() ||
+      environment.LLM_FAST_MODEL?.trim() ||
+      DEFAULT_FAST_MODEL,
+    provider: new DeepSeekProvider({
+      apiKey,
+      baseUrl: environment.LLM_BASE_URL || "https://api.deepseek.com",
+    }),
+  };
+}

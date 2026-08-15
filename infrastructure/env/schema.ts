@@ -37,6 +37,7 @@ export const serverEnvSchema = z
     LLM_API_KEY: optionalString,
     LLM_AGENT_MODEL: optionalString,
     LLM_FAST_MODEL: optionalString,
+    LLM_SUMMARY_MODEL: optionalString,
     VISION_PROVIDER: optionalString,
     VISION_BASE_URL: optionalUrl,
     VISION_API_KEY: optionalString,

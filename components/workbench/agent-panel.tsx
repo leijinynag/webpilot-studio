@@ -1794,8 +1794,11 @@ function AgentRunStatus({
   const isFailure = status.tone === "error";
   const displayedModelTurns =
     run.status === "running" && !activeTool
-      ? Math.min(run.usage.modelTurns + 1, run.budget.maxModelTurns)
+      ? run.budget.maxModelTurns === null
+        ? run.usage.modelTurns + 1
+        : Math.min(run.usage.modelTurns + 1, run.budget.maxModelTurns)
       : run.usage.modelTurns;
+  const modelTurnLimit = run.budget.maxModelTurns ?? "∞";
   const activeDetail = activeTool
     ? t("agent.executingTool", { tool: activeTool.toolName })
     : run.status === "running" && hasStreamingAssistantText
@@ -1831,8 +1834,8 @@ function AgentRunStatus({
         <div className="agent-run-status-detail">
           <span>{activeDetail}</span>
           <span>
-            {displayedModelTurns}/{run.budget.maxModelTurns} {t("agent.turns")}{" "}
-            · r{run.currentRevision}
+            {displayedModelTurns}/{modelTurnLimit} {t("agent.turns")} · r
+            {run.currentRevision}
           </span>
         </div>
         <div className="agent-run-metrics" aria-label={t("agent.runMetrics")}>
@@ -2215,7 +2218,7 @@ function getRunStatusCopy(
           title: t("agent.statusModelTurnsBudget"),
           detail: t("agent.statusModelTurnsBudgetDetail", {
             used: run.usage.modelTurns,
-            limit: run.budget.maxModelTurns,
+            limit: run.budget.maxModelTurns ?? "∞",
           }),
           message: t("agent.statusModelTurnsBudgetMessage"),
           tone: "warning",

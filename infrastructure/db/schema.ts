@@ -155,6 +155,8 @@ export const verificationStepStatus = pgEnum("verification_step_status", [
 
 export const quotaResource = pgEnum("quota_resource", [
   "agent_run",
+  "context_checkpoint",
+  "code_completion",
   "image_generation",
   "attachment_upload",
 ]);
@@ -416,6 +418,22 @@ export const conversations = pgTable(
     // ownerId 被冗余保存在会话与 Run 上，查询时始终以 owner 作为第一层隔离条件。
     ownerId: text("owner_id").notNull(),
     title: text("title").notNull(),
+    contextCheckpointSummary: text("context_checkpoint_summary"),
+    contextCheckpointTranscriptSeq: bigint(
+      "context_checkpoint_transcript_seq",
+      {
+        mode: "number",
+      },
+    )
+      .notNull()
+      .default(0),
+    contextCheckpointVersion: integer("context_checkpoint_version")
+      .notNull()
+      .default(0),
+    contextCheckpointUpdatedAt: timestamp("context_checkpoint_updated_at", {
+      withTimezone: true,
+      mode: "date",
+    }),
     createdAt: timestamp("created_at", {
       withTimezone: true,
       mode: "date",
@@ -437,6 +455,14 @@ export const conversations = pgTable(
     check(
       "conversations_title_length_check",
       sql`char_length(${table.title}) between 1 and 160`,
+    ),
+    check(
+      "conversations_checkpoint_seq_check",
+      sql`${table.contextCheckpointTranscriptSeq} >= 0`,
+    ),
+    check(
+      "conversations_checkpoint_version_check",
+      sql`${table.contextCheckpointVersion} >= 0`,
     ),
     index("conversations_owner_project_idx").on(
       table.ownerId,
