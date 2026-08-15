@@ -42,6 +42,40 @@ export type ProjectMutationResult = {
   changedPaths: string[];
 };
 
+/**
+ * 一次批量导入只允许对同一路径执行一个最终动作。
+ *
+ * 该类型同时服务 Database Repository 与 Browser Git Repository，
+ * 保证终端运行镜像导回源码仓库时，两种存储后端具有一致的 CAS 语义。
+ */
+export type ProjectFileMutation =
+  | {
+      type: "write";
+      path: string;
+      content: string;
+    }
+  | {
+      type: "delete";
+      path: string;
+    };
+
+export type RuntimeFileDiffEntry = {
+  path: string;
+  status: "added" | "modified" | "deleted";
+  beforeContent: string | null;
+  afterContent: string | null;
+};
+
+/**
+ * baseRevision 是生成 Diff 时运行镜像对应的 Repository revision。
+ * 导入时必须把它作为 expectedRevision 再做一次 CAS，避免审查期间覆盖新保存的代码。
+ */
+export type RuntimeFileDiff = {
+  projectKey: string;
+  baseRevision: number;
+  entries: RuntimeFileDiffEntry[];
+};
+
 export type ProjectCheckpoint = {
   id: string;
   projectId: string;

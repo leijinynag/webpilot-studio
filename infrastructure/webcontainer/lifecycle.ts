@@ -20,7 +20,8 @@ export type WebContainerErrorCode =
   | "install_failed"
   | "dev_server_failed"
   | "asset_sync_failed"
-  | "terminal_unavailable";
+  | "terminal_unavailable"
+  | "runtime_scan_unavailable";
 
 export type WebContainerDiagnostic = {
   code: WebContainerErrorCode;

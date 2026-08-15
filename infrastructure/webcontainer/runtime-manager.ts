@@ -20,6 +20,10 @@ import {
 } from "@/infrastructure/webcontainer/project-template";
 import type { ShowcaseArtifact } from "@/infrastructure/showcase/artifact";
 import { createShowcaseArtifact } from "@/infrastructure/showcase/artifact";
+import type {
+  RuntimeFileDiff,
+  RuntimeFileDiffEntry,
+} from "@/domains/project/types";
 
 type RuntimeListener = () => void;
 type ServerReadyListener = (port: number, url: string) => void;
@@ -121,6 +125,19 @@ const RUNTIME_RESTART_PATHS = new Set([
   "rsbuild.config.ts",
   "rsbuild.config.js",
 ]);
+const RUNTIME_DIFF_IGNORED_DIRECTORIES = new Set([
+  ".cache",
+  ".git",
+  ".next",
+  ".turbo",
+  ".vite",
+  "build",
+  "cache",
+  "coverage",
+  "dist",
+  "node_modules",
+]);
+const MAX_RUNTIME_DIFF_FILE_BYTES = 2 * 1024 * 1024;
 
 async function bootWebContainer(): Promise<WebContainerAdapter> {
   // 动态加载确保 Next.js 服务端构建阶段不会执行依赖浏览器环境的 WebContainer 代码。
@@ -503,6 +520,63 @@ export class WebContainerRuntimeManager {
   }
 
   /**
+   * 检测终端对 WebContainer 工作区造成的临时修改。
+   *
+   * 扫描与 Repository 同步共用 syncTail，避免一边写入新 revision、一边读取旧目录。
+   * mountedFiles 只在 Repository 同步成功后更新，因此天然是运行时修改的稳定基线；
+   * 本方法只返回 Diff，不修改基线，也不会把终端内容直接写回 Repository。
+   */
+  detectRuntimeChanges(input: {
+    projectKey: string;
+  }): Promise<RuntimeFileDiff> {
+    if (
+      !this.instance ||
+      this.activeProjectKey !== input.projectKey ||
+      this.snapshot.phase !== "ready" ||
+      this.snapshot.syncedRevision === null
+    ) {
+      return Promise.reject(
+        new WebContainerRuntimeError(
+          "runtime_scan_unavailable",
+          "项目运行环境尚未同步到可审查的 Repository revision。",
+        ),
+      );
+    }
+
+    // 在进入队列前固定扫描身份。若排队或递归读取期间发生项目切换、teardown
+    // 或新 revision 同步，结果会被视为过期，不能交给用户继续导入。
+    const generation = this.generation;
+    const projectKey = input.projectKey;
+    const baseRevision = this.snapshot.syncedRevision;
+    const instance = this.instance;
+    const baseline = new Map(this.mountedFiles);
+    const queuedScan = this.syncTail.then(
+      () =>
+        this.performRuntimeChangeScan({
+          instance,
+          projectKey,
+          generation,
+          baseRevision,
+          baseline,
+        }),
+      () =>
+        this.performRuntimeChangeScan({
+          instance,
+          projectKey,
+          generation,
+          baseRevision,
+          baseline,
+        }),
+    );
+    this.syncTail = queuedScan.then(
+      () => undefined,
+      () => undefined,
+    );
+
+    return queuedScan;
+  }
+
+  /**
    * 生产构建是发布动作的一部分，只有 Publish 页面显式调用才会执行。
    * 构建前复用当前项目的 boot/mount/install 结果，随后停止常驻 dev server，
    * 读取 dist 文件并交给 Showcase artifact 层打包。
@@ -661,6 +735,85 @@ export class WebContainerRuntimeManager {
       );
       this.fail(runtimeError);
       throw runtimeError;
+    }
+  }
+
+  private async performRuntimeChangeScan(input: {
+    instance: WebContainerAdapter;
+    projectKey: string;
+    generation: number;
+    baseRevision: number;
+    baseline: Map<string, string>;
+  }): Promise<RuntimeFileDiff> {
+    this.assertRuntimeScanIdentity(input);
+    const runtimeFiles = await readRuntimeTextFiles(input.instance);
+    this.assertRuntimeScanIdentity(input);
+
+    const entries: RuntimeFileDiffEntry[] = [];
+    for (const [path, content] of runtimeFiles) {
+      const beforeContent = input.baseline.get(path);
+      if (beforeContent === undefined) {
+        entries.push({
+          path,
+          status: "added",
+          beforeContent: null,
+          afterContent: content,
+        });
+      } else if (beforeContent !== content) {
+        entries.push({
+          path,
+          status: "modified",
+          beforeContent,
+          afterContent: content,
+        });
+      }
+    }
+
+    for (const [path, content] of input.baseline) {
+      if (
+        shouldIgnoreRuntimeDiffPath(path, false) ||
+        runtimeFiles.has(path)
+      ) {
+        continue;
+      }
+
+      entries.push({
+        path,
+        status: "deleted",
+        beforeContent: content,
+        afterContent: null,
+      });
+    }
+
+    entries.sort((left, right) => left.path.localeCompare(right.path));
+    return {
+      projectKey: input.projectKey,
+      baseRevision: input.baseRevision,
+      entries,
+    };
+  }
+
+  /**
+   * 扫描结果只有在项目、容器 generation 和 Repository revision 全部未变化时有效。
+   * 这里不复用 assertGeneration 的通用异常，便于 UI 明确提示用户重新检测 Diff。
+   */
+  private assertRuntimeScanIdentity(input: {
+    instance: WebContainerAdapter;
+    projectKey: string;
+    generation: number;
+    baseRevision: number;
+  }): void {
+    if (
+      this.instance !== input.instance ||
+      this.generation !== input.generation ||
+      this.activeProjectKey !== input.projectKey ||
+      this.snapshot.phase !== "ready" ||
+      this.snapshot.syncedRevision !== input.baseRevision
+    ) {
+      throw new WebContainerRuntimeError(
+        "runtime_scan_unavailable",
+        "运行环境在检测期间已经变化，请重新检测运行时文件。",
+      );
     }
   }
 
@@ -1460,6 +1613,121 @@ async function readDirectoryTree(
   }
 
   return files;
+}
+
+async function readRuntimeTextFiles(
+  instance: WebContainerAdapter,
+  directory = ".",
+  relativeDirectory = "",
+  files = new Map<string, string>(),
+): Promise<Map<string, string>> {
+  const entries = await instance.fs.readdir(directory, {
+    withFileTypes: true,
+  });
+
+  // WebContainer 返回顺序不属于稳定契约。显式排序既让 Diff UI 稳定，
+  // 也让测试和后续批量 mutation 的 changedPaths 不受文件系统实现影响。
+  for (const entry of [...entries].sort((left, right) =>
+    left.name.localeCompare(right.name),
+  )) {
+    const relativePath = relativeDirectory
+      ? `${relativeDirectory}/${entry.name}`
+      : entry.name;
+    if (shouldIgnoreRuntimeDiffPath(relativePath, entry.isDirectory())) {
+      continue;
+    }
+
+    const absolutePath =
+      directory === "." ? relativePath : `${directory}/${entry.name}`;
+    if (entry.isDirectory()) {
+      await readRuntimeTextFiles(
+        instance,
+        absolutePath,
+        relativePath,
+        files,
+      );
+      continue;
+    }
+
+    const bytes = await instance.fs.readFile(absolutePath);
+    const content = decodeRuntimeTextFile(bytes);
+    if (content !== null) {
+      files.set(relativePath, content);
+    }
+  }
+
+  return files;
+}
+
+function shouldIgnoreRuntimeDiffPath(
+  path: string,
+  isDirectory: boolean,
+): boolean {
+  const normalized = path.replace(/^\.?\//, "");
+  const segments = normalized.split("/").filter(Boolean);
+
+  // Runtime Bridge 与私有图片资产都位于 public/__webpilot。它们由宿主页面注入，
+  // 不属于用户源码，即使终端能看到也绝不能出现在导入候选中。
+  if (
+    normalized === "public/__webpilot" ||
+    normalized.startsWith("public/__webpilot/")
+  ) {
+    return true;
+  }
+
+  if (
+    segments.some((segment) =>
+      RUNTIME_DIFF_IGNORED_DIRECTORIES.has(segment),
+    )
+  ) {
+    return true;
+  }
+
+  if (isDirectory) {
+    return false;
+  }
+
+  const filename = segments.at(-1) ?? "";
+  return (
+    filename === ".DS_Store" ||
+    filename.endsWith(".log") ||
+    /^npm-debug\.log(?:\.\d+)?$/.test(filename) ||
+    /^pnpm-debug\.log(?:\.\d+)?$/.test(filename) ||
+    /^yarn-(?:debug|error)\.log(?:\.\d+)?$/.test(filename)
+  );
+}
+
+function decodeRuntimeTextFile(bytes: Uint8Array): string | null {
+  if (bytes.byteLength > MAX_RUNTIME_DIFF_FILE_BYTES) {
+    return null;
+  }
+
+  try {
+    const content = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    if (content.includes("\u0000")) {
+      return null;
+    }
+
+    // 某些二进制恰好是合法 UTF-8。控制字符占比过高时仍按二进制处理，
+    // 但保留源码中常见的换行、回车与制表符。
+    let controlCharacters = 0;
+    for (const character of content) {
+      const code = character.charCodeAt(0);
+      if (code < 32 && code !== 9 && code !== 10 && code !== 13) {
+        controlCharacters += 1;
+      }
+    }
+    if (
+      controlCharacters >
+      Math.max(4, Math.floor(content.length * 0.01))
+    ) {
+      return null;
+    }
+
+    return content;
+  } catch {
+    return null;
+  }
 }
 
 function withTimeout<T>(

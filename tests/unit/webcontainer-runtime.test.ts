@@ -680,6 +680,138 @@ describe("WebContainerRuntimeManager", () => {
     });
   });
 
+  it("按稳定路径返回终端产生的新增、修改和删除文件", async () => {
+    const runtime = new FakeWebContainer();
+    const manager = new WebContainerRuntimeManager({
+      boot: async () => runtime,
+      isCrossOriginIsolated: () => true,
+    });
+    const tree = {
+      src: {
+        directory: {
+          "app.tsx": { file: { contents: "before-app" } },
+          "remove.ts": { file: { contents: "remove-me" } },
+          "same.ts": { file: { contents: "same" } },
+        },
+      },
+    };
+
+    await manager.start(tree, "project-a", 7);
+    runtime.setRuntimeFile("src/app.tsx", "after-app");
+    runtime.setRuntimeFile("src/new.ts", "new-file");
+    runtime.deleteRuntimePath("src/remove.ts");
+
+    await expect(
+      manager.detectRuntimeChanges({ projectKey: "project-a" }),
+    ).resolves.toEqual({
+      projectKey: "project-a",
+      baseRevision: 7,
+      entries: [
+        {
+          path: "src/app.tsx",
+          status: "modified",
+          beforeContent: "before-app",
+          afterContent: "after-app",
+        },
+        {
+          path: "src/new.ts",
+          status: "added",
+          beforeContent: null,
+          afterContent: "new-file",
+        },
+        {
+          path: "src/remove.ts",
+          status: "deleted",
+          beforeContent: "remove-me",
+          afterContent: null,
+        },
+      ],
+    });
+  });
+
+  it("运行时 Diff 排除构建产物、宿主注入文件和非文本内容", async () => {
+    const runtime = new FakeWebContainer();
+    const manager = new WebContainerRuntimeManager({
+      boot: async () => runtime,
+      isCrossOriginIsolated: () => true,
+    });
+    const tree = {
+      src: {
+        directory: {
+          "app.tsx": { file: { contents: "source" } },
+        },
+      },
+      dist: {
+        directory: {
+          "old.js": { file: { contents: "old-build" } },
+        },
+      },
+    };
+
+    await manager.start(tree, "project-a", 8);
+    runtime.setRuntimeFile("node_modules/pkg/index.js", "dependency");
+    runtime.setRuntimeFile(".next/server/app.js", "next-build");
+    runtime.setRuntimeFile("dist/new.js", "new-build");
+    runtime.setRuntimeFile("public/__webpilot/runtime-bridge.js", "bridge");
+    runtime.setRuntimeFile("debug.log", "runtime log");
+    runtime.setRuntimeFile("src/image.bin", Uint8Array.from([0, 255, 1]));
+    runtime.setRuntimeFile("src/control.bin", Uint8Array.from([1, 2, 3, 4, 5]));
+    runtime.setRuntimeFile("src/valid.ts", "export const valid = true;");
+
+    await expect(
+      manager.detectRuntimeChanges({ projectKey: "project-a" }),
+    ).resolves.toEqual({
+      projectKey: "project-a",
+      baseRevision: 8,
+      entries: [
+        {
+          path: "src/valid.ts",
+          status: "added",
+          beforeContent: null,
+          afterContent: "export const valid = true;",
+        },
+      ],
+    });
+  });
+
+  it("扫描期间项目被释放时拒绝返回已经过期的 Diff", async () => {
+    const runtime = new FakeWebContainer();
+    const manager = new WebContainerRuntimeManager({
+      boot: async () => runtime,
+      isCrossOriginIsolated: () => true,
+    });
+    await manager.start(
+      {
+        src: {
+          directory: {
+            "app.tsx": { file: { contents: "source" } },
+          },
+        },
+      },
+      "project-a",
+      9,
+    );
+    runtime.setRuntimeFile("src/app.tsx", "runtime-change");
+
+    const scanEntered = createDeferred<void>();
+    const continueScan = createDeferred<void>();
+    const originalReaddir = runtime.fs.readdir;
+    runtime.fs.readdir = async (...args) => {
+      scanEntered.resolve();
+      await continueScan.promise;
+      return originalReaddir(...args);
+    };
+
+    const scan = manager.detectRuntimeChanges({ projectKey: "project-a" });
+    await scanEntered.promise;
+    manager.teardown();
+    continueScan.resolve();
+
+    await expect(scan).rejects.toMatchObject({
+      diagnostic: { code: "runtime_scan_unavailable" },
+    });
+  });
+
   it("当前 generation 的 dev 进程异常 rejection 会转成结构化失败", async () => {
     const runtime = new FakeWebContainer();
     const devExit = createDeferred<number>();

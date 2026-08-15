@@ -115,6 +115,7 @@ export class FakeWebContainer implements WebContainerAdapter {
   terminalExit: Promise<number> = new Promise<number>(() => undefined);
   terminalProcess: FakeWebContainerProcess | null = null;
   previewUrl = "https://5173-webpilot.local";
+  private readonly files = new Map<string, Uint8Array>();
   private serverReadyListener: ((port: number, url: string) => void) | null =
     null;
   readonly fs = {
@@ -123,43 +124,94 @@ export class FakeWebContainer implements WebContainerAdapter {
       options: { withFileTypes: true },
     ): Promise<Array<{ name: string; isDirectory(): boolean }>> => {
       void options;
-      this.calls.push(`readdir:${path}`);
-      if (path === "dist") {
-        return [
-          { name: "index.html", isDirectory: () => false },
-          { name: "static", isDirectory: () => true },
-        ];
+      const normalizedDirectory = normalizeFakePath(path);
+      this.calls.push(`readdir:${normalizedDirectory || "."}`);
+      const children = new Map<string, boolean>();
+
+      for (const filePath of this.files.keys()) {
+        if (
+          normalizedDirectory &&
+          !filePath.startsWith(`${normalizedDirectory}/`)
+        ) {
+          continue;
+        }
+        const relativePath = normalizedDirectory
+          ? filePath.slice(normalizedDirectory.length + 1)
+          : filePath;
+        if (!relativePath) {
+          continue;
+        }
+        const [name, ...remainingSegments] = relativePath.split("/");
+        if (name) {
+          children.set(name, remainingSegments.length > 0);
+        }
       }
-      if (path === "dist/static") {
-        return [{ name: "app.js", isDirectory: () => false }];
-      }
-      return [];
+
+      return [...children.entries()]
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([name, directory]) => ({
+          name,
+          isDirectory: () => directory,
+        }));
     },
     readFile: async (path: string): Promise<Uint8Array> => {
-      this.calls.push(`read:${path}`);
-      if (path === "dist/static/app.js") {
-        return new TextEncoder().encode("console.log('built')");
+      const normalizedPath = normalizeFakePath(path);
+      this.calls.push(`read:${normalizedPath}`);
+      const content = this.files.get(normalizedPath);
+      if (!content) {
+        throw new Error(`ENOENT: ${normalizedPath}`);
       }
-      return new TextEncoder().encode("<html><body>built</body></html>");
+      return new Uint8Array(content);
     },
     mkdir: async (path: string) => {
       this.calls.push(`mkdir:${path}`);
       return path;
     },
     rename: async (fromPath: string, toPath: string) => {
-      this.calls.push(`rename:${fromPath}:${toPath}`);
+      const normalizedFromPath = normalizeFakePath(fromPath);
+      const normalizedToPath = normalizeFakePath(toPath);
+      this.calls.push(`rename:${normalizedFromPath}:${normalizedToPath}`);
+      const content = this.files.get(normalizedFromPath);
+      if (!content) {
+        throw new Error(`ENOENT: ${normalizedFromPath}`);
+      }
+      this.files.delete(normalizedFromPath);
+      this.files.set(normalizedToPath, content);
     },
-    rm: async (path: string) => {
-      this.calls.push(`rm:${path}`);
+    rm: async (
+      path: string,
+      options?: { force?: boolean; recursive?: boolean },
+    ) => {
+      void options;
+      const normalizedPath = normalizeFakePath(path);
+      this.calls.push(`rm:${normalizedPath}`);
+      this.files.delete(normalizedPath);
+      for (const filePath of [...this.files.keys()]) {
+        if (filePath.startsWith(`${normalizedPath}/`)) {
+          this.files.delete(filePath);
+        }
+      }
     },
     writeFile: async (path: string, content: string | Uint8Array) => {
-      this.calls.push(`write:${path}:${content.toString()}`);
+      const normalizedPath = normalizeFakePath(path);
+      const bytes =
+        typeof content === "string"
+          ? new TextEncoder().encode(content)
+          : new Uint8Array(content);
+      this.calls.push(
+        `write:${normalizedPath}:${
+          typeof content === "string" ? content : content.toString()
+        }`,
+      );
+      this.files.set(normalizedPath, bytes);
     },
   };
 
   async mount(tree: FileSystemTree): Promise<void> {
     this.calls.push("mount");
     this.mountedTree = tree;
+    this.files.clear();
+    flattenFakeTree(tree, "", this.files);
   }
 
   async spawn(
@@ -198,6 +250,11 @@ export class FakeWebContainer implements WebContainerAdapter {
       ],
     );
 
+    if (args[0] === "run" && args[1] === "build") {
+      this.setRuntimeFile("dist/index.html", "<html><body>built</body></html>");
+      this.setRuntimeFile("dist/static/app.js", "console.log('built')");
+    }
+
     // 使用 microtask 模拟 spawn 返回后异步触发 server-ready，
     // 同时验证 Manager 必须在 spawn 之前完成事件订阅。
     if (args[0] === "run" && args[1] === "dev") {
@@ -222,5 +279,52 @@ export class FakeWebContainer implements WebContainerAdapter {
 
   teardown(): void {
     this.calls.push("teardown");
+  }
+
+  setRuntimeFile(path: string, content: string | Uint8Array): void {
+    this.files.set(
+      normalizeFakePath(path),
+      typeof content === "string"
+        ? new TextEncoder().encode(content)
+        : new Uint8Array(content),
+    );
+  }
+
+  deleteRuntimePath(path: string): void {
+    const normalizedPath = normalizeFakePath(path);
+    this.files.delete(normalizedPath);
+    for (const filePath of [...this.files.keys()]) {
+      if (filePath.startsWith(`${normalizedPath}/`)) {
+        this.files.delete(filePath);
+      }
+    }
+  }
+}
+
+function normalizeFakePath(path: string): string {
+  const normalized = path.replace(/^\.?\//, "").replace(/\/+$/, "");
+  // WebContainer 以 "." 表示工作区根目录；Fake 内部使用空字符串表示根目录，
+  // 两者必须在边界处归一化，否则递归扫描会把整个项目误判为已删除。
+  return normalized === "." ? "" : normalized;
+}
+
+function flattenFakeTree(
+  tree: FileSystemTree,
+  parentPath: string,
+  files: Map<string, Uint8Array>,
+): void {
+  for (const [name, entry] of Object.entries(tree)) {
+    const path = parentPath ? `${parentPath}/${name}` : name;
+    if ("file" in entry && "contents" in entry.file) {
+      const contents = entry.file.contents;
+      files.set(
+        path,
+        typeof contents === "string"
+          ? new TextEncoder().encode(contents)
+          : new Uint8Array(contents),
+      );
+    } else if ("directory" in entry) {
+      flattenFakeTree(entry.directory, path, files);
+    }
   }
 }
