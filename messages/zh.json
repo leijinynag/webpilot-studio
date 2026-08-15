@@ -87,6 +87,11 @@
         "error": "模型状态读取失败"
       }
     },
+    "layout": {
+      "resizeAgent": "调整 Agent 面板宽度",
+      "resizeExplorer": "调整 Explorer 宽度",
+      "resetWidth": "双击恢复默认宽度"
+    },
     "saving": "Saving",
     "save": "Save",
     "livePreview": "Live preview",

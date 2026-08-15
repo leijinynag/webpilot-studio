@@ -3748,13 +3748,22 @@ html[data-theme="dark"] .piece-art.travel {
 }
 
 .workbench-grid {
+  --workspace-agent-width: 340px;
+
   display: grid;
-  grid-template-columns: minmax(300px, 360px) minmax(0, 1fr);
+  grid-template-columns:
+    clamp(300px, var(--workspace-agent-width), 520px)
+    7px
+    minmax(0, 1fr);
   align-items: stretch;
   height: auto;
   flex: 1 1 auto;
   min-height: 0;
-  min-width: 0;
+  /*
+   * 桌面模式下始终为 Agent、Explorer、两个分隔条和编辑器保留最低宽度。
+   * 当视口不足时由 workbench-page 承担横向滚动，避免拖动把 Monaco 挤出画面。
+   */
+  min-width: 1014px;
   position: relative;
 }
 
@@ -3971,14 +3980,58 @@ html[data-theme="dark"] .piece-art.travel {
 }
 
 .workspace.workspace-ide {
+  --workspace-explorer-width: 224px;
+
   display: grid;
-  grid-template-columns: 224px minmax(0, 1fr);
+  grid-template-columns:
+    clamp(180px, var(--workspace-explorer-width), 360px)
+    7px
+    minmax(0, 1fr);
   grid-template-rows: minmax(0, 1fr);
   height: 100%;
   min-height: 0;
   min-width: 0;
   overflow: hidden;
   background: var(--surface-2);
+}
+
+.workspace-resize-handle {
+  position: relative;
+  z-index: 40;
+  width: 7px;
+  min-width: 7px;
+  height: 100%;
+  outline: none;
+  cursor: col-resize;
+  touch-action: none;
+}
+
+.workspace-resize-handle::before {
+  position: absolute;
+  inset: 0 3px;
+  content: "";
+  background: var(--border);
+  transition:
+    inset 140ms var(--ease-out),
+    background-color 140ms var(--ease-out);
+}
+
+.workspace-resize-handle:hover::before,
+.workspace-resize-handle:focus-visible::before,
+.workspace-resize-handle.is-dragging::before {
+  right: 2px;
+  left: 2px;
+  background: var(--accent);
+}
+
+.workspace-resize-handle:focus-visible {
+  box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--accent) 38%, transparent);
+}
+
+html.is-workspace-resizing,
+html.is-workspace-resizing * {
+  cursor: col-resize !important;
+  user-select: none !important;
 }
 
 .ide-sidebar {
@@ -4617,9 +4670,7 @@ html[data-theme="dark"] .piece-art.travel {
   background: #777c78;
 }
 
-.interactive-terminal[data-state="connecting"]
-  .terminal-connection-status
-  i,
+.interactive-terminal[data-state="connecting"] .terminal-connection-status i,
 .interactive-terminal[data-state="loading"] .terminal-connection-status i {
   background: var(--warning);
   animation: status-pulse 1.6s ease-in-out infinite;
@@ -6911,8 +6962,8 @@ html[data-theme="dark"] .ide-preview-surface {
 
   .workbench-grid {
     display: grid;
-    grid-template-columns: minmax(300px, 360px) minmax(660px, 1fr);
-    width: max(100%, 960px);
+    grid-template-columns: minmax(300px, 360px) minmax(707px, 1fr);
+    width: max(100%, 1014px);
     height: auto;
     min-width: 0;
     min-height: 0;
@@ -6932,6 +6983,10 @@ html[data-theme="dark"] .ide-preview-surface {
     grid-template-rows: minmax(0, 1fr);
     height: 100%;
     min-height: 0;
+  }
+
+  .workspace-resize-handle {
+    display: none;
   }
 
   .runtime-facts {

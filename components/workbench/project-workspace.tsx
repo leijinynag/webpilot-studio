@@ -42,6 +42,7 @@ import {
 } from "@/components/workbench/editor-tabs";
 import { FileOperationDialog } from "@/components/workbench/file-operation-dialog";
 import { FileTree } from "@/components/workbench/file-tree";
+import { WorkspaceResizeHandle } from "@/components/workbench/workspace-resize-handle";
 import { PROJECT_ERROR_CODES } from "@/domains/project/errors";
 import { BrowserGitProjectRepository } from "@/domains/project/browser-git-repository";
 import { browserApiFetch } from "@/infrastructure/http/browser-api";
@@ -187,6 +188,8 @@ export function ProjectWorkspace({
   );
   const repositoryToolRetryAttemptsRef = useRef(new Map<string, number>());
   const [repositoryToolRetryNonce, setRepositoryToolRetryNonce] = useState(0);
+  const workbenchGridRef = useRef<HTMLDivElement | null>(null);
+  const ideWorkspaceRef = useRef<HTMLElement | null>(null);
   const stateRef = useRef(state);
   stateRef.current = state;
   const streamingFileStateRef = useRef(streamingFileState);
@@ -1214,7 +1217,7 @@ export function ProjectWorkspace({
           </Button>
         </section>
       ) : (
-        <div className="workbench-grid">
+        <div className="workbench-grid" ref={workbenchGridRef}>
           <AgentPanel
             dirtyPaths={dirtyPaths}
             onClientToolRequest={handleClientToolRequest}
@@ -1224,7 +1227,18 @@ export function ProjectWorkspace({
             projectId={project.id}
             revision={agentRevision}
           />
-          <section className="workspace workspace-ide">
+          <WorkspaceResizeHandle
+            containerRef={workbenchGridRef}
+            cssVariable="--workspace-agent-width"
+            defaultWidth={340}
+            label={t("workbench.layout.resizeAgent")}
+            maxWidth={520}
+            minWidth={300}
+            panel="agent"
+            reservedWidth={727}
+            resetLabel={t("workbench.layout.resetWidth")}
+          />
+          <section className="workspace workspace-ide" ref={ideWorkspaceRef}>
             <div className="ide-sidebar">
               <div aria-label="Explorer" className="ide-panel-heading">
                 <span>
@@ -1256,6 +1270,18 @@ export function ProjectWorkspace({
                 onRename={(path) => setOperation({ mode: "rename", path })}
               />
             </div>
+
+            <WorkspaceResizeHandle
+              containerRef={ideWorkspaceRef}
+              cssVariable="--workspace-explorer-width"
+              defaultWidth={224}
+              label={t("workbench.layout.resizeExplorer")}
+              maxWidth={360}
+              minWidth={180}
+              panel="explorer"
+              reservedWidth={527}
+              resetLabel={t("workbench.layout.resetWidth")}
+            />
 
             <div className="ide-main">
               <div className="ide-toolbar">
@@ -1547,14 +1573,16 @@ async function importRuntimeChangesViaApi({
   mutations: readonly ProjectFileMutation[];
   projectId: string;
 }): Promise<ProjectMutationResult> {
-  const response = await browserApiFetch(`/api/projects/${projectId}/files/batch`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ expectedRevision, mutations }),
-  });
+  const response = await browserApiFetch(
+    `/api/projects/${projectId}/files/batch`,
+    {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ expectedRevision, mutations }),
+    },
+  );
   const body = (await response.json().catch(() => ({}))) as
-    | { result?: ProjectMutationResult }
-    | ApiErrorBody;
+    { result?: ProjectMutationResult } | ApiErrorBody;
 
   if (!response.ok || !("result" in body) || !body.result) {
     throw createApiError(body, "运行时变更导入失败，请稍后重试。");

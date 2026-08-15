@@ -87,6 +87,11 @@
         "error": "Unable to read model status"
       }
     },
+    "layout": {
+      "resizeAgent": "Resize Agent panel",
+      "resizeExplorer": "Resize Explorer",
+      "resetWidth": "Double-click to restore the default width"
+    },
     "saving": "Saving",
     "save": "Save",
     "livePreview": "Live preview",

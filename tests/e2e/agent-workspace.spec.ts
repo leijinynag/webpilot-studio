@@ -432,6 +432,115 @@ test("keeps Agent fixed and lets the Explorer scroll independently", async ({
   );
 });
 
+test("resizes desktop panels, persists widths, and restores responsive layout", async ({
+  page,
+}) => {
+  const project = await createProject(page, "Resizable workspace columns");
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto(`/p/${project.id}`);
+  await page.evaluate(() => {
+    window.localStorage.removeItem("webpilot:workspace-layout:v1");
+  });
+  await page.reload();
+
+  const agentHandle = page.locator(
+    '[data-resize-panel="agent"][role="separator"]',
+  );
+  const explorerHandle = page.locator(
+    '[data-resize-panel="explorer"][role="separator"]',
+  );
+  const agentPanel = page.locator(".agent-panel-v2");
+  const explorerPanel = page.locator(".ide-sidebar");
+  const editorSurface = page.locator(".ide-main");
+
+  await expect(agentHandle).toBeVisible();
+  await expect(explorerHandle).toBeVisible();
+
+  const initialAgentWidth = await agentPanel.evaluate(
+    (element) => element.getBoundingClientRect().width,
+  );
+  const agentHandleBox = await agentHandle.boundingBox();
+  if (!agentHandleBox) {
+    throw new Error("Agent resize handle 没有可拖动的布局边界。");
+  }
+  await page.mouse.move(
+    agentHandleBox.x + agentHandleBox.width / 2,
+    agentHandleBox.y + agentHandleBox.height / 2,
+  );
+  await page.mouse.down();
+  await page.mouse.move(
+    agentHandleBox.x + agentHandleBox.width / 2 + 72,
+    agentHandleBox.y + agentHandleBox.height / 2,
+    { steps: 6 },
+  );
+  await page.mouse.up();
+  const resizedAgentWidth = await agentPanel.evaluate(
+    (element) => element.getBoundingClientRect().width,
+  );
+  expect(resizedAgentWidth).toBeGreaterThan(initialAgentWidth + 60);
+
+  const initialExplorerWidth = await explorerPanel.evaluate(
+    (element) => element.getBoundingClientRect().width,
+  );
+  const explorerHandleBox = await explorerHandle.boundingBox();
+  if (!explorerHandleBox) {
+    throw new Error("Explorer resize handle 没有可拖动的布局边界。");
+  }
+  await page.mouse.move(
+    explorerHandleBox.x + explorerHandleBox.width / 2,
+    explorerHandleBox.y + explorerHandleBox.height / 2,
+  );
+  await page.mouse.down();
+  await page.mouse.move(
+    explorerHandleBox.x + explorerHandleBox.width / 2 + 48,
+    explorerHandleBox.y + explorerHandleBox.height / 2,
+    { steps: 5 },
+  );
+  await page.mouse.up();
+  const resizedExplorerWidth = await explorerPanel.evaluate(
+    (element) => element.getBoundingClientRect().width,
+  );
+  expect(resizedExplorerWidth).toBeGreaterThan(initialExplorerWidth + 36);
+  await expect(editorSurface).toBeVisible();
+  expect(
+    await editorSurface.evaluate(
+      (element) => element.getBoundingClientRect().width,
+    ),
+  ).toBeGreaterThanOrEqual(520);
+
+  await page.reload();
+  await expect(agentHandle).toBeVisible();
+  expect(
+    await agentPanel.evaluate(
+      (element) => element.getBoundingClientRect().width,
+    ),
+  ).toBeCloseTo(resizedAgentWidth, 0);
+  expect(
+    await explorerPanel.evaluate(
+      (element) => element.getBoundingClientRect().width,
+    ),
+  ).toBeCloseTo(resizedExplorerWidth, 0);
+
+  await agentHandle.dblclick();
+  await explorerHandle.dblclick();
+  expect(
+    await agentPanel.evaluate(
+      (element) => element.getBoundingClientRect().width,
+    ),
+  ).toBeCloseTo(340, 0);
+  expect(
+    await explorerPanel.evaluate(
+      (element) => element.getBoundingClientRect().width,
+    ),
+  ).toBeCloseTo(224, 0);
+
+  await page.setViewportSize({ width: 708, height: 800 });
+  await expect(agentHandle).toBeHidden();
+  await expect(explorerHandle).toBeHidden();
+  await expect(page.locator(".agent-composer-v2")).toBeVisible();
+  await expect(page.locator(".workspace-statusbar")).toBeVisible();
+});
+
 async function waitForRunStatus(
   page: Page,
   runId: string,
