@@ -1,6 +1,7 @@
 @import "tailwindcss";
 @import "tw-animate-css";
 @import "shadcn/tailwind.css";
+@import "@xterm/xterm/css/xterm.css";
 
 @custom-variant dark (&:is(.dark *));
 
@@ -4485,6 +4486,52 @@ html[data-theme="dark"] .piece-art.travel {
   font-size: 0.8125rem;
 }
 
+.runtime-view-tabs {
+  display: inline-flex;
+  align-items: center;
+  align-self: stretch;
+  gap: 2px;
+}
+
+.runtime-view-tabs button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 100%;
+  padding: 0 9px;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  color: var(--muted-foreground);
+  background: transparent;
+  font-size: 0.75rem;
+  font-weight: 650;
+  cursor: pointer;
+  transition:
+    color var(--duration-fast) var(--ease-out),
+    border-color var(--duration-fast) var(--ease-out),
+    background-color var(--duration-fast) var(--ease-out);
+}
+
+.runtime-view-tabs button:hover {
+  color: var(--foreground);
+  background: var(--surface-2);
+}
+
+.runtime-view-tabs button:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: -3px;
+}
+
+.runtime-view-tabs button.is-active {
+  border-bottom-color: var(--accent);
+  color: var(--foreground);
+}
+
+.runtime-view-tabs svg {
+  width: 13px;
+  height: 13px;
+}
+
 .runtime-facts {
   display: flex;
   align-items: center;
@@ -4515,6 +4562,121 @@ html[data-theme="dark"] .piece-art.travel {
   height: auto;
   min-height: 0;
   padding: 8px 12px;
+}
+
+.runtime-terminal[hidden],
+.runtime-terminal-panel[hidden] {
+  display: none;
+}
+
+.runtime-terminal-panel {
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.interactive-terminal {
+  display: grid;
+  position: relative;
+  grid-template-rows: 28px minmax(0, 1fr);
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  color: #ececea;
+  background: var(--code-background);
+}
+
+.interactive-terminal-toolbar {
+  display: flex;
+  z-index: 2;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 0 8px 0 12px;
+  border-bottom: 1px solid rgb(255 255 255 / 8%);
+  background: color-mix(in srgb, var(--code-background) 92%, white 8%);
+}
+
+.terminal-connection-status {
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+  gap: 7px;
+  color: #aeb2ae;
+  font-size: 0.6875rem;
+  white-space: nowrap;
+}
+
+.terminal-connection-status i {
+  width: 6px;
+  height: 6px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: #777c78;
+}
+
+.interactive-terminal[data-state="connecting"]
+  .terminal-connection-status
+  i,
+.interactive-terminal[data-state="loading"] .terminal-connection-status i {
+  background: var(--warning);
+  animation: status-pulse 1.6s ease-in-out infinite;
+}
+
+.interactive-terminal[data-state="connected"] .terminal-connection-status i {
+  background: #8eb8aa;
+}
+
+.interactive-terminal[data-state="failed"] .terminal-connection-status i {
+  background: var(--destructive);
+}
+
+.interactive-terminal-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.interactive-terminal-actions [data-slot="button"] {
+  color: #aeb2ae;
+}
+
+.interactive-terminal-actions [data-slot="button"]:hover {
+  color: #f3f3f0;
+  background: rgb(255 255 255 / 9%);
+}
+
+.interactive-terminal-host {
+  min-width: 0;
+  min-height: 0;
+  padding: 6px 8px 4px;
+  overflow: hidden;
+}
+
+.interactive-terminal-host .xterm {
+  height: 100%;
+}
+
+.interactive-terminal-host .xterm-viewport {
+  scrollbar-color: rgb(255 255 255 / 18%) transparent;
+  scrollbar-width: thin;
+}
+
+.interactive-terminal-error {
+  position: absolute;
+  z-index: 3;
+  right: 10px;
+  bottom: 8px;
+  max-width: min(420px, calc(100% - 20px));
+  padding: 6px 8px;
+  border: 1px solid color-mix(in srgb, var(--destructive) 55%, transparent);
+  border-radius: var(--radius-compact);
+  color: #f4c4b8;
+  background: color-mix(in srgb, var(--code-background) 86%, black 14%);
+  font-size: 0.6875rem;
+  line-height: 1.4;
 }
 
 .console-line {

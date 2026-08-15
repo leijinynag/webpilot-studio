@@ -10,12 +10,14 @@ import {
 import {
   ArrowLeft,
   ArrowRight,
+  Logs,
   ExternalLink,
   Monitor,
   Play,
   RefreshCw,
   RotateCcw,
   Smartphone,
+  SquareTerminal,
 } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
@@ -56,6 +58,7 @@ import { BrowserBridgeController } from "@/infrastructure/webcontainer/browser-b
 import { PreviewEvidenceCollector } from "@/infrastructure/webcontainer/evidence-collector";
 import { WEB_CONTAINER_PHASE_LABELS } from "@/infrastructure/webcontainer/lifecycle";
 import { injectRuntimeBridge } from "@/infrastructure/webcontainer/runtime-bridge";
+import { InteractiveTerminal } from "@/components/preview/interactive-terminal";
 import {
   type WebContainerRuntimeAsset,
   webContainerRuntimeManager,
@@ -126,6 +129,10 @@ function ProjectWebContainerPreview({
   const retryTimerIdsRef = useRef(new Map<string, number>());
   const [frameRevision, setFrameRevision] = useState(0);
   const [compactViewport, setCompactViewport] = useState(false);
+  const [runtimePanel, setRuntimePanel] = useState<"logs" | "terminal">(
+    "logs",
+  );
+  const [terminalOpened, setTerminalOpened] = useState(false);
   const [clientToolRetryNonce, setClientToolRetryNonce] = useState(0);
   const [runtimeRequested, setRuntimeRequested] = useState(() =>
     webContainerRuntimeManager.isActiveProject(projectId),
@@ -866,7 +873,37 @@ function ProjectWebContainerPreview({
 
       <div className="evidence-drawer">
         <header className="evidence-heading">
-          <b>Runtime</b>
+          <div
+            aria-label="Runtime 输出视图"
+            className="runtime-view-tabs"
+            role="tablist"
+          >
+            <button
+              aria-selected={runtimePanel === "logs"}
+              className={runtimePanel === "logs" ? "is-active" : undefined}
+              onClick={() => setRuntimePanel("logs")}
+              role="tab"
+              type="button"
+            >
+              <Logs />
+              日志
+            </button>
+            <button
+              aria-selected={runtimePanel === "terminal"}
+              className={
+                runtimePanel === "terminal" ? "is-active" : undefined
+              }
+              onClick={() => {
+                setTerminalOpened(true);
+                setRuntimePanel("terminal");
+              }}
+              role="tab"
+              type="button"
+            >
+              <SquareTerminal />
+              终端
+            </button>
+          </div>
           <div className="runtime-facts" aria-label="运行时状态">
             <RuntimeFact
               label="State"
@@ -883,7 +920,12 @@ function ProjectWebContainerPreview({
           </div>
         </header>
         <div className="runtime-output">
-          <div aria-live="polite" className="runtime-terminal runtime-console">
+          <div
+            aria-live="polite"
+            className="runtime-terminal runtime-console"
+            hidden={runtimePanel !== "logs"}
+            role="tabpanel"
+          >
             {visibleLogs.length > 0 ? (
               visibleLogs.map((line, index) => (
                 <div className="console-line" key={`${index}-${line}`}>
@@ -894,6 +936,22 @@ function ProjectWebContainerPreview({
               <div className="console-line">等待运行时输出...</div>
             )}
           </div>
+          {terminalOpened ? (
+            <div
+              className="runtime-terminal-panel"
+              hidden={runtimePanel !== "terminal"}
+              role="tabpanel"
+            >
+              <InteractiveTerminal
+                active={runtimePanel === "terminal"}
+                projectId={projectId}
+                runtimeReady={
+                  runtimeBelongsToProject &&
+                  visibleSnapshot.phase === "ready"
+                }
+              />
+            </div>
+          ) : null}
           {visibleSnapshot.diagnostic ? (
             <aside className="runtime-diagnostic">
               <span>{visibleSnapshot.diagnostic.message}</span>
