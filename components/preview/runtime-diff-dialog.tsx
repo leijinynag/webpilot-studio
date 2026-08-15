@@ -401,8 +401,23 @@ function RuntimeDiffEditor({
       </header>
       <div className="runtime-diff-editor-body">
         <MonacoDiffEditor
+          keepCurrentModifiedModel
+          keepCurrentOriginalModel
           language={getMonacoLanguage(entry.path)}
           modified={afterContent}
+          onMount={(editor) => {
+            const model = editor.getModel();
+
+            // Runtime Diff 会在导入成功后立即关闭弹窗。若沿用
+            // @monaco-editor/react 的默认清理顺序，两个 TextModel 会先于
+            // DiffEditor 被释放，Monaco 0.52 因此会报告内部一致性错误。
+            // 这里让 DiffEditor 先完成解绑，再释放本弹窗独占的只读模型；
+            // 既消除关闭时的控制台异常，也避免反复扫描后残留 Monaco 模型。
+            editor.onDidDispose(() => {
+              model?.original.dispose();
+              model?.modified.dispose();
+            });
+          }}
           original={beforeContent}
           options={{
             accessibilitySupport: "auto",
