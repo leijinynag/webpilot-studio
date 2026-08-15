@@ -207,7 +207,8 @@ function inferCodeStyle(prefix: string): string {
 
   const indentation =
     tabIndented.length > twoSpaceIndented.length ? "tabs" : "2 spaces";
-  const quotes = singleQuotes > doubleQuotes ? "single quotes" : "double quotes";
+  const quotes =
+    singleQuotes > doubleQuotes ? "single quotes" : "double quotes";
   const semicolons =
     semicolonLines.length >= Math.max(1, nonEmptyLines.length / 3)
       ? "semicolons"
@@ -222,7 +223,9 @@ function formatFileIndex(paths: readonly string[]): string {
     : "- <empty project>";
 }
 
-function formatRelatedFiles(files: readonly CodeCompletionSourceFile[]): string {
+function formatRelatedFiles(
+  files: readonly CodeCompletionSourceFile[],
+): string {
   if (files.length === 0) {
     return "<none resolved>";
   }

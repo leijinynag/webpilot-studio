@@ -10,8 +10,7 @@ export const CODE_COMPLETION_LANGUAGES = [
   "plaintext",
 ] as const;
 
-export type CodeCompletionLanguage =
-  (typeof CODE_COMPLETION_LANGUAGES)[number];
+export type CodeCompletionLanguage = (typeof CODE_COMPLETION_LANGUAGES)[number];
 
 export const CODE_COMPLETION_TRIGGERS = ["automatic", "explicit"] as const;
 export type CodeCompletionTrigger = (typeof CODE_COMPLETION_TRIGGERS)[number];
@@ -66,12 +65,11 @@ export const codeCompletionRequestSchema = z
   })
   .strict();
 
-export type CodeCompletionRequest = z.infer<
-  typeof codeCompletionRequestSchema
->;
+export type CodeCompletionRequest = z.infer<typeof codeCompletionRequestSchema>;
 
 export const CODE_COMPLETION_EMPTY_REASONS = [
   "no_suggestion",
+  "in_flight",
   "stale_revision",
   "invalid_model_response",
   "completion_too_long",
@@ -88,6 +86,8 @@ export const codeCompletionResponseSchema = z
     insertText: z.string().max(6_000),
     model: z.string().trim().min(1).max(160),
     latencyMs: z.number().int().nonnegative(),
+    firstResultLatencyMs: z.number().int().nonnegative(),
+    cacheHit: z.boolean(),
     reason: z.enum(CODE_COMPLETION_EMPTY_REASONS).optional(),
   })
   .strict();

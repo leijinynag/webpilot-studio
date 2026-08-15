@@ -20,9 +20,7 @@ const OUTPUT_LIMITS = {
   }
 >;
 
-export function getCodeCompletionOutputLimits(
-  trigger: CodeCompletionTrigger,
-) {
+export function getCodeCompletionOutputLimits(trigger: CodeCompletionTrigger) {
   return OUTPUT_LIMITS[trigger];
 }
 

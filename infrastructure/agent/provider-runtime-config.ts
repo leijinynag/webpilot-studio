@@ -239,3 +239,57 @@ export function createContextSummaryProviderRuntime(
     }),
   };
 }
+
+/**
+ * 行内补全是短请求，不能让客户端传入任意模型名，也不应复用 Agent
+ * Run 的模型白名单。服务端只从专用配置或快速模型回退值中选择模型，
+ * 并沿用主 LLM Provider 的密钥与 Base URL。
+ */
+export function createCodeCompletionProviderRuntime(
+  environment: Pick<
+    ServerEnv,
+    | "AGENT_ENABLED"
+    | "LLM_PROVIDER"
+    | "LLM_API_KEY"
+    | "LLM_BASE_URL"
+    | "LLM_FAST_MODEL"
+    | "CODE_COMPLETION_MODEL"
+  >,
+): AgentProviderRuntime {
+  if (environment.AGENT_ENABLED !== "true") {
+    throw new AgentError(
+      AGENT_ERROR_CODES.featureDisabled,
+      "Agent 功能尚未启用。",
+      503,
+    );
+  }
+
+  if (environment.LLM_PROVIDER?.toLowerCase() !== "deepseek") {
+    throw new AgentError(
+      AGENT_ERROR_CODES.providerNotConfigured,
+      "代码补全当前需要 DeepSeek Provider。",
+      503,
+    );
+  }
+
+  const apiKey = environment.LLM_API_KEY?.trim();
+  if (!apiKey) {
+    throw new AgentError(
+      AGENT_ERROR_CODES.providerNotConfigured,
+      "请配置 LLM_API_KEY 后再使用代码补全。",
+      503,
+    );
+  }
+
+  return {
+    providerName: "deepseek",
+    model:
+      environment.CODE_COMPLETION_MODEL?.trim() ||
+      environment.LLM_FAST_MODEL?.trim() ||
+      DEFAULT_FAST_MODEL,
+    provider: new DeepSeekProvider({
+      apiKey,
+      baseUrl: environment.LLM_BASE_URL || "https://api.deepseek.com",
+    }),
+  };
+}

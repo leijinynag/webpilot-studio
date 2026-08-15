@@ -2,6 +2,7 @@ import "server-only";
 
 import {
   createAgentProviderRuntime,
+  createCodeCompletionProviderRuntime,
   createContextSummaryProviderRuntime,
   getAgentModelOptions as resolveAgentModelOptions,
   type AgentProviderRuntime,
@@ -24,4 +25,8 @@ export function getAgentModelOptions() {
 
 export function getContextSummaryProviderRuntime(): AgentProviderRuntime {
   return createContextSummaryProviderRuntime(serverEnv);
+}
+
+export function getCodeCompletionProviderRuntime(): AgentProviderRuntime {
+  return createCodeCompletionProviderRuntime(serverEnv);
 }

@@ -67,6 +67,8 @@ export type UsageBudgetReservation = {
   alreadySettled: boolean;
 };
 
+type ExclusiveUsageResource = "context_checkpoint" | "code_completion";
+
 /**
  * 图片 Worker 和历史兼容入口需要知道当前是否启用了全局费用账本。
  * 预算未配置时继续保留旧的 usage ledger 行为；预算开启后必须走
@@ -115,6 +117,7 @@ const DEFAULT_POLICIES: Record<QuotaResource, QuotaPolicy> = {
 const POSTGRES_INTEGER_MAX = 2_147_483_647;
 const USD_SCALE = 1_000_000;
 const CONTEXT_CHECKPOINT_CLAIM_TTL_MS = 10 * 60 * 1_000;
+const CODE_COMPLETION_CLAIM_TTL_MS = 2 * 60 * 1_000;
 
 type UsageExclusiveClaim = {
   claimId: string;
@@ -832,21 +835,17 @@ export async function reserveContextCheckpointUsageBudget(input: {
   estimatedInputTokens: number;
   maxOutputTokens: number;
 }): Promise<UsageBudgetReservation | null> {
-  if (getGlobalDailyBudgetLimitMicros() === null) {
-    // 即使未启用费用预算，也要在 Provider 调用前占用幂等键。否则同一 Run
-    // 对同一 Checkpoint 源版本失败后再次进入主循环，会产生无法区分的重复
-    // 摘要调用，而事后 onConflictDoNothing 只能隐藏第二次调用，不能阻止它。
-    return reserveContextCheckpointUsageWithoutGlobalBudget(input);
-  }
-
-  const pricing = requireTokenPricing(getModelPricingKind(input.provider));
+  const pricing =
+    getGlobalDailyBudgetLimitMicros() === null
+      ? null
+      : requireTokenPricing(getModelPricingKind(input.provider));
   const reservedInputTokens = Math.max(
     1,
     Math.ceil(input.estimatedInputTokens),
   );
   const reservedOutputTokens = Math.max(1, Math.ceil(input.maxOutputTokens));
 
-  return reserveUsageBudget({
+  return reserveExclusiveUsageBudget({
     ownerId: input.ownerId,
     resource: "context_checkpoint",
     agentRunId: input.agentRunId,
@@ -857,12 +856,14 @@ export async function reserveContextCheckpointUsageBudget(input: {
     idempotencyKey: `context-checkpoint:${input.conversationId}:${input.checkpointVersion}:${input.transcriptSeq}`,
     reservedInputTokens,
     reservedOutputTokens,
-    reservedCostMicros: estimateTokenCostMicros({
-      inputTokens: reservedInputTokens,
-      outputTokens: reservedOutputTokens,
-      inputCostPerMillionUsd: pricing.inputCostPerMillionUsd,
-      outputCostPerMillionUsd: pricing.outputCostPerMillionUsd,
-    }),
+    reservedCostMicros: pricing
+      ? estimateTokenCostMicros({
+          inputTokens: reservedInputTokens,
+          outputTokens: reservedOutputTokens,
+          inputCostPerMillionUsd: pricing.inputCostPerMillionUsd,
+          outputCostPerMillionUsd: pricing.outputCostPerMillionUsd,
+        })
+      : 0,
     metadata: {
       conversationId: input.conversationId,
       checkpointVersion: input.checkpointVersion,
@@ -870,6 +871,50 @@ export async function reserveContextCheckpointUsageBudget(input: {
       costEstimation: "configured_token_price",
     },
     exclusiveClaimTtlMilliseconds: CONTEXT_CHECKPOINT_CLAIM_TTL_MS,
+  });
+}
+
+export async function reserveCodeCompletionUsageBudget(input: {
+  ownerId: string;
+  projectRevision: number;
+  requestFingerprint: string;
+  provider: string;
+  model: string;
+  estimatedInputTokens: number;
+  maxOutputTokens: number;
+}): Promise<UsageBudgetReservation | null> {
+  const pricing =
+    getGlobalDailyBudgetLimitMicros() === null
+      ? null
+      : requireTokenPricing(getModelPricingKind(input.provider));
+  const reservedInputTokens = Math.max(
+    1,
+    Math.ceil(input.estimatedInputTokens),
+  );
+  const reservedOutputTokens = Math.max(1, Math.ceil(input.maxOutputTokens));
+
+  return reserveExclusiveUsageBudget({
+    ownerId: input.ownerId,
+    resource: "code_completion",
+    provider: input.provider,
+    model: input.model,
+    idempotencyKey: `code-completion:${input.ownerId}:${input.projectRevision}:${input.requestFingerprint}`,
+    reservedInputTokens,
+    reservedOutputTokens,
+    reservedCostMicros: pricing
+      ? estimateTokenCostMicros({
+          inputTokens: reservedInputTokens,
+          outputTokens: reservedOutputTokens,
+          inputCostPerMillionUsd: pricing.inputCostPerMillionUsd,
+          outputCostPerMillionUsd: pricing.outputCostPerMillionUsd,
+        })
+      : 0,
+    metadata: {
+      projectRevision: input.projectRevision,
+      requestFingerprint: input.requestFingerprint,
+      costEstimation: "configured_token_price",
+    },
+    exclusiveClaimTtlMilliseconds: CODE_COMPLETION_CLAIM_TTL_MS,
   });
 }
 
@@ -890,7 +935,7 @@ export async function settleContextCheckpointUsageBudget(input: {
     return;
   }
   if (getGlobalDailyBudgetLimitMicros() === null) {
-    await settleContextCheckpointUsageWithoutGlobalBudget({
+    await settleExclusiveUsageWithoutGlobalBudget({
       ...input,
       reservation,
     });
@@ -924,7 +969,62 @@ export async function settleContextCheckpointUsageBudget(input: {
   });
 }
 
-async function settleContextCheckpointUsageWithoutGlobalBudget(input: {
+export async function settleCodeCompletionUsageBudget(input: {
+  reservation: UsageBudgetReservation | null;
+  provider: string;
+  inputTokens: number;
+  outputTokens: number;
+  providerRequestStarted: boolean;
+  usageObserved: boolean;
+  latencyMs: number;
+}): Promise<void> {
+  if (!input.reservation) {
+    return;
+  }
+
+  if (input.reservation.alreadySettled || !input.reservation.acquired) {
+    return;
+  }
+  if (getGlobalDailyBudgetLimitMicros() === null) {
+    await settleExclusiveUsageWithoutGlobalBudget({
+      reservation: input.reservation,
+      inputTokens: input.inputTokens,
+      outputTokens: input.outputTokens,
+      providerRequestStarted: input.providerRequestStarted,
+      usageObserved: input.usageObserved,
+      latencyMs: input.latencyMs,
+    });
+    return;
+  }
+  if (!input.providerRequestStarted) {
+    await releaseUsageBudget(input.reservation);
+    return;
+  }
+
+  const pricing = requireTokenPricing(getModelPricingKind(input.provider));
+  await settleUsageBudget({
+    reservation: input.reservation,
+    inputTokens: input.inputTokens,
+    outputTokens: input.outputTokens,
+    actualCostMicros: input.usageObserved
+      ? estimateTokenCostMicros({
+          inputTokens: input.inputTokens,
+          outputTokens: input.outputTokens,
+          inputCostPerMillionUsd: pricing.inputCostPerMillionUsd,
+          outputCostPerMillionUsd: pricing.outputCostPerMillionUsd,
+        })
+      : undefined,
+    metadata: {
+      usageObserved: input.usageObserved,
+      latencyMs: input.latencyMs,
+      costEstimation: input.usageObserved
+        ? "configured_token_price"
+        : "reserved_upper_bound",
+    },
+  });
+}
+
+async function settleExclusiveUsageWithoutGlobalBudget(input: {
   reservation: UsageBudgetReservation;
   inputTokens: number;
   outputTokens: number;
@@ -1080,6 +1180,26 @@ export async function assertGlobalBudgetAvailable(): Promise<void> {
  * 时，已经存在的 reservation 会直接复用，避免同一个 Provider 请求重复占用
  * 全局预算。
  */
+async function reserveExclusiveUsageBudget(input: {
+  ownerId: string;
+  resource: ExclusiveUsageResource;
+  agentRunId?: string;
+  provider: string;
+  model: string;
+  idempotencyKey: string;
+  reservedInputTokens: number;
+  reservedOutputTokens: number;
+  reservedCostMicros: number;
+  metadata: Record<string, unknown>;
+  exclusiveClaimTtlMilliseconds: number;
+}): Promise<UsageBudgetReservation> {
+  if (getGlobalDailyBudgetLimitMicros() === null) {
+    return reserveExclusiveUsageWithoutGlobalBudget(input);
+  }
+
+  return reserveUsageBudget(input);
+}
+
 async function reserveUsageBudget(input: {
   ownerId: string;
   resource: UsageResource;
@@ -1371,27 +1491,26 @@ async function reserveUsageBudget(input: {
  * 未启用费用预算时仍先写一条零金额 reserved 账本，作为 Checkpoint 调用的
  * 幂等声明。这里只服务摘要调用，普通模型与图片继续沿用原有兼容记录路径。
  */
-async function reserveContextCheckpointUsageWithoutGlobalBudget(input: {
+async function reserveExclusiveUsageWithoutGlobalBudget(input: {
   ownerId: string;
-  agentRunId: string;
-  conversationId: string;
-  checkpointVersion: number;
-  transcriptSeq: number;
+  resource: ExclusiveUsageResource;
+  agentRunId?: string;
   provider: string;
   model: string;
-  estimatedInputTokens: number;
-  maxOutputTokens: number;
+  idempotencyKey: string;
+  reservedInputTokens: number;
+  reservedOutputTokens: number;
+  metadata: Record<string, unknown>;
+  exclusiveClaimTtlMilliseconds: number;
 }): Promise<UsageBudgetReservation> {
-  const idempotencyKey = `context-checkpoint:${input.conversationId}:${input.checkpointVersion}:${input.transcriptSeq}`;
+  const idempotencyKey = input.idempotencyKey;
   const bucketDate = getUtcDateKey();
   const db = getDatabase();
   const requestedClaim = createUsageExclusiveClaim(
-    CONTEXT_CHECKPOINT_CLAIM_TTL_MS,
+    input.exclusiveClaimTtlMilliseconds,
   );
   const metadata = {
-    conversationId: input.conversationId,
-    checkpointVersion: input.checkpointVersion,
-    transcriptSeq: input.transcriptSeq,
+    ...input.metadata,
     bucketDate,
     costEstimation: "pending_price_table",
     ...requestedClaim,
@@ -1401,14 +1520,14 @@ async function reserveContextCheckpointUsageWithoutGlobalBudget(input: {
     .insert(usageLedger)
     .values({
       ownerId: input.ownerId,
-      resource: "context_checkpoint",
+      resource: input.resource,
       agentRunId: input.agentRunId,
       provider: input.provider,
       model: input.model,
       status: "reserved",
       idempotencyKey,
-      reservedInputTokens: Math.max(1, Math.ceil(input.estimatedInputTokens)),
-      reservedOutputTokens: Math.max(1, Math.ceil(input.maxOutputTokens)),
+      reservedInputTokens: Math.max(1, Math.ceil(input.reservedInputTokens)),
+      reservedOutputTokens: Math.max(1, Math.ceil(input.reservedOutputTokens)),
       estimatedCostUsd: "0",
       metadata,
     })
@@ -1437,7 +1556,7 @@ async function reserveContextCheckpointUsageWithoutGlobalBudget(input: {
   if (!existing) {
     throw new QuotaError(
       QUOTA_ERROR_CODES.storageUnavailable,
-      "Checkpoint 用量账本暂不可用，请稍后重试。",
+      "独占用量账本暂不可用，请稍后重试。",
       503,
     );
   }
@@ -1454,8 +1573,11 @@ async function reserveContextCheckpointUsageWithoutGlobalBudget(input: {
         agentRunId: input.agentRunId,
         provider: input.provider,
         model: input.model,
-        reservedInputTokens: Math.max(1, Math.ceil(input.estimatedInputTokens)),
-        reservedOutputTokens: Math.max(1, Math.ceil(input.maxOutputTokens)),
+        reservedInputTokens: Math.max(1, Math.ceil(input.reservedInputTokens)),
+        reservedOutputTokens: Math.max(
+          1,
+          Math.ceil(input.reservedOutputTokens),
+        ),
         inputTokens: 0,
         outputTokens: 0,
         metadata: {
@@ -1504,16 +1626,14 @@ async function reserveContextCheckpointUsageWithoutGlobalBudget(input: {
     };
   }
 
-  // 预算关闭时没有预算桶事务可复用，因此使用“旧 Claim 值 + returning”
-  // 完成数据库级 CAS。两个请求即使同时读到过期 Claim，也只有一个更新成功。
   const [reclaimed] = await db
     .update(usageLedger)
     .set({
       agentRunId: input.agentRunId,
       provider: input.provider,
       model: input.model,
-      reservedInputTokens: Math.max(1, Math.ceil(input.estimatedInputTokens)),
-      reservedOutputTokens: Math.max(1, Math.ceil(input.maxOutputTokens)),
+      reservedInputTokens: Math.max(1, Math.ceil(input.reservedInputTokens)),
+      reservedOutputTokens: Math.max(1, Math.ceil(input.reservedOutputTokens)),
       metadata: {
         ...metadata,
         bucketDate: existingBucketDate,
@@ -1735,6 +1855,41 @@ export async function recordContextCheckpointUsage(input: {
       conversationId: input.conversationId,
       checkpointVersion: input.checkpointVersion,
       transcriptSeq: input.transcriptSeq,
+      latencyMs: input.latencyMs,
+      costEstimation: "pending_price_table",
+    },
+  });
+}
+
+/**
+ * 全局费用预算未启用时，代码补全仍保留一条独立账本记录。
+ *
+ * 补全不属于 Agent Run，不能复用 agent-turn 的幂等键，否则同一个项目
+ * revision 下的多次编辑会被错误合并，导致成本、延迟和模型使用统计失真。
+ * requestFingerprint 由服务端根据完整 Prompt 语义生成，clientRequestId
+ * 不参与指纹，因此重试和短期缓存不会重复写入账本。
+ */
+export async function recordCodeCompletionUsage(input: {
+  ownerId: string;
+  provider: string;
+  model: string;
+  projectRevision: number;
+  requestFingerprint: string;
+  inputTokens: number;
+  outputTokens: number;
+  latencyMs: number;
+}): Promise<void> {
+  await recordUsageWithoutGlobalBudget({
+    ownerId: input.ownerId,
+    resource: "code_completion",
+    provider: input.provider,
+    model: input.model,
+    idempotencyKey: `code-completion:${input.ownerId}:${input.projectRevision}:${input.requestFingerprint}`,
+    inputTokens: input.inputTokens,
+    outputTokens: input.outputTokens,
+    metadata: {
+      projectRevision: input.projectRevision,
+      requestFingerprint: input.requestFingerprint,
       latencyMs: input.latencyMs,
       costEstimation: "pending_price_table",
     },
