@@ -35,7 +35,10 @@ import {
 import { CodeEditor } from "@/components/workbench/code-editor";
 import { AgentPanel } from "@/components/workbench/agent-panel";
 import { BrowserGitMigrationDialog } from "@/components/workbench/browser-git-migration-dialog";
-import { EditorTabs } from "@/components/workbench/editor-tabs";
+import {
+  EditorTabs,
+  type EditorTabItem,
+} from "@/components/workbench/editor-tabs";
 import { FileOperationDialog } from "@/components/workbench/file-operation-dialog";
 import { FileTree } from "@/components/workbench/file-tree";
 import { PROJECT_ERROR_CODES } from "@/domains/project/errors";
@@ -51,6 +54,14 @@ import {
   createBrowserRepositoryToolFailure,
   executeBrowserRepositoryClientTool,
 } from "@/domains/agent/browser-git-client-tools";
+import {
+  applyStreamingFileEvents,
+  createStreamingFileProjectionState,
+  dismissStreamingFileProjection,
+  handoffStreamingFileProjection,
+  type StreamingFileProjection,
+} from "@/domains/agent/streaming-file-projection";
+import type { AgentRunEvent } from "@/domains/agent/types";
 import type {
   ProjectDescription,
   ProjectFileSnapshot,
@@ -119,6 +130,12 @@ export function ProjectWorkspace({
   const [operation, setOperation] = useState<FileOperation>(null);
   const [mutationPending, setMutationPending] = useState(false);
   const [agentRevision, setAgentRevision] = useState(project.revision);
+  const [streamingFileState, setStreamingFileState] = useState(() =>
+    createStreamingFileProjectionState(),
+  );
+  const [activeStreamingFileId, setActiveStreamingFileId] = useState<
+    string | null
+  >(null);
   const [clientToolRequest, setClientToolRequest] =
     useState<ClientToolRequest | null>(null);
   const browserGitRepository = useMemo(
@@ -158,6 +175,8 @@ export function ProjectWorkspace({
   const [repositoryToolRetryNonce, setRepositoryToolRetryNonce] = useState(0);
   const stateRef = useRef(state);
   stateRef.current = state;
+  const streamingFileStateRef = useRef(streamingFileState);
+  streamingFileStateRef.current = streamingFileState;
 
   /**
    * Browser Git 文件没有服务端副本，补全请求必须读取工作台 reducer 的最新草稿。
@@ -195,6 +214,42 @@ export function ProjectWorkspace({
   const activeFile = state.activePath
     ? (state.files[state.activePath] ?? null)
     : null;
+  const activeStreamingFile = activeStreamingFileId
+    ? (streamingFileState.projections[activeStreamingFileId] ?? null)
+    : null;
+  const editorTabs = useMemo<EditorTabItem[]>(() => {
+    const repositoryTabs = state.openPaths.flatMap((path) => {
+      const file = state.files[path];
+      return file
+        ? [
+            {
+              id: getRepositoryEditorTabId(path),
+              kind: "repository" as const,
+              path,
+              dirty: file.dirty,
+            },
+          ]
+        : [];
+    });
+    const streamingTabs = streamingFileState.order.flatMap((id) => {
+      const projection = streamingFileState.projections[id];
+      return projection
+        ? [
+            {
+              id,
+              kind: "streaming" as const,
+              path: projection.path,
+              status: projection.status,
+            },
+          ]
+        : [];
+    });
+
+    return [...repositoryTabs, ...streamingTabs];
+  }, [state.files, state.openPaths, streamingFileState]);
+  const activeEditorTabId =
+    activeStreamingFile?.id ??
+    (state.activePath ? getRepositoryEditorTabId(state.activePath) : null);
   const repositoryFiles = useMemo(
     () =>
       Object.values(state.files)
@@ -208,6 +263,45 @@ export function ProjectWorkspace({
     t,
   );
 
+  /**
+   * 文件流事件既可能来自实时 SSE，也可能来自断线后的 Conversation 快照。
+   * 独立 ref 让同一事件循环里的连续 delta 能基于最新 sequence 前进，而无需
+   * 等待 React 完成 render；领域投影仍负责去重、坏事件消费和会话切换清理。
+   */
+  const handleFileStreamEvents = useCallback(
+    (conversationId: string, events: readonly AgentRunEvent[]) => {
+      const current = streamingFileStateRef.current;
+      const next = applyStreamingFileEvents({
+        state: current,
+        conversationId,
+        events,
+      });
+
+      if (next === current) {
+        return;
+      }
+
+      streamingFileStateRef.current = next;
+      setStreamingFileState(next);
+
+      const startedProjectionId = next.order.find(
+        (id) => !current.projections[id] && next.projections[id],
+      );
+      if (startedProjectionId) {
+        // 只在新 Tool Call 开始时切到代码视图。后续高频 delta 不抢焦点，
+        // 用户仍可查看其他正式文件或 Preview。
+        setActiveStreamingFileId(startedProjectionId);
+        setView("code");
+        return;
+      }
+
+      setActiveStreamingFileId((currentId) =>
+        currentId && next.projections[currentId] ? currentId : null,
+      );
+    },
+    [],
+  );
+
   useEffect(() => {
     // 发布页无法访问另一个路由实例中的 reducer，因此只同步“是否有草稿”
     // 这项跨页面事实，不同步正文，避免把 Monaco 内容复制到持久化存储。
@@ -219,6 +313,68 @@ export function ProjectWorkspace({
 
     window.sessionStorage.setItem(key, JSON.stringify(dirtyPaths));
   }, [dirtyPaths, project.id]);
+
+  useEffect(() => {
+    if (streamingFileState.order.length === 0) {
+      return;
+    }
+
+    const repositoryPaths = new Set(
+      Object.values(state.files)
+        .filter((file) => file.repositoryPresent)
+        .map((file) => file.path),
+    );
+    let next = streamingFileState;
+    const handedOff: StreamingFileProjection[] = [];
+
+    for (const projectionId of streamingFileState.order) {
+      const handoff = handoffStreamingFileProjection({
+        state: next,
+        projectionId,
+        repositoryRevision: state.revision,
+        repositoryPaths,
+      });
+      if (!handoff) {
+        continue;
+      }
+
+      next = handoff.state;
+      handedOff.push(handoff.projection);
+    }
+
+    if (next === streamingFileState) {
+      return;
+    }
+
+    let cancelled = false;
+    queueMicrotask(() => {
+      // effect 计算结果到微任务执行之间，SSE 仍可能推进投影。只允许基于同一
+      // 快照的交接落地，避免旧 next 覆盖刚收到的 delta 或并行 Tool Call。
+      if (cancelled || streamingFileStateRef.current !== streamingFileState) {
+        return;
+      }
+
+      // Repository 已经同时满足 revision 与真实路径约束，此时才把正式文件加入
+      // 标签页。非活动临时文件后台打开，避免多个并行 write_file 依次抢走焦点。
+      for (const projection of handedOff) {
+        dispatch({
+          type: "open",
+          path: projection.path,
+          activate: projection.id === activeStreamingFileId,
+        });
+      }
+
+      streamingFileStateRef.current = next;
+      setStreamingFileState(next);
+      setActiveStreamingFileId((currentId) =>
+        currentId && next.projections[currentId] ? currentId : null,
+      );
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [activeStreamingFileId, state.files, state.revision, streamingFileState]);
 
   useEffect(() => {
     function confirmUnload(event: BeforeUnloadEvent) {
@@ -812,6 +968,44 @@ export function ProjectWorkspace({
     dispatch({ type: "close", path });
   }
 
+  function closeEditorTab(tabId: string) {
+    const projection = streamingFileStateRef.current.projections[tabId];
+    if (!projection) {
+      const repositoryPath = readRepositoryEditorTabPath(tabId);
+      if (repositoryPath) {
+        closeFile(repositoryPath);
+      }
+      return;
+    }
+
+    // 主动关闭只回收浏览器临时视图；sequence 游标必须保留，防止稍后的
+    // Conversation 快照重放 started 事件又把用户关闭的标签重新打开。
+    const next = dismissStreamingFileProjection(
+      streamingFileStateRef.current,
+      tabId,
+    );
+    streamingFileStateRef.current = next;
+    setStreamingFileState(next);
+    setActiveStreamingFileId((currentId) =>
+      currentId === tabId ? null : currentId,
+    );
+  }
+
+  function selectEditorTab(tabId: string) {
+    if (streamingFileStateRef.current.projections[tabId]) {
+      setActiveStreamingFileId(tabId);
+      return;
+    }
+
+    const repositoryPath = readRepositoryEditorTabPath(tabId);
+    if (!repositoryPath) {
+      return;
+    }
+
+    setActiveStreamingFileId(null);
+    dispatch({ type: "open", path: repositoryPath });
+  }
+
   function handleWorkbenchLink(event: React.MouseEvent<HTMLDivElement>) {
     const target = event.target as HTMLElement;
     const link = target.closest("a");
@@ -909,6 +1103,7 @@ export function ProjectWorkspace({
           <AgentPanel
             dirtyPaths={dirtyPaths}
             onClientToolRequest={handleClientToolRequest}
+            onFileStreamEvents={handleFileStreamEvents}
             onRevisionChange={handleAgentRevisionChange}
             onRestoreComplete={handleRestoreComplete}
             projectId={project.id}
@@ -952,23 +1147,28 @@ export function ProjectWorkspace({
                 {view === "code" ? (
                   <>
                     <EditorTabs
-                      activePath={state.activePath}
-                      files={state.files}
-                      onClose={closeFile}
-                      onSelect={(path) => dispatch({ type: "open", path })}
-                      openPaths={state.openPaths}
+                      activeId={activeEditorTabId}
+                      onClose={closeEditorTab}
+                      onSelect={selectEditorTab}
+                      tabs={editorTabs}
                     />
                     <div className="editor-actions">
                       <CodeCompletionMenu
-                        activeFile={activeFile !== null}
-                        onTrigger={codeCompletionTrigger}
+                        activeFile={
+                          activeFile !== null && activeStreamingFile === null
+                        }
+                        onTrigger={
+                          activeStreamingFile ? null : codeCompletionTrigger
+                        }
                         settings={codeCompletionSettings}
                       />
                       <Tooltip>
                         <TooltipTrigger asChild>
                           <Button
                             aria-label={t("workbench.formatFile")}
-                            disabled={!activeFile}
+                            disabled={
+                              !activeFile || Boolean(activeStreamingFile)
+                            }
                             onClick={formatActiveFile}
                             size="icon-sm"
                             variant="ghost"
@@ -982,7 +1182,9 @@ export function ProjectWorkspace({
                       </Tooltip>
                       <Button
                         disabled={
-                          !activeFile?.dirty || state.saveStatus === "saving"
+                          Boolean(activeStreamingFile) ||
+                          !activeFile?.dirty ||
+                          state.saveStatus === "saving"
                         }
                         onClick={saveActiveFile}
                         size="sm"
@@ -1009,7 +1211,7 @@ export function ProjectWorkspace({
                   hidden={view !== "code"}
                 >
                   {view === "code" ? (
-                    activeFile ? (
+                    activeStreamingFile || activeFile ? (
                       <CodeEditor
                         codeCompletion={{
                           automaticEnabled:
@@ -1020,14 +1222,32 @@ export function ProjectWorkspace({
                           storageKind: project.storageKind,
                           getBrowserFiles: getBrowserCodeCompletionFiles,
                         }}
-                        file={activeFile}
-                        onChange={(content) =>
+                        file={
+                          activeStreamingFile
+                            ? {
+                                path: activeStreamingFile.path,
+                                content: activeStreamingFile.content,
+                                modelPath:
+                                  getStreamingFileMonacoUri(
+                                    activeStreamingFile,
+                                  ),
+                                readOnly: true,
+                              }
+                            : {
+                                path: activeFile!.path,
+                                content: activeFile!.draftContent,
+                              }
+                        }
+                        onChange={(content) => {
+                          if (!activeFile || activeStreamingFile) {
+                            return;
+                          }
                           dispatch({
                             type: "edit",
                             path: activeFile.path,
                             content,
-                          })
-                        }
+                          });
+                        }}
                         onEditorReady={(editorInstance) => {
                           editorRef.current = editorInstance;
                         }}
@@ -1075,17 +1295,21 @@ export function ProjectWorkspace({
                 )}
               >
                 <span>
-                  {state.statusMessage ||
-                    localizedStatusMessage ||
-                    (dirtyPaths.length > 0
-                      ? t("workbench.unsavedFiles", {
-                          count: dirtyPaths.length,
-                        })
-                      : t("workbench.repositoryRevision", {
-                          revision: state.revision,
-                        }))}
+                  {activeStreamingFile
+                    ? formatStreamingFileStatus(activeStreamingFile, t)
+                    : state.statusMessage ||
+                      localizedStatusMessage ||
+                      (dirtyPaths.length > 0
+                        ? t("workbench.unsavedFiles", {
+                            count: dirtyPaths.length,
+                          })
+                        : t("workbench.repositoryRevision", {
+                            revision: state.revision,
+                          }))}
                 </span>
-                {activeFile ? <span>{activeFile.path}</span> : null}
+                {activeStreamingFile || activeFile ? (
+                  <span>{activeStreamingFile?.path ?? activeFile?.path}</span>
+                ) : null}
               </footer>
             </div>
           </section>
@@ -1136,6 +1360,49 @@ function formatWorkspaceStatusDetail(
     case "deleted":
       return t("workbench.fileDeleted", { path: detail.path });
   }
+}
+
+const REPOSITORY_EDITOR_TAB_PREFIX = "repository:";
+
+function getRepositoryEditorTabId(path: string): string {
+  return `${REPOSITORY_EDITOR_TAB_PREFIX}${path}`;
+}
+
+function readRepositoryEditorTabPath(tabId: string): string | null {
+  if (!tabId.startsWith(REPOSITORY_EDITOR_TAB_PREFIX)) {
+    return null;
+  }
+
+  const path = tabId.slice(REPOSITORY_EDITOR_TAB_PREFIX.length);
+  return path.length > 0 ? path : null;
+}
+
+function getStreamingFileMonacoUri(
+  projection: StreamingFileProjection,
+): string {
+  const path = projection.path
+    .split("/")
+    .map((segment) => encodeURIComponent(segment))
+    .join("/");
+
+  // 每个 Tool Call 都获得独立的 Monaco model。即使 Agent 正在覆盖一个已打开的
+  // 正式文件，临时内容也不会共享撤销栈、诊断标记或编辑器 view state。
+  return `webpilot-stream://${encodeURIComponent(
+    projection.runId,
+  )}/${encodeURIComponent(projection.toolCallId)}/${path}`;
+}
+
+function formatStreamingFileStatus(
+  projection: StreamingFileProjection,
+  t: (key: string, values?: Record<string, string | number>) => string,
+): string {
+  return t(
+    projection.status === "streaming"
+      ? "workbench.streamingFile.generating"
+      : projection.status === "completed"
+        ? "workbench.streamingFile.validating"
+        : "workbench.streamingFile.syncing",
+  );
 }
 
 function toProjectFileSnapshot(file: {

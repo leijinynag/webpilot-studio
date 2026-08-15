@@ -48,6 +48,22 @@ describe("project workspace reducer", () => {
     expect(state.files["src/styles.css"]?.draftContent).toBe("updated");
   });
 
+  it("可以在后台打开 Agent 刚写入的正式文件而不抢占当前标签", () => {
+    let state = createProjectWorkspaceState(
+      [file("src/index.tsx", "index"), file("src/generated.ts", "generated")],
+      2,
+    );
+
+    state = projectWorkspaceReducer(state, {
+      type: "open",
+      path: "src/generated.ts",
+      activate: false,
+    });
+
+    expect(state.openPaths).toEqual(["src/index.tsx", "src/generated.ts"]);
+    expect(state.activePath).toBe("src/index.tsx");
+  });
+
   it("保存响应较慢时保留响应期间产生的新草稿", () => {
     let state = createProjectWorkspaceState(
       [file("src/index.tsx", "server")],

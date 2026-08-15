@@ -4187,6 +4187,26 @@ html[data-theme="dark"] .piece-art.travel {
   box-shadow: inset 0 2px 0 var(--accent);
 }
 
+.editor-tab.is-streaming {
+  background:
+    linear-gradient(
+      90deg,
+      color-mix(in srgb, var(--accent) 7%, transparent),
+      transparent 72%
+    ),
+    var(--surface-2);
+}
+
+.editor-tab.is-streaming.is-active {
+  background:
+    linear-gradient(
+      90deg,
+      color-mix(in srgb, var(--accent) 10%, transparent),
+      transparent 78%
+    ),
+    var(--surface);
+}
+
 .editor-tab > button:first-child {
   display: flex;
   align-items: center;
@@ -4207,6 +4227,32 @@ html[data-theme="dark"] .piece-art.travel {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.editor-tab .editor-tab-streaming-status {
+  display: inline-flex;
+  width: 14px;
+  height: 14px;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  overflow: visible;
+  color: var(--accent);
+}
+
+.editor-tab-streaming-status svg {
+  width: 13px;
+  height: 13px;
+}
+
+.editor-tab-streaming-status.is-generating svg {
+  animation: streaming-file-spin 0.9s linear infinite;
+}
+
+@keyframes streaming-file-spin {
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 .editor-actions {

@@ -47,7 +47,7 @@ export type ProjectWorkspaceState = {
 };
 
 export type WorkspaceAction =
-  | { type: "open"; path: string }
+  | { type: "open"; path: string; activate?: boolean }
   | { type: "close"; path: string }
   | { type: "edit"; path: string; content: string }
   | { type: "save-start" }
@@ -120,7 +120,7 @@ export function projectWorkspaceReducer(
 
       return {
         ...state,
-        activePath: action.path,
+        activePath: action.activate === false ? state.activePath : action.path,
         openPaths: state.openPaths.includes(action.path)
           ? state.openPaths
           : [...state.openPaths, action.path],

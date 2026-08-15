@@ -71,6 +71,11 @@
     "backToProjects": "Back to projects",
     "createFile": "New file",
     "formatFile": "Format current file",
+    "streamingFile": {
+      "generating": "Agent is generating file content",
+      "validating": "File arguments complete; validating write",
+      "syncing": "File written; syncing Repository"
+    },
     "codeCompletion": {
       "title": "AI inline completion",
       "automatic": "Show completions automatically",

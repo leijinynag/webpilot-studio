@@ -1,6 +1,6 @@
 "use client";
 
-import { X } from "lucide-react";
+import { CircleCheck, LoaderCircle, X } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import {
@@ -8,22 +8,34 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import type { WorkspaceFile } from "@/domains/project/workspace";
+import type { StreamingFileProjectionStatus } from "@/domains/agent/streaming-file-projection";
 import { useUiI18n } from "@/infrastructure/i18n/ui";
 import { cn } from "@/lib/utils";
 
+export type EditorTabItem =
+  | {
+      id: string;
+      kind: "repository";
+      path: string;
+      dirty: boolean;
+    }
+  | {
+      id: string;
+      kind: "streaming";
+      path: string;
+      status: StreamingFileProjectionStatus;
+    };
+
 export function EditorTabs({
-  activePath,
-  files,
-  openPaths,
+  activeId,
   onClose,
   onSelect,
+  tabs,
 }: {
-  activePath: string | null;
-  files: Record<string, WorkspaceFile>;
-  openPaths: string[];
-  onClose: (path: string) => void;
-  onSelect: (path: string) => void;
+  activeId: string | null;
+  onClose: (id: string) => void;
+  onSelect: (id: string) => void;
+  tabs: readonly EditorTabItem[];
 }) {
   const { t } = useUiI18n();
 
@@ -33,29 +45,45 @@ export function EditorTabs({
       className="editor-tabs"
       role="tablist"
     >
-      {openPaths.map((path) => {
-        const file = files[path];
-
-        if (!file) {
-          return null;
-        }
-
+      {tabs.map((tab) => {
+        const active = activeId === tab.id;
         return (
           <div
-            aria-selected={activePath === path}
-            className={cn("editor-tab", activePath === path && "is-active")}
-            key={path}
+            aria-selected={active}
+            className={cn(
+              "editor-tab",
+              active && "is-active",
+              tab.kind === "streaming" && "is-streaming",
+            )}
+            key={tab.id}
             role="tab"
           >
-            <button onClick={() => onSelect(path)} type="button">
-              <span>{path.split("/").at(-1)}</span>
-              {file.dirty ? <i aria-label={t("workbench.unsaved")} /> : null}
+            <button onClick={() => onSelect(tab.id)} type="button">
+              <span>{tab.path.split("/").at(-1)}</span>
+              {tab.kind === "repository" && tab.dirty ? (
+                <i aria-label={t("workbench.unsaved")} />
+              ) : null}
+              {tab.kind === "streaming" ? (
+                <span
+                  aria-label={getStreamingStatusLabel(tab.status, t)}
+                  className={cn(
+                    "editor-tab-streaming-status",
+                    tab.status === "streaming" && "is-generating",
+                  )}
+                >
+                  {tab.status === "streaming" ? (
+                    <LoaderCircle />
+                  ) : (
+                    <CircleCheck />
+                  )}
+                </span>
+              ) : null}
             </button>
             <Tooltip>
               <TooltipTrigger asChild>
                 <Button
-                  aria-label={t("workbench.closeFile", { path })}
-                  onClick={() => onClose(path)}
+                  aria-label={t("workbench.closeFile", { path: tab.path })}
+                  onClick={() => onClose(tab.id)}
                   size="icon-xs"
                   variant="ghost"
                 >
@@ -68,5 +96,18 @@ export function EditorTabs({
         );
       })}
     </div>
+  );
+}
+
+function getStreamingStatusLabel(
+  status: StreamingFileProjectionStatus,
+  t: (key: string, values?: Record<string, string | number>) => string,
+): string {
+  return t(
+    status === "streaming"
+      ? "workbench.streamingFile.generating"
+      : status === "completed"
+        ? "workbench.streamingFile.validating"
+        : "workbench.streamingFile.syncing",
   );
 }

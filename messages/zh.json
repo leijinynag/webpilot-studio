@@ -71,6 +71,11 @@
     "backToProjects": "返回项目列表",
     "createFile": "新建文件",
     "formatFile": "格式化当前文件",
+    "streamingFile": {
+      "generating": "Agent 正在生成文件内容",
+      "validating": "文件参数已完成，正在校验写入",
+      "syncing": "文件已写入，正在同步 Repository"
+    },
     "codeCompletion": {
       "title": "AI 行内补全",
       "automatic": "自动显示补全",

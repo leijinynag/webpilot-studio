@@ -6,7 +6,6 @@ import type { editor } from "monaco-editor";
 
 import type { CodeCompletionSourceFile } from "@/domains/code-completion/types";
 import type { ProjectStorageKind } from "@/domains/project/types";
-import type { WorkspaceFile } from "@/domains/project/workspace";
 import { loadLocalMonacoReact } from "@/components/workbench/monaco-client";
 import { useUiI18n } from "@/infrastructure/i18n/ui";
 
@@ -22,6 +21,17 @@ function EditorLoading() {
   const { t } = useUiI18n();
   return <div className="editor-loading">{t("workbench.editorLoading")}</div>;
 }
+
+export type CodeEditorFile = {
+  path: string;
+  content: string;
+  /**
+   * 临时生成文件使用独立 URI，避免与 Repository 中同路径的正式 Monaco
+   * model 共用撤销栈、诊断和 view state。真实文件不传时继续使用 path。
+   */
+  modelPath?: string;
+  readOnly?: boolean;
+};
 
 export function CodeEditor({
   codeCompletion,
@@ -39,7 +49,7 @@ export function CodeEditor({
     storageKind: ProjectStorageKind;
     getBrowserFiles: () => readonly CodeCompletionSourceFile[];
   };
-  file: WorkspaceFile;
+  file: CodeEditorFile;
   onChange: (content: string) => void;
   onCompletionTriggerReady: (trigger: (() => void) | null) => void;
   onEditorReady: (editor: editor.IStandaloneCodeEditor | null) => void;
@@ -54,21 +64,35 @@ export function CodeEditor({
     projectRevision,
     storageKind,
   } = codeCompletion;
+  const readOnly = file.readOnly === true;
+  const effectiveCompletionEnabled = completionEnabled && !readOnly;
+  const effectiveAutomaticCompletionEnabled =
+    automaticCompletionEnabled && !readOnly;
   const saveRef = useRef(onSave);
+  const readOnlyRef = useRef(readOnly);
   const mountedEditorRef = useRef<editor.IStandaloneCodeEditor | null>(null);
   const completionClientRef = useRef<
     | import("@/infrastructure/code-completion/client").CodeCompletionClient
     | null
   >(null);
   const completionSnapshotRef = useRef({
-    ...codeCompletion,
+    automaticEnabled: effectiveAutomaticCompletionEnabled,
+    enabled: effectiveCompletionEnabled,
+    getBrowserFiles,
     path: file.path,
+    projectId,
+    projectRevision,
+    storageKind,
   });
   const completionTriggerReadyRef = useRef(onCompletionTriggerReady);
 
   useEffect(() => {
     saveRef.current = onSave;
   }, [onSave]);
+
+  useEffect(() => {
+    readOnlyRef.current = readOnly;
+  }, [readOnly]);
 
   useEffect(() => {
     completionTriggerReadyRef.current = onCompletionTriggerReady;
@@ -78,8 +102,8 @@ export function CodeEditor({
     // Provider 读取 ref 而不是闭包中的旧 props。这样补全模块无需在每次输入
     // 后重新注册，同时 ref 写入发生在 commit 之后，符合 React 的纯渲染约束。
     completionSnapshotRef.current = {
-      automaticEnabled: automaticCompletionEnabled,
-      enabled: completionEnabled,
+      automaticEnabled: effectiveAutomaticCompletionEnabled,
+      enabled: effectiveCompletionEnabled,
       getBrowserFiles,
       path: file.path,
       projectId,
@@ -87,8 +111,8 @@ export function CodeEditor({
       storageKind,
     };
   }, [
-    automaticCompletionEnabled,
-    completionEnabled,
+    effectiveAutomaticCompletionEnabled,
+    effectiveCompletionEnabled,
     file.path,
     getBrowserFiles,
     projectId,
@@ -98,23 +122,27 @@ export function CodeEditor({
 
   useEffect(() => {
     mountedEditorRef.current?.updateOptions({
-      inlineSuggest: { enabled: completionEnabled },
+      inlineSuggest: { enabled: effectiveCompletionEnabled },
+      readOnly,
     });
 
     // 切换文件、Repository revision 或关闭功能时，正在等待的结果已经失去
     // 插入资格。主动取消可尽早释放网络和 Provider 等待，不只依赖返回后的校验。
     completionClientRef.current?.cancel(
-      completionEnabled
-        ? automaticCompletionEnabled
+      effectiveCompletionEnabled
+        ? effectiveAutomaticCompletionEnabled
           ? "context_changed"
           : "automatic_disabled"
-        : "disabled",
+        : readOnly
+          ? "read_only"
+          : "disabled",
     );
   }, [
-    automaticCompletionEnabled,
-    completionEnabled,
+    effectiveAutomaticCompletionEnabled,
+    effectiveCompletionEnabled,
     file.path,
     projectRevision,
+    readOnly,
   ]);
 
   return (
@@ -151,13 +179,23 @@ export function CodeEditor({
       }}
       height="100%"
       language={getMonacoLanguage(file.path)}
-      onChange={(value) => onChange(value ?? "")}
+      onChange={(value) => {
+        // Monaco 的 readOnly 是主要交互边界，这里再做一次事件级防守。
+        // 即使未来插件或测试直接触发 change，也不能把临时内容写入工作台草稿。
+        if (!readOnlyRef.current) {
+          onChange(value ?? "");
+        }
+      }}
       onMount={(mountedEditor, monaco) => {
         mountedEditorRef.current = mountedEditor;
         onEditorReady(mountedEditor);
         mountedEditor.addCommand(
           monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS,
-          () => saveRef.current(),
+          () => {
+            if (!readOnlyRef.current) {
+              saveRef.current();
+            }
+          },
         );
 
         const applyTheme = () => {
@@ -217,6 +255,7 @@ export function CodeEditor({
               inlineSuggest: {
                 enabled: completionSnapshotRef.current.enabled,
               },
+              readOnly: readOnlyRef.current,
             });
           })
           .catch(() => {
@@ -257,7 +296,7 @@ export function CodeEditor({
           '"SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace',
         fontLigatures: true,
         fontSize: 14,
-        inlineSuggest: { enabled: completionEnabled },
+        inlineSuggest: { enabled: effectiveCompletionEnabled },
         lineHeight: 22,
         minimap: { enabled: false },
         padding: { top: 14, bottom: 14 },
@@ -266,10 +305,11 @@ export function CodeEditor({
         smoothScrolling: true,
         tabSize: 2,
         wordWrap: "on",
+        readOnly,
       }}
-      path={file.path}
+      path={file.modelPath ?? file.path}
       saveViewState
-      value={file.draftContent}
+      value={file.content}
     />
   );
 }
