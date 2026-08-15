@@ -98,7 +98,7 @@ async function expectNoMissingMessageKeys(page: Page): Promise<void> {
   // 只检查可见主内容，避免 Next.js 注入到 body 中的 RSC/脚本序列化内容
   // 把合法的 sourceControl.foo 消息 key 误判成用户可见的缺失翻译。
   await expect(page.locator("main")).not.toContainText(
-    /\b(?:common|nav|theme|workbench|projects|newProject|errors|agent|showcase|sourceControl|publish|changeSet)\.[a-z][\w.]*/,
+    /\b(?:common|nav|theme|workbench|projects|newProject|errors|agent|showcase|sourceControl|publish|changeSet|runtimeDiff)\.[a-z][\w.]*/,
   );
 }
 

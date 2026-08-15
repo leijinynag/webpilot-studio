@@ -1,6 +1,6 @@
 import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
 import {
   waitForRuntimeRender,
@@ -13,6 +13,7 @@ import type { ProjectFileSnapshot } from "@/domains/project/types";
 const {
   runtimeActivateProject,
   runtimeActiveProject,
+  runtimeDetectRuntimeChanges,
   runtimeSnapshot,
   runtimeStart,
 } = vi.hoisted(() => {
@@ -38,6 +39,18 @@ const {
       }
     }),
     runtimeActiveProject: { value: null as string | null },
+    runtimeDetectRuntimeChanges: vi.fn(async () => ({
+      projectKey: "22222222-2222-4222-8222-222222222222",
+      baseRevision: 2,
+      entries: [
+        {
+          path: "src/index.tsx",
+          status: "modified" as const,
+          beforeContent: "export const title = 'before';",
+          afterContent: "export const title = 'after';",
+        },
+      ],
+    })),
     runtimeSnapshot: snapshot,
     runtimeStart: vi.fn(
       async (
@@ -63,6 +76,7 @@ vi.mock("@/infrastructure/webcontainer/runtime-manager", () => ({
     subscribe: () => () => undefined,
     getSnapshot: () => runtimeSnapshot,
     activateProject: runtimeActivateProject,
+    detectRuntimeChanges: runtimeDetectRuntimeChanges,
     isActiveProject: (projectId: string) =>
       runtimeActiveProject.value === projectId,
     start: runtimeStart,
@@ -136,6 +150,22 @@ const request: PreviewClientToolRequest = {
   },
 };
 
+const originalResizeObserver = globalThis.ResizeObserver;
+
+beforeAll(() => {
+  // Radix Tooltip/Dialog 在测试环境里会访问 ResizeObserver。JSDOM 没有真实布局，
+  // 这里提供一个空实现，只让弹层生命周期完整跑完，不参与任何尺寸推导。
+  globalThis.ResizeObserver = class ResizeObserverMock {
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  } as typeof ResizeObserver;
+});
+
+afterAll(() => {
+  globalThis.ResizeObserver = originalResizeObserver;
+});
+
 function createFiles(content: string): ProjectFileSnapshot[] {
   return [
     {
@@ -175,6 +205,7 @@ function renderPreview({
     <TooltipProvider>
       <WebContainerPreview
         clientToolRequest={clientToolRequest}
+        dirtyPaths={[]}
         files={files}
         onClientToolResult={onClientToolResult}
         projectId={request.projectId}
@@ -191,6 +222,7 @@ describe("WebContainerPreview 客户端工具执行", () => {
     cleanup();
     runtimeActiveProject.value = null;
     runtimeActivateProject.mockClear();
+    runtimeDetectRuntimeChanges.mockClear();
     runtimeStart.mockClear();
   });
 
@@ -243,6 +275,7 @@ describe("WebContainerPreview 客户端工具执行", () => {
       <TooltipProvider>
         <WebContainerPreview
           clientToolRequest={null}
+          dirtyPaths={[]}
           files={files}
           onClientToolResult={vi.fn()}
           projectId={request.projectId}
@@ -259,6 +292,7 @@ describe("WebContainerPreview 客户端工具执行", () => {
       <TooltipProvider>
         <WebContainerPreview
           clientToolRequest={null}
+          dirtyPaths={[]}
           files={files}
           onClientToolResult={vi.fn()}
           projectId={otherProjectId}
@@ -315,6 +349,7 @@ describe("WebContainerPreview 客户端工具执行", () => {
       <TooltipProvider>
         <WebContainerPreview
           clientToolRequest={{ ...request }}
+          dirtyPaths={[]}
           files={[...initialFiles]}
           onClientToolResult={onClientToolResult}
           projectId={request.projectId}
@@ -373,6 +408,92 @@ describe("WebContainerPreview 客户端工具执行", () => {
           `agent:${request.runId}:${request.toolCallId}:${request.revision}`,
       ),
     ).toBe(true);
+  });
+
+  it("运行时变更扫描后通过 Diff 审查导入选中文件", async () => {
+    const user = userEvent.setup();
+    runtimeActiveProject.value = request.projectId;
+    const onImportRuntimeChanges = vi.fn<
+      NonNullable<
+        React.ComponentProps<typeof WebContainerPreview>["onImportRuntimeChanges"]
+      >
+    >(async () => ({
+      status: "imported" as const,
+      revision: 3,
+    }));
+
+    render(
+      <TooltipProvider>
+        <WebContainerPreview
+          clientToolRequest={null}
+          dirtyPaths={[]}
+          files={createFiles("export const title = 'runtime';")}
+          onClientToolResult={vi.fn()}
+          onImportRuntimeChanges={onImportRuntimeChanges}
+          projectId={request.projectId}
+          revision={2}
+        />
+      </TooltipProvider>,
+    );
+
+    await user.click(
+      screen.getByRole("button", { name: "检测运行时变更" }),
+    );
+
+    await waitFor(() =>
+      expect(runtimeDetectRuntimeChanges).toHaveBeenCalledWith({
+        projectKey: request.projectId,
+      }),
+    );
+    expect(
+      await screen.findByRole("button", { name: /src\/index\.tsx/ }),
+    ).toBeVisible();
+
+    await user.click(screen.getByRole("button", { name: "导入 1 个文件" }));
+
+    await waitFor(() => expect(onImportRuntimeChanges).toHaveBeenCalledTimes(1));
+    expect(onImportRuntimeChanges.mock.calls[0]?.[0]).toMatchObject({
+      baseRevision: 2,
+      projectKey: request.projectId,
+    });
+    expect(onImportRuntimeChanges.mock.calls[0]?.[1]).toEqual([
+      expect.objectContaining({
+        path: "src/index.tsx",
+        status: "modified",
+      }),
+    ]);
+  });
+
+  it("选中路径存在未保存草稿时阻止运行时导入", async () => {
+    const user = userEvent.setup();
+    runtimeActiveProject.value = request.projectId;
+    const onImportRuntimeChanges = vi.fn();
+
+    render(
+      <TooltipProvider>
+        <WebContainerPreview
+          clientToolRequest={null}
+          dirtyPaths={["src/index.tsx"]}
+          files={createFiles("export const title = 'draft';")}
+          onClientToolResult={vi.fn()}
+          onImportRuntimeChanges={onImportRuntimeChanges}
+          projectId={request.projectId}
+          revision={2}
+        />
+      </TooltipProvider>,
+    );
+
+    await user.click(
+      screen.getByRole("button", { name: "检测运行时变更" }),
+    );
+
+    expect(
+      await screen.findByRole("button", { name: /src\/index\.tsx/ }),
+    ).toBeVisible();
+    expect(
+      screen.getByRole("button", { name: "导入 1 个文件" }),
+    ).toBeDisabled();
+    expect(onImportRuntimeChanges).not.toHaveBeenCalled();
   });
 });
 

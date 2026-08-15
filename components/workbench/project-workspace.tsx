@@ -21,6 +21,7 @@ import {
 } from "lucide-react";
 
 import { WebContainerPreview } from "@/components/preview/webcontainer-preview";
+import type { RuntimeImportResult } from "@/components/preview/runtime-diff-dialog";
 import { Button } from "@/components/ui/button";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import {
@@ -64,8 +65,11 @@ import {
 import type { AgentRunEvent } from "@/domains/agent/types";
 import type {
   ProjectDescription,
+  ProjectFileMutation,
   ProjectFileSnapshot,
   ProjectMutationResult,
+  RuntimeFileDiff,
+  RuntimeFileDiffEntry,
 } from "@/domains/project/types";
 import {
   createProjectWorkspaceState,
@@ -107,6 +111,16 @@ class ClientToolResultSubmissionError extends Error {
   ) {
     super(message);
     this.name = "ClientToolResultSubmissionError";
+  }
+}
+
+class ProjectApiResponseError extends Error {
+  constructor(
+    message: string,
+    readonly code: string | null,
+  ) {
+    super(message);
+    this.name = code ?? "ProjectApiResponseError";
   }
 }
 
@@ -563,6 +577,7 @@ export function ProjectWorkspace({
         files: filesBody.files,
         revision: projectBody.project.revision,
       });
+      setAgentRevision(projectBody.project.revision);
     } catch {
       dispatch({
         type: "error",
@@ -588,6 +603,106 @@ export function ProjectWorkspace({
     // reconcile 会更新服务端基线，同时继续保留 Monaco 中尚未保存的 draft。
     await refreshRepositorySnapshot();
   }
+
+  const handleImportRuntimeChanges = useCallback(
+    async (
+      diff: RuntimeFileDiff,
+      selectedEntries: readonly RuntimeFileDiffEntry[],
+    ): Promise<RuntimeImportResult> => {
+      const current = stateRef.current;
+      const selectedPaths = selectedEntries.map((entry) => entry.path);
+      const selectedDirtyPaths = selectedPaths.filter(
+        (path) => current.files[path]?.dirty,
+      );
+
+      if (selectedEntries.length === 0) {
+        return {
+          status: "failed",
+          message: t("runtimeDiff.noSelectedFiles"),
+        };
+      }
+
+      if (diff.baseRevision !== current.revision) {
+        await refreshRepositorySnapshot();
+        return {
+          status: "stale",
+          message: t("runtimeDiff.staleReview"),
+        };
+      }
+
+      if (selectedDirtyPaths.length > 0) {
+        return {
+          status: "failed",
+          message: t("runtimeDiff.draftImportBlocked", {
+            count: selectedDirtyPaths.length,
+          }),
+        };
+      }
+
+      const mutations = selectedEntries
+        .map<ProjectFileMutation | null>((entry) => {
+          if (entry.status === "deleted") {
+            return { type: "delete", path: entry.path };
+          }
+
+          if (entry.afterContent === null) {
+            return null;
+          }
+
+          return {
+            type: "write",
+            path: entry.path,
+            content: entry.afterContent,
+          };
+        })
+        .filter((mutation): mutation is ProjectFileMutation =>
+          Boolean(mutation),
+        );
+
+      if (mutations.length !== selectedEntries.length) {
+        return {
+          status: "failed",
+          message: t("runtimeDiff.invalidDiff"),
+        };
+      }
+
+      try {
+        const result = browserGitRepository
+          ? await browserGitRepository.batchMutateFiles({
+              expectedRevision: diff.baseRevision,
+              mutations,
+            })
+          : await importRuntimeChangesViaApi({
+              projectId: project.id,
+              expectedRevision: diff.baseRevision,
+              mutations,
+            });
+
+        // 运行时导入是 Repository 事实更新。刷新快照会把新 revision 和文件内容
+        // 重新灌入工作台；reducer 仍会保护未保存草稿，但此处已先阻止重叠路径。
+        setAgentRevision(result.revision);
+        await refreshRepositorySnapshot();
+        return { status: "imported", revision: result.revision };
+      } catch (error) {
+        if (isRevisionConflictError(error)) {
+          await refreshRepositorySnapshot();
+          return {
+            status: "stale",
+            message: t("runtimeDiff.importConflict"),
+          };
+        }
+
+        return {
+          status: "failed",
+          message:
+            error instanceof Error
+              ? error.message
+              : t("runtimeDiff.importFailed"),
+        };
+      }
+    },
+    [browserGitRepository, project.id, refreshRepositorySnapshot, t],
+  );
 
   const handleClientToolRequest = useCallback(
     (request: ClientToolRequest) => {
@@ -1279,7 +1394,9 @@ export function ProjectWorkspace({
                         ? clientToolRequest
                         : null
                     }
+                    dirtyPaths={dirtyPaths}
                     files={repositoryFiles}
+                    onImportRuntimeChanges={handleImportRuntimeChanges}
                     onClientToolResult={handleClientToolResult}
                     projectId={project.id}
                     revision={state.revision}
@@ -1419,6 +1536,55 @@ function toProjectFileSnapshot(file: {
     hash: file.hash,
     updatedAt: file.updatedAt,
   };
+}
+
+async function importRuntimeChangesViaApi({
+  expectedRevision,
+  mutations,
+  projectId,
+}: {
+  expectedRevision: number;
+  mutations: readonly ProjectFileMutation[];
+  projectId: string;
+}): Promise<ProjectMutationResult> {
+  const response = await browserApiFetch(`/api/projects/${projectId}/files/batch`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ expectedRevision, mutations }),
+  });
+  const body = (await response.json().catch(() => ({}))) as
+    | { result?: ProjectMutationResult }
+    | ApiErrorBody;
+
+  if (!response.ok || !("result" in body) || !body.result) {
+    throw createApiError(body, "运行时变更导入失败，请稍后重试。");
+  }
+
+  return body.result;
+}
+
+function createApiError(body: unknown, fallback: string): Error {
+  const error =
+    body && typeof body === "object" && "error" in body
+      ? (body.error as ApiErrorBody["error"])
+      : null;
+  const message =
+    error && typeof error.message === "string" ? error.message : fallback;
+  return new ProjectApiResponseError(message, error?.code ?? null);
+}
+
+function isRevisionConflictError(error: unknown): boolean {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+
+  const code =
+    "code" in error && typeof error.code === "string" ? error.code : null;
+
+  return (
+    error.name === PROJECT_ERROR_CODES.revisionConflict ||
+    code === PROJECT_ERROR_CODES.revisionConflict
+  );
 }
 
 function getInitialFileContent(path: string): string {

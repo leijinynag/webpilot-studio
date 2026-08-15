@@ -6354,6 +6354,369 @@ html[data-theme="dark"] .ide-preview-surface {
   color: var(--success);
 }
 
+.runtime-diff-dialog {
+  grid-template-rows: auto minmax(0, 1fr) auto auto;
+  width: min(1120px, calc(100vw - 40px));
+  max-width: none;
+  height: min(780px, calc(100dvh - 40px));
+  gap: 0;
+  overflow: hidden;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-shell);
+  background: var(--surface-raised);
+  box-shadow: var(--shadow-shell);
+}
+
+.runtime-diff-header {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(280px, 0.82fr);
+  gap: 18px;
+  align-items: end;
+  padding: 18px 20px 16px;
+  border-bottom: 1px solid var(--border);
+}
+
+.runtime-diff-header > div {
+  display: grid;
+  gap: 6px;
+}
+
+.runtime-diff-header [data-slot="dialog-title"] {
+  font-size: 1.08rem;
+  line-height: 1.2;
+}
+
+.runtime-diff-header [data-slot="dialog-description"] {
+  max-width: 520px;
+  justify-self: end;
+  line-height: 1.5;
+  text-align: right;
+}
+
+.runtime-diff-eyebrow {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--accent);
+  font-size: 0.68rem;
+  font-weight: 750;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.runtime-diff-eyebrow svg {
+  width: 13px;
+  height: 13px;
+}
+
+.runtime-diff-state,
+.runtime-diff-editor-loading {
+  display: flex;
+  min-height: 260px;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  color: var(--muted-foreground);
+  font-size: 0.82rem;
+}
+
+.runtime-diff-state.is-error {
+  flex-direction: column;
+  color: var(--destructive);
+}
+
+.runtime-diff-state > svg,
+.runtime-diff-editor-loading > svg {
+  width: 18px;
+  height: 18px;
+  color: var(--accent);
+}
+
+.runtime-diff-state.is-error > svg {
+  color: var(--destructive);
+}
+
+.runtime-diff-layout {
+  display: grid;
+  grid-template-columns: 310px minmax(0, 1fr);
+  min-height: 0;
+  overflow: hidden;
+}
+
+.runtime-diff-sidebar {
+  display: grid;
+  grid-template-rows: auto auto auto minmax(0, 1fr) auto;
+  min-width: 0;
+  min-height: 0;
+  border-right: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.runtime-diff-summary {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  padding: 13px 14px;
+  border-bottom: 1px solid var(--border-soft);
+  color: var(--muted-foreground);
+  font-size: 0.72rem;
+}
+
+.runtime-diff-summary small {
+  color: var(--faint-foreground);
+  font-size: 0.66rem;
+}
+
+.runtime-diff-counts {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 6px;
+  padding: 10px 12px 6px;
+}
+
+.runtime-diff-counts span {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+  padding: 8px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-compact);
+  background: var(--surface-2);
+}
+
+.runtime-diff-counts strong {
+  font-size: 0.9rem;
+  line-height: 1;
+}
+
+.runtime-diff-counts small {
+  color: var(--muted-foreground);
+  font-size: 0.62rem;
+}
+
+.runtime-diff-selection-actions {
+  display: flex;
+  gap: 7px;
+  padding: 6px 12px 9px;
+}
+
+.runtime-diff-file-list {
+  min-height: 0;
+  overflow: auto;
+  padding: 6px;
+  scrollbar-width: thin;
+}
+
+.runtime-diff-file {
+  display: grid;
+  grid-template-columns: 16px 16px minmax(0, 1fr) auto;
+  width: 100%;
+  min-height: 38px;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 7px;
+  border: 0;
+  border-radius: var(--radius-compact);
+  color: var(--muted-foreground);
+  background: transparent;
+  cursor: pointer;
+  text-align: left;
+  transition:
+    color var(--duration-fast) var(--ease-out),
+    background-color var(--duration-fast) var(--ease-out);
+}
+
+.runtime-diff-file:hover,
+.runtime-diff-file.is-active {
+  color: var(--foreground);
+  background: var(--surface-2);
+}
+
+.runtime-diff-file.is-active {
+  box-shadow: inset 2px 0 0 var(--accent);
+}
+
+.runtime-diff-file.has-draft {
+  background: color-mix(in srgb, var(--warning) 9%, transparent);
+}
+
+.runtime-diff-checkmark {
+  display: grid;
+  width: 14px;
+  height: 14px;
+  place-items: center;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--surface);
+}
+
+.runtime-diff-checkmark.is-selected {
+  border-color: var(--accent);
+  color: var(--accent-foreground);
+  background: var(--accent);
+}
+
+.runtime-diff-file svg {
+  width: 14px;
+  height: 14px;
+  color: var(--faint-foreground);
+}
+
+.runtime-diff-checkmark svg {
+  width: 10px;
+  height: 10px;
+  color: currentColor;
+}
+
+.runtime-diff-file.is-active svg {
+  color: var(--accent);
+}
+
+.runtime-diff-file.is-active .runtime-diff-checkmark.is-selected svg {
+  color: currentColor;
+}
+
+.runtime-diff-file span {
+  overflow: hidden;
+  font-size: 0.72rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.runtime-diff-status-badge {
+  height: 18px;
+  padding: 0 5px;
+  font-size: 0.6rem;
+}
+
+.runtime-diff-status-badge.is-added {
+  border-color: color-mix(in srgb, var(--success) 38%, var(--border));
+  color: var(--success);
+}
+
+.runtime-diff-status-badge.is-modified {
+  border-color: color-mix(in srgb, var(--accent) 38%, var(--border));
+  color: var(--accent);
+}
+
+.runtime-diff-status-badge.is-deleted {
+  border-color: color-mix(in srgb, var(--destructive) 38%, var(--border));
+  color: var(--destructive);
+}
+
+.runtime-diff-drafts {
+  display: grid;
+  gap: 6px;
+  max-height: 150px;
+  overflow: auto;
+  padding: 12px 14px;
+  border-top: 1px solid var(--border);
+  background: var(--surface-2);
+  scrollbar-width: thin;
+}
+
+.runtime-diff-drafts strong {
+  font-size: 0.72rem;
+}
+
+.runtime-diff-drafts p {
+  margin: 0;
+  color: var(--muted-foreground);
+  font-size: 0.66rem;
+  line-height: 1.45;
+}
+
+.runtime-diff-drafts ul {
+  display: grid;
+  gap: 3px;
+  margin: 0;
+  padding: 0;
+  color: var(--foreground);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.62rem;
+  list-style: none;
+}
+
+.runtime-diff-drafts li {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.runtime-diff-main {
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  background: var(--surface-2);
+}
+
+.runtime-diff-editor {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.runtime-diff-editor > header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.runtime-diff-editor > header > div {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 7px;
+}
+
+.runtime-diff-editor > header svg {
+  width: 14px;
+  height: 14px;
+  flex: 0 0 auto;
+  color: var(--accent);
+}
+
+.runtime-diff-editor > header strong {
+  overflow: hidden;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.72rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.runtime-diff-editor-body {
+  min-height: 0;
+}
+
+.runtime-diff-message {
+  padding: 8px 14px;
+  border-top: 1px solid var(--border);
+  color: var(--muted-foreground);
+  background: var(--surface);
+  font-size: 0.72rem;
+}
+
+.runtime-diff-footer {
+  display: flex;
+  min-height: 62px;
+  flex-direction: row;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  margin: 0;
+  padding: 12px 16px;
+  border-radius: 0;
+}
+
 .change-set-restore-copy.is-blocked svg {
   color: var(--destructive);
 }
@@ -6748,6 +7111,64 @@ html[data-theme="dark"] .ide-preview-surface {
   }
 
   .change-set-footer [data-slot="button"] {
+    width: 100%;
+  }
+
+  .runtime-diff-dialog {
+    width: calc(100vw - 16px);
+    max-width: none;
+    height: calc(100dvh - 16px);
+  }
+
+  .runtime-diff-header {
+    grid-template-columns: 1fr;
+    gap: 7px;
+    padding: 15px 16px 13px;
+  }
+
+  .runtime-diff-header [data-slot="dialog-description"] {
+    max-width: none;
+    justify-self: start;
+    padding-right: 28px;
+    text-align: left;
+  }
+
+  .runtime-diff-layout {
+    display: block;
+    overflow: auto;
+  }
+
+  .runtime-diff-sidebar {
+    display: block;
+    border-right: 0;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .runtime-diff-file-list {
+    display: flex;
+    overflow-x: auto;
+    padding: 7px;
+  }
+
+  .runtime-diff-file {
+    width: auto;
+    min-width: 220px;
+  }
+
+  .runtime-diff-drafts {
+    max-height: 120px;
+  }
+
+  .runtime-diff-main {
+    height: min(480px, 54dvh);
+  }
+
+  .runtime-diff-footer {
+    align-items: stretch;
+    flex-direction: column-reverse;
+  }
+
+  .runtime-diff-footer [data-slot="button"] {
     width: 100%;
   }
 }

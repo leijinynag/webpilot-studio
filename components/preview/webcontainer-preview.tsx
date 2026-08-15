@@ -16,6 +16,7 @@ import {
   Play,
   RefreshCw,
   RotateCcw,
+  ScanSearch,
   Smartphone,
   SquareTerminal,
 } from "lucide-react";
@@ -23,12 +24,20 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
+  RuntimeDiffDialog,
+  type RuntimeImportResult,
+} from "@/components/preview/runtime-diff-dialog";
+import {
   Tooltip,
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { buildProjectTemplate } from "@/domains/project/template";
-import type { ProjectFileSnapshot } from "@/domains/project/types";
+import type {
+  ProjectFileSnapshot,
+  RuntimeFileDiff,
+  RuntimeFileDiffEntry,
+} from "@/domains/project/types";
 import {
   type BrowserBridgeResponse,
   type BrowserCommand,
@@ -75,6 +84,11 @@ type WebContainerPreviewProps = {
     | "duplicate"
     | "ignored"
     | Promise<"accepted" | "duplicate" | "ignored">;
+  dirtyPaths: readonly string[];
+  onImportRuntimeChanges?: (
+    diff: RuntimeFileDiff,
+    selectedEntries: readonly RuntimeFileDiffEntry[],
+  ) => Promise<RuntimeImportResult>;
   projectId: string;
   revision: number;
 };
@@ -87,7 +101,9 @@ export function WebContainerPreview(props: WebContainerPreviewProps) {
 
 function ProjectWebContainerPreview({
   clientToolRequest,
+  dirtyPaths,
   files,
+  onImportRuntimeChanges,
   onClientToolResult,
   projectId,
   revision,
@@ -141,6 +157,11 @@ function ProjectWebContainerPreview({
     WebContainerRuntimeAsset[]
   >([]);
   const [assetLoadError, setAssetLoadError] = useState<string | null>(null);
+  const [runtimeDiffOpen, setRuntimeDiffOpen] = useState(false);
+  const [runtimeDiff, setRuntimeDiff] = useState<RuntimeFileDiff | null>(null);
+  const [runtimeDiffLoading, setRuntimeDiffLoading] = useState(false);
+  const [runtimeDiffError, setRuntimeDiffError] = useState<string | null>(null);
+  const runtimeDiffRequestRef = useRef(0);
   const projectTree = useMemo(
     () =>
       buildProjectTemplate(
@@ -710,6 +731,12 @@ function ProjectWebContainerPreview({
   // 保留足够多的上下文供用户定位安装或编译失败，容器本身负责滚动，
   // 避免只显示堆栈尾部而丢失真正的首条错误信息。
   const visibleLogs = visibleSnapshot.logs.slice(-60);
+  const canScanRuntimeChanges =
+    runtimeBelongsToProject &&
+    visibleSnapshot.phase === "ready" &&
+    visibleSnapshot.syncedRevision === revision &&
+    !clientToolExecutionKey &&
+    Boolean(onImportRuntimeChanges);
 
   function refreshPreview() {
     if (!visibleSnapshot.previewUrl) {
@@ -744,6 +771,82 @@ function ProjectWebContainerPreview({
     setRuntimeRequested(true);
   }
 
+  async function scanRuntimeChanges() {
+    if (!canScanRuntimeChanges) {
+      setRuntimeDiffOpen(true);
+      setRuntimeDiffError("运行环境尚未同步到当前 Repository revision。");
+      return;
+    }
+
+    const requestId = runtimeDiffRequestRef.current + 1;
+    runtimeDiffRequestRef.current = requestId;
+    const expectedProjectId = projectId;
+    const expectedRevision = revision;
+    setRuntimeDiffOpen(true);
+    setRuntimeDiffLoading(true);
+    setRuntimeDiffError(null);
+
+    try {
+      const diff = await webContainerRuntimeManager.detectRuntimeChanges({
+        projectKey: projectId,
+      });
+
+      // 扫描可能排在 Repository 同步之后执行。结果回到 React 前必须再次校验
+      // 项目与 revision 身份，陈旧 Diff 只能提示重扫，不能进入导入确认。
+      const latestSnapshot = webContainerRuntimeManager.getSnapshot();
+      if (
+        runtimeDiffRequestRef.current !== requestId ||
+        expectedProjectId !== projectId ||
+        expectedRevision !== revision ||
+        diff.projectKey !== expectedProjectId ||
+        diff.baseRevision !== expectedRevision ||
+        latestSnapshot.syncedRevision !== expectedRevision ||
+        !webContainerRuntimeManager.isActiveProject(expectedProjectId)
+      ) {
+        setRuntimeDiff(null);
+        setRuntimeDiffError("运行环境或 Repository 已变化，请重新检测。");
+        return;
+      }
+
+      setRuntimeDiff(diff);
+      setRuntimeDiffError(null);
+    } catch (error) {
+      if (runtimeDiffRequestRef.current !== requestId) {
+        return;
+      }
+
+      setRuntimeDiff(null);
+      setRuntimeDiffError(
+        error instanceof Error
+          ? error.message
+          : "运行时变更检测失败，请稍后重试。",
+      );
+    } finally {
+      if (runtimeDiffRequestRef.current === requestId) {
+        setRuntimeDiffLoading(false);
+      }
+    }
+  }
+
+  async function importRuntimeChanges(
+    diff: RuntimeFileDiff,
+    selectedEntries: readonly RuntimeFileDiffEntry[],
+  ): Promise<RuntimeImportResult> {
+    if (
+      diff.projectKey !== projectId ||
+      diff.baseRevision !== revision ||
+      !canScanRuntimeChanges ||
+      !onImportRuntimeChanges
+    ) {
+      return {
+        status: "stale",
+        message: "Repository 或运行环境已变化，请重新检测后再导入。",
+      };
+    }
+
+    return onImportRuntimeChanges(diff, selectedEntries);
+  }
+
   const hasProjectFiles = !projectTreeIsEmpty(projectTree);
 
   return (
@@ -763,6 +866,13 @@ function ProjectWebContainerPreview({
             onClick={refreshPreview}
           >
             <RefreshCw />
+          </ToolbarButton>
+          <ToolbarButton
+            disabled={!canScanRuntimeChanges}
+            label="检测运行时变更"
+            onClick={scanRuntimeChanges}
+          >
+            <ScanSearch />
           </ToolbarButton>
         </div>
 
@@ -968,6 +1078,21 @@ function ProjectWebContainerPreview({
           ) : null}
         </div>
       </div>
+      <RuntimeDiffDialog
+        diff={runtimeDiff}
+        dirtyPaths={dirtyPaths}
+        errorMessage={runtimeDiffError}
+        loading={runtimeDiffLoading}
+        onImport={importRuntimeChanges}
+        onOpenChange={(open) => {
+          setRuntimeDiffOpen(open);
+          if (!open) {
+            setRuntimeDiffError(null);
+          }
+        }}
+        onRescan={scanRuntimeChanges}
+        open={runtimeDiffOpen}
+      />
     </>
   );
 }
