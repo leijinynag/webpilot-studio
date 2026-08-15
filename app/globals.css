@@ -116,6 +116,38 @@ html[data-theme="dark"] {
   --shadow-hover: 0 18px 48px rgb(0 0 0 / 62%);
 }
 
+/*
+ * system 主题不在 SSR 的 html 上写死 data-theme，由媒体查询负责首帧。
+ * ThemeProvider hydration 后会补齐 data-theme 与 dark class；这样不需要在
+ * 根布局插入同步脚本，也不会因 React 19 客户端导航重复渲染 script 而报错。
+ */
+@media (prefers-color-scheme: dark) {
+  html:not([data-theme]) {
+    color-scheme: dark;
+    --primitive-bg: #030304;
+    --primitive-surface: #08090a;
+    --primitive-surface-2: #0d0f11;
+    --primitive-surface-3: #15181b;
+    --primitive-ink: #f1f0ed;
+    --primitive-muted: #a4a3a0;
+    --primitive-faint: #6f7175;
+    --primitive-line: rgb(255 255 255 / 11%);
+    --primitive-line-soft: rgb(255 255 255 / 7%);
+    --primitive-accent: #d58b68;
+    --primitive-accent-2: #7183a8;
+    --primitive-accent-soft: rgb(213 139 104 / 14%);
+    --primitive-success: #91a9bb;
+    --primitive-warning: #d58b68;
+    --primitive-code: #030404;
+    --primitive-code-ink: #ececea;
+    --surface-raised: #111315;
+    --destructive: #e09b86;
+    --overlay: rgb(0 0 0 / 72%);
+    --shadow-shell: 0 30px 100px rgb(0 0 0 / 72%);
+    --shadow-hover: 0 18px 48px rgb(0 0 0 / 62%);
+  }
+}
+
 * {
   box-sizing: border-box;
   border-color: var(--border);

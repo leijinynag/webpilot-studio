@@ -2,8 +2,6 @@ import type { APIRequestContext, Page } from "@playwright/test";
 
 type RequestOptions = NonNullable<Parameters<APIRequestContext["post"]>[1]>;
 
-const CSRF_COOKIE_NAMES = ["__Host-webpilot-csrf", "webpilot-csrf"];
-
 /**
  * 为 E2E 的主站写请求补齐和真实浏览器 fetch 一致的安全头。
  *
@@ -57,9 +55,14 @@ async function getMutationHeaders(
   }
 
   const cookies = await page.context().cookies();
-  const csrfCookie = cookies.find((cookie) =>
-    CSRF_COOKIE_NAMES.includes(cookie.name),
-  );
+  // 本地与 Vercel 回归可能复用一个持久浏览器环境，里面同时残留两种 Cookie。
+  // HTTPS 主站使用 __Host- 前缀，本地 HTTP 开发服务器使用普通 host-only 名称；
+  // 必须按当前页面协议精确选择，不能让数组顺序决定 CSRF Header。
+  const csrfCookieName =
+    new URL(pageURL).protocol === "https:"
+      ? "__Host-webpilot-csrf"
+      : "webpilot-csrf";
+  const csrfCookie = cookies.find((cookie) => cookie.name === csrfCookieName);
 
   if (!csrfCookie) {
     throw new Error("E2E 请求缺少 CSRF Cookie，请先访问主站页面建立匿名会话。");

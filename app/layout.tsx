@@ -1,7 +1,6 @@
 import type { Metadata } from "next";
 import { Geist, Instrument_Serif } from "next/font/google";
 import { cookies } from "next/headers";
-import Script from "next/script";
 import { NextIntlClientProvider } from "next-intl";
 
 import { ThemeProvider } from "@/components/theme/theme-provider";
@@ -42,13 +41,7 @@ export default async function RootLayout({
   const messages = getMessages(locale);
   const cookieStore = await cookies();
   const rawThemeCookie = cookieStore.get(THEME_COOKIE_NAME)?.value;
-  const initialThemePreference = resolveThemePreference(
-    rawThemeCookie,
-  );
-  const hasValidThemeCookie =
-    rawThemeCookie === "system" ||
-    rawThemeCookie === "light" ||
-    rawThemeCookie === "dark";
+  const initialThemePreference = resolveThemePreference(rawThemeCookie);
   const explicitTheme =
     initialThemePreference === "system" ? undefined : initialThemePreference;
 
@@ -63,43 +56,6 @@ export default async function RootLayout({
       suppressHydrationWarning
     >
       <body>
-        <Script id="theme-init" strategy="beforeInteractive">
-          {`
-            (() => {
-              try {
-                const serverPreference = ${JSON.stringify(initialThemePreference)};
-                const hasValidCookie = ${JSON.stringify(hasValidThemeCookie)};
-                const stored = localStorage.getItem("webpilot-theme-v1");
-                const storedPreference =
-                  stored === "light" || stored === "dark" || stored === "system"
-                    ? stored
-                    : null;
-
-                // Cookie 是 SSR 的首帧事实来源；旧用户尚无 Cookie 时才读取
-                // localStorage 完成一次兼容迁移。system 模式仍需在首屏解析系统偏好。
-                const preference =
-                  hasValidCookie ? serverPreference : (storedPreference ?? serverPreference);
-                const resolved =
-                  preference === "system"
-                    ? matchMedia("(prefers-color-scheme: dark)").matches
-                      ? "dark"
-                      : "light"
-                    : preference;
-                const root = document.documentElement;
-
-                root.dataset.theme = resolved;
-                root.classList.toggle("dark", resolved === "dark");
-                root.style.colorScheme = resolved;
-
-                // Cookie 已经是服务端首帧事实来源时，同步覆盖可能过期的本地值。
-                // 这样客户端主题 Store 初始化后不会把旧 localStorage 再写回页面。
-                if (hasValidCookie) {
-                  localStorage.setItem("webpilot-theme-v1", serverPreference);
-                }
-              } catch {}
-            })();
-          `}
-        </Script>
         <NextIntlClientProvider locale={locale} messages={messages}>
           <UiI18nProvider locale={locale} messages={messages}>
             <ThemeProvider initialPreference={initialThemePreference}>

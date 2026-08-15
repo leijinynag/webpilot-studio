@@ -15,6 +15,23 @@ type FileResponse = {
   };
 };
 
+type CompletionMetric = {
+  name: string;
+  reason?: string;
+};
+
+function createDeferred() {
+  let resolvePromise: () => void = () => undefined;
+  const promise = new Promise<void>((resolve) => {
+    resolvePromise = resolve;
+  });
+
+  return {
+    promise,
+    resolve: () => resolvePromise(),
+  };
+}
+
 async function createProject(
   page: Page,
   name: string,
@@ -183,6 +200,180 @@ test("edits and saves multiple files from the Monaco workspace", async ({
     await owned.page.reload();
     await expect(owned.page.getByLabel("Repository revision 3")).toBeVisible();
   } finally {
+    await owned.context.close();
+  }
+});
+
+test("shows, accepts and invalidates Monaco AI inline completions", async ({
+  browser,
+  baseURL,
+}) => {
+  test.setTimeout(90_000);
+  const owned = await createOwnedContext(browser, baseURL!);
+  let completionRequestCount = 0;
+  const staleRequest = createDeferred();
+  const staleResponse = createDeferred();
+
+  try {
+    const project = await createProject(
+      owned.page,
+      "Monaco inline completion workflow",
+    );
+
+    // 禁用自动触发以隔离显式补全链路，同时在页面初始化阶段注册指标监听。
+    // addInitScript 会在项目页脚本执行前生效，不会漏掉 Provider 的首个 request。
+    await owned.page.addInitScript(() => {
+      window.localStorage.setItem(
+        "webpilot:code-completion-preference:v1",
+        JSON.stringify({ version: 1, enabled: false }),
+      );
+      const metrics: CompletionMetric[] = [];
+      (
+        window as typeof window & {
+          __webpilotCompletionMetrics?: CompletionMetric[];
+        }
+      ).__webpilotCompletionMetrics = metrics;
+      window.addEventListener("webpilot:code-completion-metric", (event) => {
+        metrics.push((event as CustomEvent<CompletionMetric>).detail);
+      });
+    });
+
+    await owned.page.route(
+      `**/api/projects/${project.id}/code-completions`,
+      async (route) => {
+        if (route.request().method() === "GET") {
+          await route.fulfill({
+            contentType: "application/json",
+            body: JSON.stringify({
+              configured: true,
+              model: "e2e-completion",
+              provider: "deepseek",
+            }),
+          });
+          return;
+        }
+
+        completionRequestCount += 1;
+        if (completionRequestCount === 2) {
+          // 第二次响应故意悬停，等待测试修改 Monaco model version。
+          // 这样可以覆盖真实网络仍在飞行时的 stale-result 防护，而非只测纯函数。
+          staleRequest.resolve();
+          await staleResponse.promise;
+        }
+
+        await route.fulfill({
+          contentType: "application/json",
+          body: JSON.stringify({
+            requestId:
+              completionRequestCount === 1
+                ? "22222222-2222-4222-8222-222222222222"
+                : "33333333-3333-4333-8333-333333333333",
+            projectRevision:
+              completionRequestCount === 1 ? project.revision : 2,
+            insertText: completionRequestCount === 1 ? "42;" : "STALE_RESULT;",
+            model: "e2e-completion",
+            latencyMs: 8,
+            firstResultLatencyMs: 5,
+            cacheHit: false,
+          }),
+        });
+      },
+    );
+
+    await owned.page.goto(`/p/${project.id}`);
+    const codeView = owned.page.getByRole("radio", { name: "Code" });
+    await expect
+      .poll(
+        async () => {
+          if (!(await codeView.isChecked())) {
+            await codeView.click();
+          }
+          return codeView.isChecked();
+        },
+        {
+          // 开发态首轮编译可能在 React hydration 前让原生点击先发生。
+          // 以受控 radio 的最终状态为准重试，避免绑定 Next 内部缓存或请求时序。
+          timeout: 15_000,
+        },
+      )
+      .toBe(true);
+
+    const editor = owned.page.locator(".monaco-editor");
+    await expect(editor).toBeVisible({ timeout: 15_000 });
+    await editor.click();
+    await owned.page.keyboard.press("ControlOrMeta+A");
+    await owned.page.keyboard.type("const answer = ");
+
+    const completionButton = owned.page.getByRole("button", {
+      name: /AI (?:行内补全|inline completion)/,
+    });
+    await expect(completionButton).toBeVisible();
+    await completionButton.click();
+    await expect(owned.page.getByText("e2e-completion")).toBeVisible();
+    await owned.page
+      .getByRole("menuitem", {
+        name: /(?:立即生成补全|Generate completion now)/,
+      })
+      .click();
+
+    // Monaco 的 ghost text 属于编辑器渲染层，不会进入 textarea value。
+    // 先证明建议真实展示，再按 Tab 接受并保存到 Repository 验证最终内容。
+    await expect(
+      owned.page.locator(".monaco-editor .view-lines").getByText("42;", {
+        exact: false,
+      }),
+    ).toBeVisible({ timeout: 15_000 });
+    await owned.page.keyboard.press("Tab");
+    await owned.page.getByRole("button", { name: "Save", exact: true }).click();
+    await expect(
+      owned.page.getByText(/Revision 2 (?:已保存|saved)/, { exact: true }),
+    ).toBeVisible({ timeout: 15_000 });
+
+    const acceptedFile = await getWithBrowserSession(
+      owned.page,
+      `/api/projects/${project.id}/files/src/index.tsx`,
+      {},
+      owned.request,
+    );
+    await expect(acceptedFile.json()).resolves.toMatchObject({
+      file: { content: expect.stringContaining("const answer = 42;") },
+    });
+
+    await editor.click();
+    await owned.page.keyboard.press("ControlOrMeta+A");
+    await owned.page.keyboard.type("const stale = ");
+    await completionButton.click();
+    await owned.page
+      .getByRole("menuitem", {
+        name: /(?:立即生成补全|Generate completion now)/,
+      })
+      .click();
+    await staleRequest.promise;
+
+    // 请求发出后继续输入会改变 Monaco model version，并取消当前建议。
+    // 即使服务端稍后返回成功，旧结果也必须被 Provider 丢弃，不能污染草稿。
+    await owned.page.keyboard.type("user_kept_typing");
+    staleResponse.resolve();
+    await expect
+      .poll(async () => completionRequestCount, { timeout: 10_000 })
+      .toBe(2);
+    await owned.page.waitForTimeout(500);
+    await expect(
+      owned.page.locator(".monaco-editor .view-lines"),
+    ).not.toContainText("STALE_RESULT");
+
+    const metricNames = await owned.page.evaluate(() =>
+      (
+        window as typeof window & {
+          __webpilotCompletionMetrics?: CompletionMetric[];
+        }
+      ).__webpilotCompletionMetrics?.map((metric) => metric.name),
+    );
+    expect(metricNames).toEqual(
+      expect.arrayContaining(["request", "first_result", "shown", "accepted"]),
+    );
+  } finally {
+    staleResponse.resolve();
     await owned.context.close();
   }
 });

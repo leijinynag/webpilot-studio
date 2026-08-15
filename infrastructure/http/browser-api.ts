@@ -1,4 +1,3 @@
-const CSRF_COOKIE_NAMES = ["__Host-webpilot-csrf", "webpilot-csrf"];
 const CSRF_HEADER_NAME = "x-webpilot-csrf";
 const MUTATION_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
 
@@ -57,16 +56,30 @@ function isSameOriginRequest(input: RequestInfo | URL): boolean {
   }
 }
 
+/**
+ * 客户端必须和 Proxy 使用完全相同的 Cookie 命名规则。
+ *
+ * 浏览器可能同时保留线上 `__Host-` Cookie 与本地开发 Cookie。如果按固定
+ * 优先级遍历，localhost 会误把线上旧值放进 Header，最终形成无法靠刷新恢复的
+ * CSRF_REJECTED。构建环境在客户端会被 Next 内联，因此这里只读取唯一目标项。
+ */
+export function getBrowserCsrfCookieName(
+  nodeEnv = process.env.NODE_ENV,
+): "__Host-webpilot-csrf" | "webpilot-csrf" {
+  return nodeEnv === "production" ? "__Host-webpilot-csrf" : "webpilot-csrf";
+}
+
 function readCsrfCookie(): string | null {
+  const cookieName = getBrowserCsrfCookieName();
+  const prefix = `${cookieName}=`;
   const cookies = document.cookie.split(";");
-  for (const cookieName of CSRF_COOKIE_NAMES) {
-    const prefix = `${cookieName}=`;
-    const match = cookies
-      .map((cookie) => cookie.trim())
-      .find((cookie) => cookie.startsWith(prefix));
-    if (match) {
-      return decodeURIComponent(match.slice(prefix.length));
-    }
+  const match = cookies
+    .map((cookie) => cookie.trim())
+    .find((cookie) => cookie.startsWith(prefix));
+
+  if (match) {
+    return decodeURIComponent(match.slice(prefix.length));
   }
+
   return null;
 }
