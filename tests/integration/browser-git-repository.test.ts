@@ -87,6 +87,11 @@ describeProjectContentRepositoryContract("Browser Git", async () => {
       execute("delete_file", input) as Promise<ProjectMutationResult>,
     renameFile: (input) =>
       execute("rename_file", input) as Promise<ProjectMutationResult>,
+    batchMutateFiles: (input) =>
+      execute("batch_mutate_files", {
+        expectedRevision: input.expectedRevision,
+        mutations: [...input.mutations],
+      }) as Promise<ProjectMutationResult>,
     createCheckpoint: (input) =>
       execute("create_checkpoint", input) as Promise<ProjectCheckpoint>,
     restoreCheckpoint: (input) =>

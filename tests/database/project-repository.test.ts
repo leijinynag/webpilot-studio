@@ -65,6 +65,12 @@ describeProjectContentRepositoryContract("Database", async () => {
         projectId: requireProjectId(projectId),
         ...input,
       }),
+    batchMutateFiles: (input) =>
+      repository.batchMutateFiles({
+        ownerId,
+        projectId: requireProjectId(projectId),
+        ...input,
+      }),
     createCheckpoint: (input) =>
       repository.createCheckpoint({
         ownerId,

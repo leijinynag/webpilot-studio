@@ -1,6 +1,7 @@
 import type {
   ProjectCheckpoint,
   ProjectDescription,
+  ProjectFileMutation,
   ProjectFileSnapshot,
   ProjectMutationResult,
   ProjectSearchMatch,
@@ -114,6 +115,10 @@ export type BrowserGitWorkerPayloadMap = {
     fromPath: string;
     toPath: string;
     expectedRevision: number;
+  };
+  batch_mutate_files: {
+    expectedRevision: number;
+    mutations: ProjectFileMutation[];
   };
   stage: { paths: string[] };
   unstage: { paths: string[] };

@@ -85,6 +85,13 @@ export class BrowserGitClient {
     return (await this.request(projectId, "rename_file", input)).data;
   }
 
+  async batchMutateFiles(
+    projectId: string,
+    input: BrowserGitWorkerPayloadMap["batch_mutate_files"],
+  ) {
+    return (await this.request(projectId, "batch_mutate_files", input)).data;
+  }
+
   async stage(projectId: string, paths: string[]) {
     return (
       await this.request(projectId, "stage", {

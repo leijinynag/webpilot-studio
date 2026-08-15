@@ -10,6 +10,7 @@ import type {
 import type {
   ProjectCheckpoint,
   ProjectDescription,
+  ProjectFileMutation,
   ProjectFileSnapshot,
   ProjectMutationResult,
   ProjectSearchMatch,
@@ -17,6 +18,7 @@ import type {
   ProjectSummary,
 } from "@/domains/project/types";
 import { isProjectError, PROJECT_ERROR_CODES } from "@/domains/project/errors";
+import { normalizeProjectFileMutations } from "@/domains/project/file-mutations";
 import { assertValidProjectPath } from "@/domains/project/path";
 import { browserApiFetch } from "@/infrastructure/http/browser-api";
 
@@ -192,6 +194,16 @@ export class BrowserGitProjectRepository {
       fromPath: assertValidProjectPath(input.fromPath),
       toPath: assertValidProjectPath(input.toPath),
       expectedRevision: input.expectedRevision,
+    }) as Promise<ProjectMutationResult>;
+  }
+
+  async batchMutateFiles(input: {
+    expectedRevision: number;
+    mutations: readonly ProjectFileMutation[];
+  }): Promise<ProjectMutationResult> {
+    return this.client.batchMutateFiles(this.project.id, {
+      expectedRevision: input.expectedRevision,
+      mutations: normalizeProjectFileMutations(input.mutations),
     }) as Promise<ProjectMutationResult>;
   }
 

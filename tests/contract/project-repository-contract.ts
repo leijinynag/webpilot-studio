@@ -4,6 +4,7 @@ import { PROJECT_ERROR_CODES } from "@/domains/project/errors";
 import type { ProjectRepository } from "@/domains/project/repository";
 import type {
   ProjectCheckpoint,
+  ProjectFileMutation,
   ProjectFileSnapshot,
   ProjectMutationResult,
   ProjectSearchMatch,
@@ -34,6 +35,10 @@ export type ProjectContentRepository = {
     fromPath: string;
     toPath: string;
     expectedRevision: number;
+  }): Promise<ProjectMutationResult>;
+  batchMutateFiles(input: {
+    expectedRevision: number;
+    mutations: readonly ProjectFileMutation[];
   }): Promise<ProjectMutationResult>;
   createCheckpoint(input: {
     summary?: string;
@@ -179,6 +184,112 @@ export function describeProjectContentRepositoryContract(
       await expect(
         fixture.repository.readFile("src/App.tsx"),
       ).resolves.toMatchObject({ content: "winner" });
+    });
+
+    it("applies a file batch atomically and advances only one revision", async () => {
+      await initializeProject(fixture.repository);
+
+      await expect(
+        fixture.repository.batchMutateFiles({
+          expectedRevision: 1,
+          mutations: [
+            {
+              type: "write",
+              path: "src/z-last.ts",
+              content: "export const z = true;",
+            },
+            { type: "delete", path: "src/styles.css" },
+            {
+              type: "write",
+              path: "src/App.tsx",
+              content: "batch updated",
+            },
+          ],
+        }),
+      ).resolves.toEqual({
+        revision: 2,
+        changedPaths: ["src/App.tsx", "src/styles.css", "src/z-last.ts"],
+      });
+
+      await expect(fixture.repository.getRevision()).resolves.toBe(2);
+      await expect(
+        fixture.repository.readFile("src/App.tsx"),
+      ).resolves.toMatchObject({ content: "batch updated" });
+      await expect(
+        fixture.repository.readFile("src/z-last.ts"),
+      ).resolves.toMatchObject({ content: "export const z = true;" });
+      await expect(
+        fixture.repository.readFile("src/styles.css"),
+      ).rejects.toMatchObject({ code: PROJECT_ERROR_CODES.fileNotFound });
+    });
+
+    it("rejects an invalid batch without leaving partial file changes", async () => {
+      await initializeProject(fixture.repository);
+
+      await expect(
+        fixture.repository.batchMutateFiles({
+          expectedRevision: 1,
+          mutations: [
+            {
+              type: "write",
+              path: "src/partial.ts",
+              content: "must not survive",
+            },
+            { type: "delete", path: "src/missing.ts" },
+          ],
+        }),
+      ).rejects.toMatchObject({ code: PROJECT_ERROR_CODES.fileNotFound });
+
+      await expect(fixture.repository.getRevision()).resolves.toBe(1);
+      await expect(
+        fixture.repository.readFile("src/partial.ts"),
+      ).rejects.toMatchObject({ code: PROJECT_ERROR_CODES.fileNotFound });
+    });
+
+    it("rejects stale and duplicate-path batches before writing", async () => {
+      await initializeProject(fixture.repository);
+
+      await fixture.repository.writeFile({
+        path: "src/App.tsx",
+        content: "revision winner",
+        expectedRevision: 1,
+      });
+      await expect(
+        fixture.repository.batchMutateFiles({
+          expectedRevision: 1,
+          mutations: [
+            {
+              type: "write",
+              path: "src/stale.ts",
+              content: "must not survive",
+            },
+          ],
+        }),
+      ).rejects.toMatchObject({
+        code: PROJECT_ERROR_CODES.revisionConflict,
+      });
+
+      await expect(
+        fixture.repository.batchMutateFiles({
+          expectedRevision: 2,
+          mutations: [
+            {
+              type: "write",
+              path: "src/duplicate.ts",
+              content: "first",
+            },
+            { type: "delete", path: "src/duplicate.ts" },
+          ],
+        }),
+      ).rejects.toMatchObject({ code: PROJECT_ERROR_CODES.pathConflict });
+
+      await expect(fixture.repository.getRevision()).resolves.toBe(2);
+      await expect(
+        fixture.repository.readFile("src/stale.ts"),
+      ).rejects.toMatchObject({ code: PROJECT_ERROR_CODES.fileNotFound });
+      await expect(
+        fixture.repository.readFile("src/duplicate.ts"),
+      ).rejects.toMatchObject({ code: PROJECT_ERROR_CODES.fileNotFound });
     });
 
     it("rejects rename conflicts without advancing revision", async () => {

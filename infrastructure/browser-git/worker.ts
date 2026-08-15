@@ -107,6 +107,7 @@ function isOperation(value: unknown): value is BrowserGitWorkerOperation {
       "write_file",
       "delete_file",
       "rename_file",
+      "batch_mutate_files",
       "stage",
       "unstage",
       "commit",

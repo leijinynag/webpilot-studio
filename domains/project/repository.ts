@@ -26,6 +26,7 @@ import {
 } from "@/infrastructure/db/schema";
 import { serializeMigrationManifest } from "@/domains/project/migration-manifest";
 import { PROJECT_ERROR_CODES, ProjectError } from "@/domains/project/errors";
+import { normalizeProjectFileMutations } from "@/domains/project/file-mutations";
 import { assertValidProjectPath } from "@/domains/project/path";
 import type {
   BrowserGitProvision,
@@ -33,6 +34,7 @@ import type {
   BrowserGitMigrationPreparation,
   BrowserGitMigrationResult,
   ProjectDescription,
+  ProjectFileMutation,
   ProjectFileSnapshot,
   ProjectMutationResult,
   ProjectSearchMatch,
@@ -141,6 +143,12 @@ export type ProjectRepository = {
     fromPath: string;
     toPath: string;
     expectedRevision: number;
+  }): Promise<ProjectMutationResult>;
+  batchMutateFiles(input: {
+    ownerId: string;
+    projectId: string;
+    expectedRevision: number;
+    mutations: readonly ProjectFileMutation[];
   }): Promise<ProjectMutationResult>;
   createCheckpoint(input: {
     ownerId: string;
@@ -1256,6 +1264,87 @@ export class DatabaseProjectRepository<
           .update(projectFiles)
           .set({ path: toPath, updatedAt: new Date() })
           .where(eq(projectFiles.id, source.id));
+      },
+    });
+  }
+
+  async batchMutateFiles(input: {
+    ownerId: string;
+    projectId: string;
+    expectedRevision: number;
+    mutations: readonly ProjectFileMutation[];
+  }): Promise<ProjectMutationResult> {
+    const mutations = normalizeProjectFileMutations(input.mutations);
+    const changedPaths = mutations.map((mutation) => mutation.path);
+
+    return this.mutateProject({
+      ownerId: input.ownerId,
+      projectId: input.projectId,
+      expectedRevision: input.expectedRevision,
+      // 批量导入是一次源码快照更新，revision 历史沿用 write 类型，
+      // 不为终端导入制造只被单一调用方理解的特殊 revision kind。
+      kind: "write",
+      changedPaths,
+      operation: async (tx, project) => {
+        const rows = await tx
+          .select({
+            id: projectFiles.id,
+            path: projectFiles.path,
+            deletedAt: projectFiles.deletedAt,
+          })
+          .from(projectFiles)
+          .where(
+            and(
+              eq(projectFiles.projectId, project.id),
+              inArray(projectFiles.path, changedPaths),
+            ),
+          );
+        const existingByPath = new Map(rows.map((row) => [row.path, row]));
+
+        // 必须在第一次写入前检查全部 delete。这样即使删除目标缺失，
+        // 事务也不会短暂产生部分写入，更不会创建新的 revision 快照。
+        for (const mutation of mutations) {
+          if (
+            mutation.type === "delete" &&
+            (!existingByPath.get(mutation.path) ||
+              existingByPath.get(mutation.path)?.deletedAt)
+          ) {
+            throw new ProjectError(
+              PROJECT_ERROR_CODES.fileNotFound,
+              "项目文件不存在。",
+              404,
+              { path: mutation.path },
+            );
+          }
+        }
+
+        const now = new Date();
+        for (const mutation of mutations) {
+          const existing = existingByPath.get(mutation.path);
+
+          if (mutation.type === "delete") {
+            await tx
+              .update(projectFiles)
+              .set({ deletedAt: now, updatedAt: now })
+              .where(eq(projectFiles.id, existing!.id));
+            continue;
+          }
+
+          const blobHash = await ensureBlob(tx, mutation.content);
+          if (existing) {
+            await tx
+              .update(projectFiles)
+              .set({ blobHash, updatedAt: now, deletedAt: null })
+              .where(eq(projectFiles.id, existing.id));
+          } else {
+            await tx.insert(projectFiles).values({
+              projectId: project.id,
+              path: mutation.path,
+              blobHash,
+              updatedAt: now,
+            });
+          }
+        }
       },
     });
   }

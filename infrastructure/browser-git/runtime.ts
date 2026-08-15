@@ -1,10 +1,13 @@
 import LightningFS from "@isomorphic-git/lightning-fs";
 import * as git from "isomorphic-git";
 
+import { isProjectError } from "@/domains/project/errors";
+import { normalizeProjectFileMutations } from "@/domains/project/file-mutations";
 import { serializeMigrationManifest } from "@/domains/project/migration-manifest";
 import { assertValidProjectPath } from "@/domains/project/path";
 import type {
   ProjectCheckpoint,
+  ProjectFileMutation,
   ProjectFileSnapshot,
   ProjectMutationResult,
   ProjectSearchMatch,
@@ -106,6 +109,10 @@ export class BrowserGitRuntime {
       case "rename_file":
         return this.renameFile(
           request.payload as BrowserGitWorkerPayloadMap["rename_file"],
+        );
+      case "batch_mutate_files":
+        return this.batchMutateFiles(
+          request.payload as BrowserGitWorkerPayloadMap["batch_mutate_files"],
         );
       case "stage":
         return this.stage(
@@ -563,6 +570,94 @@ export class BrowserGitRuntime {
     await ensureDirectory(this.fs, parentDirectory(repositoryPath(toPath)));
     await this.fs.rename(repositoryPath(fromPath), repositoryPath(toPath));
     return this.finishWorkspaceMutation(metadata, [fromPath, toPath]);
+  }
+
+  private async batchMutateFiles(
+    input: BrowserGitWorkerPayloadMap["batch_mutate_files"],
+  ): Promise<ProjectMutationResult> {
+    const mutations = normalizeWorkerFileMutations(input.mutations);
+    const changedPaths = mutations.map((mutation) => mutation.path);
+    const metadata = await this.assertRevision(input.expectedRevision);
+    const currentPaths = await listProjectFilePaths(
+      this.fs,
+      REPOSITORY_DIRECTORY,
+      new Set([".git", "node_modules"]),
+    );
+    const currentPathSet = new Set(currentPaths);
+
+    // 所有 delete 和最终路径冲突都在第一次写入前检查。尤其是 file -> directory
+    // 或 directory -> file 转换，只有批次完整描述最终状态时才允许执行。
+    for (const mutation of mutations) {
+      if (mutation.type === "delete" && !currentPathSet.has(mutation.path)) {
+        throw workerDomainError("FILE_NOT_FOUND", "项目文件不存在。", {
+          path: mutation.path,
+        });
+      }
+    }
+
+    const finalPaths = new Set(currentPaths);
+    for (const mutation of mutations) {
+      if (mutation.type === "delete") {
+        finalPaths.delete(mutation.path);
+      } else {
+        finalPaths.add(mutation.path);
+      }
+    }
+    assertNoFileDirectoryConflicts([...finalPaths]);
+
+    const snapshots = await Promise.all(
+      mutations.map(async (mutation) => ({
+        path: mutation.path,
+        content: currentPathSet.has(mutation.path)
+          ? await readStableBytes(this.fs, repositoryPath(mutation.path))
+          : null,
+      })),
+    );
+
+    try {
+      // 先删除再写入，允许一次批次安全完成 file/directory 形态转换。
+      for (const mutation of mutations) {
+        if (mutation.type === "delete") {
+          await this.fs.unlink(repositoryPath(mutation.path));
+        }
+      }
+      await removeEmptyMutationDirectories(
+        this.fs,
+        mutations.map((mutation) => mutation.path),
+      );
+
+      for (const mutation of mutations) {
+        if (mutation.type === "write") {
+          await removeEmptyDirectoryAtPath(
+            this.fs,
+            repositoryPath(mutation.path),
+          );
+          await writeTextFile(
+            this.fs,
+            repositoryPath(mutation.path),
+            mutation.content,
+          );
+        }
+      }
+
+      // finishWorkspaceMutation 是批次内唯一一次 revision 更新和 flush。
+      // Git index 与 HEAD 从未参与这些操作，因此 Source Control 暂存态保持原样。
+      return await this.finishWorkspaceMutation(metadata, changedPaths);
+    } catch (error) {
+      try {
+        await rollbackWorkspaceMutations(this.fs, snapshots, metadata);
+      } catch (rollbackError) {
+        throw workerDomainError(
+          "STORAGE_UNAVAILABLE",
+          "批量文件导入失败，且 Browser Git 工作区未能完整回滚。",
+          {
+            mutationError: toErrorMessage(error),
+            rollbackError: toErrorMessage(rollbackError),
+          },
+        );
+      }
+      throw error;
+    }
   }
 
   private async stage(paths: string[]): Promise<BrowserGitRepositoryState> {
@@ -1299,6 +1394,223 @@ function normalizeProjectName(name: string) {
 
 function uniquePaths(paths: string[]) {
   return [...new Set(paths)].sort();
+}
+
+/**
+ * Worker 不能把 ProjectError 原样抛给主线程，否则会被序列化成笼统的
+ * WORKER_UNAVAILABLE。这里复用领域层校验规则，再转换为 Worker 协议错误。
+ */
+function normalizeWorkerFileMutations(
+  mutations: readonly ProjectFileMutation[],
+): ProjectFileMutation[] {
+  try {
+    return normalizeProjectFileMutations(mutations);
+  } catch (error) {
+    if (isProjectError(error)) {
+      throw workerDomainError(error.code, error.message, error.details);
+    }
+    throw error;
+  }
+}
+
+/**
+ * 只列出工作区中的项目文件路径，不读取文件正文。
+ *
+ * 批量 mutation 需要先计算最终文件树，提前拒绝 file/directory 冲突；
+ * `.git` 和运行依赖目录不属于项目源码事实，因此不会参与导入。
+ */
+async function listProjectFilePaths(
+  fs: PromisifiedFS,
+  directory: string,
+  excludeDirectories: Set<string>,
+  relativeDirectory = "",
+): Promise<string[]> {
+  const names = await fs.readdir(directory);
+  const paths: string[] = [];
+
+  for (const name of names.sort()) {
+    if (excludeDirectories.has(name)) {
+      continue;
+    }
+
+    const absolutePath = `${directory}/${name}`;
+    const relativePath = relativeDirectory
+      ? `${relativeDirectory}/${name}`
+      : name;
+    const stats = await fs.stat(absolutePath);
+
+    if (stats.isDirectory()) {
+      paths.push(
+        ...(await listProjectFilePaths(
+          fs,
+          absolutePath,
+          excludeDirectories,
+          relativePath,
+        )),
+      );
+    } else {
+      paths.push(relativePath);
+    }
+  }
+
+  return paths;
+}
+
+/**
+ * 最终文件树中不允许一个路径同时是文件和另一个文件的父目录。
+ * 该检查在任何 unlink/write 前完成，失败时无需启动回滚。
+ */
+function assertNoFileDirectoryConflicts(paths: readonly string[]) {
+  const pathSet = new Set(paths);
+
+  for (const path of paths) {
+    const segments = path.split("/");
+    let parent = "";
+
+    for (let index = 0; index < segments.length - 1; index += 1) {
+      parent = parent ? `${parent}/${segments[index]}` : segments[index];
+      if (pathSet.has(parent)) {
+        throw workerDomainError(
+          "PROJECT_PATH_CONFLICT",
+          "批量文件操作产生了文件与目录路径冲突。",
+          { filePath: parent, descendantPath: path },
+        );
+      }
+    }
+  }
+}
+
+/**
+ * LightningFS 返回的 Uint8Array 可能复用底层缓冲区。回滚快照必须复制，
+ * 防止后续 write/unlink 使快照内容发生不可见变化。
+ */
+async function readStableBytes(fs: PromisifiedFS, path: string) {
+  const content = await fs.readFile(path);
+  const stableContent = new Uint8Array(content.byteLength);
+  stableContent.set(content);
+  return stableContent;
+}
+
+/**
+ * 删除 mutation 路径产生的空父目录，按最深路径优先处理。
+ * ENOTEMPTY 表示目录还承载其他项目文件，此时保留目录即可。
+ */
+async function removeEmptyMutationDirectories(
+  fs: PromisifiedFS,
+  paths: readonly string[],
+) {
+  const directories = new Set<string>();
+
+  for (const path of paths) {
+    let directory = parentDirectory(repositoryPath(path));
+    while (directory !== "/" && directory !== REPOSITORY_DIRECTORY) {
+      directories.add(directory);
+      directory = parentDirectory(directory);
+    }
+  }
+
+  const orderedDirectories = [...directories].sort(
+    (left, right) =>
+      right.split("/").length - left.split("/").length ||
+      right.localeCompare(left),
+  );
+
+  for (const directory of orderedDirectories) {
+    try {
+      await fs.rmdir(directory);
+    } catch (error) {
+      if (
+        !isMissingFileError(error) &&
+        !hasErrorCode(error, "ENOTEMPTY")
+      ) {
+        throw error;
+      }
+    }
+  }
+}
+
+/**
+ * directory -> file 转换时，目标位置可能残留刚被清空的目录。
+ * 非空目录不能静默删除，rmdir 会让整个批次失败并进入回滚。
+ */
+async function removeEmptyDirectoryAtPath(
+  fs: PromisifiedFS,
+  absolutePath: string,
+) {
+  try {
+    const stats = await fs.stat(absolutePath);
+    if (stats.isDirectory()) {
+      await fs.rmdir(absolutePath);
+    }
+  } catch (error) {
+    if (!isMissingFileError(error)) {
+      throw error;
+    }
+  }
+}
+
+/**
+ * Browser Git 没有数据库事务，批量导入通过补偿式回滚保持原子语义：
+ * 先移除本批次留下的文件，再恢复原始字节，最后恢复 revision metadata。
+ *
+ * Git index 与 HEAD 从未被 mutation 修改，因此不需要重建 Git 历史。
+ */
+async function rollbackWorkspaceMutations(
+  fs: PromisifiedFS,
+  snapshots: readonly {
+    path: string;
+    content: Uint8Array | null;
+  }[],
+  metadata: BrowserGitProjectMetadata,
+) {
+  const deepestFirst = [...snapshots].sort(
+    (left, right) =>
+      right.path.split("/").length - left.path.split("/").length ||
+      right.path.localeCompare(left.path),
+  );
+
+  for (const snapshot of deepestFirst) {
+    const absolutePath = repositoryPath(snapshot.path);
+    try {
+      const stats = await fs.stat(absolutePath);
+      if (stats.isDirectory()) {
+        await fs.rmdir(absolutePath);
+      } else {
+        await fs.unlink(absolutePath);
+      }
+    } catch (error) {
+      if (
+        !isMissingFileError(error) &&
+        !hasErrorCode(error, "ENOTEMPTY")
+      ) {
+        throw error;
+      }
+    }
+  }
+
+  await removeEmptyMutationDirectories(
+    fs,
+    snapshots.map((snapshot) => snapshot.path),
+  );
+
+  for (const snapshot of snapshots) {
+    if (snapshot.content === null) {
+      continue;
+    }
+    await removeEmptyDirectoryAtPath(fs, repositoryPath(snapshot.path));
+    await writeBinaryFile(
+      fs,
+      repositoryPath(snapshot.path),
+      snapshot.content,
+    );
+  }
+
+  await writeJsonFile(fs, PROJECT_METADATA_PATH, metadata);
+  await fs.flush();
+}
+
+function toErrorMessage(error: unknown) {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function isReservedRepositoryPath(path: string) {
