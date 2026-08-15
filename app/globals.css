@@ -6984,7 +6984,9 @@ html[data-theme="dark"] .ide-preview-surface {
     grid-template-columns: repeat(3, minmax(0, 1fr));
     grid-column: 1;
     grid-row: 1;
+    justify-self: stretch;
     gap: 4px;
+    width: 100%;
     min-width: 0;
     padding: 5px;
     border-bottom: 1px solid var(--border);

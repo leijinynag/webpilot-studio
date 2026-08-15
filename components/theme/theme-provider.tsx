@@ -2,23 +2,22 @@
 
 import * as React from "react";
 
-export type ThemePreference = "system" | "light" | "dark";
+import {
+  THEME_COOKIE_NAME,
+  THEME_STORAGE_KEY,
+  resolveThemePreference,
+  type ThemePreference,
+} from "@/infrastructure/theme/preferences";
 
-const THEME_STORAGE_KEY = "webpilot-theme-v1";
+export type { ThemePreference } from "@/infrastructure/theme/preferences";
 
 let currentPreference: ThemePreference = "system";
 const themeListeners = new Set<() => void>();
 
 if (typeof window !== "undefined") {
-  const storedPreference = window.localStorage.getItem(THEME_STORAGE_KEY);
-
-  if (
-    storedPreference === "light" ||
-    storedPreference === "dark" ||
-    storedPreference === "system"
-  ) {
-    currentPreference = storedPreference;
-  }
+  currentPreference = resolveThemePreference(
+    window.localStorage.getItem(THEME_STORAGE_KEY),
+  );
 }
 
 function getSystemTheme(): "light" | "dark" {
@@ -37,6 +36,13 @@ function applyTheme(preference: ThemePreference) {
   root.style.colorScheme = resolvedTheme;
 }
 
+type ThemeContextValue = {
+  preference: ThemePreference;
+  setPreference: (preference: ThemePreference) => void;
+};
+
+const ThemeContext = React.createContext<ThemeContextValue | null>(null);
+
 function subscribeToTheme(listener: () => void) {
   themeListeners.add(listener);
   return () => themeListeners.delete(listener);
@@ -46,25 +52,23 @@ function getThemePreference() {
   return currentPreference;
 }
 
-function getServerThemePreference() {
-  return "system" as const;
-}
-
-type ThemeContextValue = {
-  preference: ThemePreference;
-  setPreference: (preference: ThemePreference) => void;
-};
-
-const ThemeContext = React.createContext<ThemeContextValue | null>(null);
-
-export function ThemeProvider({ children }: { children: React.ReactNode }) {
+export function ThemeProvider({
+  children,
+  initialPreference,
+}: {
+  children: React.ReactNode;
+  initialPreference: ThemePreference;
+}) {
   const preference = React.useSyncExternalStore(
     subscribeToTheme,
     getThemePreference,
-    getServerThemePreference,
+    () => initialPreference,
   );
 
   React.useEffect(() => {
+    // 兼容旧版本只写 localStorage 的用户，并保证后续 SSR 能直接输出明确主题。
+    persistThemePreference(preference);
+
     // system 模式需要监听系统偏好变化，用户主动选择明暗主题时则不订阅。
     if (preference !== "system") {
       applyTheme(preference);
@@ -82,8 +86,7 @@ export function ThemeProvider({ children }: { children: React.ReactNode }) {
   }, [preference]);
 
   const setPreference = React.useCallback((nextPreference: ThemePreference) => {
-    // 存储协议带版本号，未来变更字段时可以平滑迁移而不污染旧值。
-    window.localStorage.setItem(THEME_STORAGE_KEY, nextPreference);
+    persistThemePreference(nextPreference);
     currentPreference = nextPreference;
     applyTheme(nextPreference);
     themeListeners.forEach((listener) => listener());
@@ -104,4 +107,12 @@ export function useTheme() {
   }
 
   return context;
+}
+
+function persistThemePreference(preference: ThemePreference) {
+  // localStorage 负责同标签页即时恢复，Cookie 让 Server Component 在首帧输出
+  // 正确的显式主题。该值不含敏感信息，SameSite=Lax 足以限制跨站携带。
+  window.localStorage.setItem(THEME_STORAGE_KEY, preference);
+  const secure = window.location.protocol === "https:" ? "; Secure" : "";
+  document.cookie = `${THEME_COOKIE_NAME}=${preference}; Path=/; Max-Age=31536000; SameSite=Lax${secure}`;
 }
