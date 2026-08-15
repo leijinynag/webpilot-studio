@@ -2710,6 +2710,21 @@ export class AgentStore<TQueryResult extends PgQueryResultHKT> {
     }
 
     await tx.insert(agentRunEvents).values([
+      // Browser Git 的 write_file 参数已经在服务端流式展示，但真实副作用由
+      // 浏览器执行。失败结果必须与正式 Tool 事件同事务回收临时标签，避免
+      // 网络重连后重放出一个并不存在于 Repository 的文件。
+      ...(!result.ok && request.toolName === FILE_TOOL_NAMES.writeFile
+        ? [
+            {
+              runId: request.runId,
+              type: "file.stream_discarded",
+              payload: {
+                toolCallId: request.toolCallId,
+                reason: result.error.code,
+              },
+            },
+          ]
+        : []),
       {
         runId: request.runId,
         type: "tool.completed",

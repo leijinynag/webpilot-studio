@@ -592,6 +592,114 @@ describe("AgentStore", () => {
     }
   });
 
+  it("Browser Git write_file 失败时按事务顺序回收临时文件并完成客户端工具", async () => {
+    const testDatabase = await createTestDatabase();
+
+    try {
+      const repository = new DatabaseProjectRepository(testDatabase.database);
+      const project = await repository.createProject({
+        ownerId: "owner-1",
+        name: "Browser Write Failure",
+        storageKind: "browser_git",
+        initialFiles: [],
+      });
+      await repository.claimBrowserGitProvision({
+        ownerId: "owner-1",
+        projectId: project.id,
+      });
+      const store = new AgentStore(testDatabase.database);
+      const run = await store.createRun({
+        ownerId: "owner-1",
+        projectId: project.id,
+        conversationTitle: "浏览器写入失败",
+        userMessage: "写入 App 文件",
+        profile: browserGitProfile,
+        startRevision: 3,
+      });
+      await store.transitionRun({
+        ownerId: run.ownerId,
+        runId: run.id,
+        status: "running",
+      });
+      await prepareBrowserRepositoryTool(store, {
+        ownerId: run.ownerId,
+        runId: run.id,
+        toolCallId: "call-browser-write-failed",
+        toolName: FILE_TOOL_NAMES.writeFile,
+        argumentsJson: {
+          path: "src/App.tsx",
+          content: "export default function App() {}",
+          expectedRevision: 3,
+        },
+        revision: 3,
+      });
+
+      const completion = await store.completeClientToolResult({
+        ownerId: run.ownerId,
+        runId: run.id,
+        projectId: project.id,
+        toolCallId: "call-browser-write-failed",
+        toolName: FILE_TOOL_NAMES.writeFile,
+        idempotencyKey: `${run.id}:call-browser-write-failed`,
+        revision: 3,
+        result: {
+          ok: false,
+          toolName: FILE_TOOL_NAMES.writeFile,
+          revision: 3,
+          conflict: false,
+          error: {
+            code: "BROWSER_GIT_UNAVAILABLE",
+            message: "浏览器仓库当前不可用。",
+          },
+        },
+      });
+      const events = await store.listEventsAfter({
+        ownerId: run.ownerId,
+        runId: run.id,
+      });
+      const lifecycleEvents = events.filter(
+        (event) =>
+          event.type === "file.stream_discarded" ||
+          event.type === "tool.completed" ||
+          event.type === "client_tool.completed",
+      );
+
+      expect(completion).toMatchObject({
+        disposition: "accepted",
+        run: { status: "running", currentRevision: 3 },
+      });
+      expect(lifecycleEvents).toMatchObject([
+        {
+          type: "file.stream_discarded",
+          payload: {
+            toolCallId: "call-browser-write-failed",
+            reason: "BROWSER_GIT_UNAVAILABLE",
+          },
+        },
+        {
+          type: "tool.completed",
+          payload: {
+            toolCallId: "call-browser-write-failed",
+            toolName: FILE_TOOL_NAMES.writeFile,
+            ok: false,
+            revision: 3,
+          },
+        },
+        {
+          type: "client_tool.completed",
+          payload: {
+            toolCallId: "call-browser-write-failed",
+            toolName: FILE_TOOL_NAMES.writeFile,
+            ok: false,
+            revision: 3,
+          },
+        },
+      ]);
+    } finally {
+      await testDatabase.close();
+    }
+  });
+
   it("Browser Repository 旧 revision 结果保持等待态且不完成 Ledger", async () => {
     const testDatabase = await createTestDatabase();
 

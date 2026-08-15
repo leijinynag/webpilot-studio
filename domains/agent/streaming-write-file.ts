@@ -245,15 +245,16 @@ export function discardStreamingWriteFileProjection(input: {
   toolCallId: string;
   reason: string;
 }): StreamingWriteFileEvent[] {
-  if (
-    input.projection.status === "completed" ||
-    input.projection.status === "discarded"
-  ) {
+  if (input.projection.status === "discarded") {
     return [];
   }
 
   const path = input.projection.path;
-  const wasVisible = input.projection.status === "streaming";
+  // completed 只表示模型参数已闭合，真实 Repository 写入仍可能失败。
+  // 因此前端可见的 streaming/completed 两种状态都必须允许被正式结果回收。
+  const wasVisible =
+    input.projection.status === "streaming" ||
+    input.projection.status === "completed";
   input.projection.status = "discarded";
 
   // 尚未拿到安全路径时，前端从未创建临时标签，不需要发送一条无对象可回收的

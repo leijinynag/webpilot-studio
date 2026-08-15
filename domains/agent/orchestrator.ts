@@ -46,6 +46,14 @@ import {
   type FileToolName,
   type GitToolName,
 } from "@/domains/agent/tool-contracts";
+import {
+  completeStreamingWriteFileProjection,
+  createStreamingWriteFileProjection,
+  discardStreamingWriteFileProjection,
+  updateStreamingWriteFileProjection,
+  type StreamingWriteFileEvent,
+  type StreamingWriteFileProjection,
+} from "@/domains/agent/streaming-write-file";
 import { INSPECT_ATTACHMENT_TOOL_NAME } from "@/domains/image/vision-tool";
 import { GENERATE_IMAGE_TOOL_NAME } from "@/domains/image/generation-tool";
 import { LIST_PROJECT_ASSETS_TOOL_NAME } from "@/domains/image/asset-tool-definition";
@@ -111,6 +119,12 @@ type AccumulatedToolCall = {
   id: string;
   name: string;
   argumentsText: string;
+  streamingWriteFileProjection: StreamingWriteFileProjection;
+  /**
+   * true 表示临时投影的后续生命周期已经移交给正式 Repository 结果：
+   * Database 写入已成功，或 Browser Git 已建立可恢复的客户端等待事务。
+   */
+  streamingWriteFileSettled: boolean;
 };
 
 function estimateProviderInputTokens(
@@ -178,6 +192,7 @@ export class AgentOrchestrator {
       return;
     }
 
+    let activeStreamingToolCalls: AccumulatedToolCall[] = [];
     try {
       let run = await this.store.getRun(input);
       const profiles = assertFrozenProfilesAvailable({
@@ -328,6 +343,14 @@ export class AgentOrchestrator {
           leaseId,
           signal: input.signal,
         });
+        // 正常情况下上一轮投影已经 settled/discarded。这里仍先执行幂等清理，
+        // 防止未来新增分支在进入下一轮时遗留只存在于 UI 的临时文件。
+        await this.discardStreamingWriteFileProjections({
+          runId: run.id,
+          toolCalls: activeStreamingToolCalls,
+          reason: "turn_replaced",
+        });
+        activeStreamingToolCalls = turn.toolCalls;
         const retryableEmptyToolCallTurn =
           !turn.interruption && isRetryableEmptyToolCallTurn(turn);
         const consecutiveEmptyToolCallTurns = retryableEmptyToolCallTurn
@@ -704,6 +727,11 @@ export class AgentOrchestrator {
             });
 
             if (suspended) {
+              if (toolCall.name === FILE_TOOL_NAMES.writeFile) {
+                // Browser Git 的真实结果由浏览器异步提交。等待事务建立成功后，
+                // 服务端不再清理 completed 投影，由 client_tool.completed 接管。
+                toolCall.streamingWriteFileSettled = true;
+              }
               return;
             }
 
@@ -809,6 +837,9 @@ export class AgentOrchestrator {
                   id: `replay:${toolCall.id}:${run.currentRevision}`,
                   name: BROWSER_VERIFY_TOOL_NAME,
                   argumentsText: JSON.stringify(replayArguments.data),
+                  streamingWriteFileProjection:
+                    createStreamingWriteFileProjection(),
+                  streamingWriteFileSettled: false,
                 },
                 argumentsJson: replayArguments.data,
                 leaseId,
@@ -840,11 +871,19 @@ export class AgentOrchestrator {
     } catch (error) {
       await this.handleTerminalError(input, error, leaseId);
     } finally {
-      await this.store.releaseExecutionLease({
-        ownerId: input.ownerId,
-        runId: input.runId,
-        leaseId,
-      });
+      try {
+        await this.discardStreamingWriteFileProjections({
+          runId: input.runId,
+          toolCalls: activeStreamingToolCalls,
+          reason: "run_stopped",
+        });
+      } finally {
+        await this.store.releaseExecutionLease({
+          ownerId: input.ownerId,
+          runId: input.runId,
+          leaseId,
+        });
+      }
     }
   }
 
@@ -959,7 +998,18 @@ export class AgentOrchestrator {
               });
               break;
             case "tool_call_delta":
-              accumulateToolCall(toolCalls, event);
+              {
+                const toolCall = accumulateToolCall(toolCalls, event);
+                await this.appendStreamingWriteFileEvents(
+                  input.run.id,
+                  updateStreamingWriteFileProjection({
+                    projection: toolCall.streamingWriteFileProjection,
+                    toolCallId: toolCall.id,
+                    toolName: toolCall.name,
+                    argumentsText: toolCall.argumentsText,
+                  }),
+                );
+              }
               break;
             case "usage":
               inputTokens = event.inputTokens;
@@ -981,7 +1031,26 @@ export class AgentOrchestrator {
               break;
           }
         }
+
+        // Provider 正常结束只证明函数参数流已经闭合。completed 事件让前端
+        // 从“生成中”切换到“参数就绪”，仍需等待正式 tool.completed。
+        for (const toolCall of toolCalls.values()) {
+          await this.appendStreamingWriteFileEvents(
+            input.run.id,
+            completeStreamingWriteFileProjection({
+              projection: toolCall.streamingWriteFileProjection,
+              toolCallId: toolCall.id,
+              toolName: toolCall.name,
+              argumentsText: toolCall.argumentsText,
+            }),
+          );
+        }
       } catch (error) {
+        await this.discardStreamingWriteFileProjections({
+          runId: input.run.id,
+          toolCalls: [...toolCalls.values()],
+          reason: isAgentError(error) ? error.code : "provider_stream_error",
+        });
         // Provider 层只会在尚未产生任何事件时自行重试。若流已经输出了部分
         // 文本或 Tool Call 后中断，这一轮尚未执行任何工具副作用，可以由领域
         // 状态机丢弃临时输出并按冻结预算重试，避免用户等待到 120 秒总超时。
@@ -1045,6 +1114,20 @@ export class AgentOrchestrator {
     toolCall: AccumulatedToolCall,
     result: AgentToolResultEnvelope,
   ) {
+    if (toolCall.name === FILE_TOOL_NAMES.writeFile) {
+      if (result.ok) {
+        // Repository 副作用已经成功，之后即使 Transcript/Event 持久化瞬时
+        // 失败也不能发送 discarded，否则 UI 会否认一个真实存在的新 revision。
+        toolCall.streamingWriteFileSettled = true;
+      } else {
+        await this.discardStreamingWriteFileProjection({
+          runId: run.id,
+          toolCall,
+          reason: result.error?.code ?? "tool_failed",
+        });
+      }
+    }
+
     await this.store.appendTranscript({
       conversationId: run.conversationId,
       runId: run.id,
@@ -1082,6 +1165,12 @@ export class AgentOrchestrator {
     issues: readonly object[];
     persistLedger?: boolean;
   }): Promise<void> {
+    await this.discardStreamingWriteFileProjection({
+      runId: input.run.id,
+      toolCall: input.toolCall,
+      reason: AGENT_ERROR_CODES.toolInvalidArguments,
+    });
+
     const result = {
       ok: false,
       toolName: input.toolCall.name,
@@ -1145,6 +1234,54 @@ export class AgentOrchestrator {
         errorCode: AGENT_ERROR_CODES.toolInvalidArguments,
       },
     });
+  }
+
+  private async appendStreamingWriteFileEvents(
+    runId: string,
+    events: readonly StreamingWriteFileEvent[],
+  ): Promise<void> {
+    // 临时事件只进入 Run Event 流。这里刻意不写 Transcript、Tool Ledger
+    // 和 Repository，刷新后可重放 UI，但不会成为模型上下文或审计副作用。
+    for (const event of events) {
+      await this.store.appendEvent({
+        runId,
+        type: event.type,
+        payload: event.payload,
+      });
+    }
+  }
+
+  private async discardStreamingWriteFileProjection(input: {
+    runId: string;
+    toolCall: AccumulatedToolCall;
+    reason: string;
+  }): Promise<void> {
+    if (input.toolCall.streamingWriteFileSettled) {
+      return;
+    }
+
+    await this.appendStreamingWriteFileEvents(
+      input.runId,
+      discardStreamingWriteFileProjection({
+        projection: input.toolCall.streamingWriteFileProjection,
+        toolCallId: input.toolCall.id,
+        reason: input.reason,
+      }),
+    );
+  }
+
+  private async discardStreamingWriteFileProjections(input: {
+    runId: string;
+    toolCalls: readonly AccumulatedToolCall[];
+    reason: string;
+  }): Promise<void> {
+    for (const toolCall of input.toolCalls) {
+      await this.discardStreamingWriteFileProjection({
+        runId: input.runId,
+        toolCall,
+        reason: input.reason,
+      });
+    }
   }
 
   private async suspendForRunPreview(input: {
@@ -1636,17 +1773,20 @@ function parseImageToolArguments(value: unknown):
 function accumulateToolCall(
   toolCalls: Map<number, AccumulatedToolCall>,
   event: Extract<ProviderEvent, { type: "tool_call_delta" }>,
-) {
+): AccumulatedToolCall {
   const existing = toolCalls.get(event.index) ?? {
     index: event.index,
     id: "",
     name: "",
     argumentsText: "",
+    streamingWriteFileProjection: createStreamingWriteFileProjection(),
+    streamingWriteFileSettled: false,
   };
   existing.id = event.toolCallId ?? existing.id;
   existing.name = event.toolName ?? existing.name;
   existing.argumentsText += event.argumentsDelta ?? "";
   toolCalls.set(event.index, existing);
+  return existing;
 }
 
 function getConflictRevision(

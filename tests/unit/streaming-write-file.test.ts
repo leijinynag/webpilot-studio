@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   completeStreamingWriteFileProjection,
   createStreamingWriteFileProjection,
+  discardStreamingWriteFileProjection,
   updateStreamingWriteFileProjection,
 } from "@/domains/agent/streaming-write-file";
 
@@ -221,6 +222,34 @@ describe("streaming write_file projection", () => {
           toolCallId: "call-6",
           path: "src/a.ts",
           reason: "invalid_arguments",
+        },
+      },
+    ]);
+  });
+
+  it("参数已完成但正式工具失败时仍可回收临时文件", () => {
+    const projection = createStreamingWriteFileProjection();
+    completeStreamingWriteFileProjection({
+      projection,
+      toolCallId: "call-completed-failure",
+      toolName: "write_file",
+      argumentsText:
+        '{"path":"src/a.ts","content":"export const value = 1;","expectedRevision":1}',
+    });
+
+    expect(
+      discardStreamingWriteFileProjection({
+        projection,
+        toolCallId: "call-completed-failure",
+        reason: "repository_write_failed",
+      }),
+    ).toEqual([
+      {
+        type: "file.stream_discarded",
+        payload: {
+          toolCallId: "call-completed-failure",
+          path: "src/a.ts",
+          reason: "repository_write_failed",
         },
       },
     ]);
