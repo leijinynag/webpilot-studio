@@ -65,7 +65,8 @@ export async function launchAgentRun(input: {
 
     // Run 创建时已经冻结了模型。恢复执行必须沿用这个模型，
     // 否则用户选择 gpt-5.5 后，后台重启会悄悄退回 DeepSeek。
-    const { provider } = getAgentProviderRuntime(currentRun.model);
+    const agentProviderRuntime = getAgentProviderRuntime(currentRun.model);
+    const { provider } = agentProviderRuntime;
     let checkpointRuntime:
       ReturnType<typeof getContextSummaryProviderRuntime> | undefined;
     try {
@@ -153,6 +154,7 @@ export async function launchAgentRun(input: {
             },
           }
         : undefined,
+      agentProviderRuntime.contextWindowCharacters,
     );
 
     await withAgentRunController(input.runId, (signal) =>

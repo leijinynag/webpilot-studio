@@ -11,6 +11,11 @@ export type AgentProviderRuntime = {
   provider: LlmProvider;
   providerName: AgentProviderName;
   model: string;
+  /**
+   * Provider/代理网关明确提供的上下文字符预算。未知模型保持 undefined，
+   * 由 Agent 领域层使用 96k 安全值，不能依据模型名猜测窗口大小。
+   */
+  contextWindowCharacters?: number;
 };
 
 export type AgentModelOption = {
@@ -125,10 +130,12 @@ export function createAgentProviderRuntime(
     | "LLM_AGENT_MODEL"
     | "LLM_FAST_MODEL"
     | "LLM_BASE_URL"
+    | "LLM_CONTEXT_WINDOW_CHARACTERS"
     | "VISION_PROVIDER"
     | "VISION_BASE_URL"
     | "VISION_API_KEY"
     | "VISION_MODEL"
+    | "VISION_CONTEXT_WINDOW_CHARACTERS"
   >,
   requestedModel?: string,
 ): AgentProviderRuntime {
@@ -168,6 +175,7 @@ export function createAgentProviderRuntime(
     return {
       providerName: "deepseek",
       model,
+      contextWindowCharacters: environment.LLM_CONTEXT_WINDOW_CHARACTERS,
       provider: new DeepSeekProvider({
         apiKey,
         baseUrl: environment.LLM_BASE_URL || "https://api.deepseek.com",
@@ -191,6 +199,7 @@ export function createAgentProviderRuntime(
   return {
     providerName: "openai-compatible",
     model,
+    contextWindowCharacters: environment.VISION_CONTEXT_WINDOW_CHARACTERS,
     provider: new OpenAiCompatibleAgentProvider({
       apiKey: visionApiKey,
       baseUrl: environment.VISION_BASE_URL || "https://api.openai.com/v1",

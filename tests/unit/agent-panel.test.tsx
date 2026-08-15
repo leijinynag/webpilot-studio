@@ -456,34 +456,41 @@ describe("AgentPanel", () => {
 
     await screen.findByText("执行中", { exact: true });
     const stream = MockEventSource.instances[0];
+    vi.useFakeTimers();
 
-    await act(async () => {
-      for (let sequence = 1; sequence <= 8; sequence += 1) {
-        stream?.emit(
-          "assistant.delta",
-          {
-            id: `event-delta-${sequence}`,
-            runId: createRun("running").id,
-            sequence,
-            type: "assistant.delta",
-            payload: { text: String(sequence) },
-            createdAt: new Date().toISOString(),
-          },
-          String(sequence),
-        );
-      }
-    });
+    try {
+      await act(async () => {
+        for (let sequence = 1; sequence <= 8; sequence += 1) {
+          stream?.emit(
+            "assistant.delta",
+            {
+              id: `event-delta-${sequence}`,
+              runId: createRun("running").id,
+              sequence,
+              type: "assistant.delta",
+              payload: { text: String(sequence) },
+              createdAt: new Date().toISOString(),
+            },
+            String(sequence),
+          );
+        }
+        // 流式文本本身以 32ms 批量提交 React state。先只推进这一层，
+        // 验证 UI 已更新但 160ms 的持久化快照刷新尚未发生。
+        await vi.advanceTimersByTimeAsync(32);
+      });
 
-    await waitFor(() => {
       expect(screen.getByText("12345678")).toBeVisible();
-    });
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-    await waitFor(
-      () => {
-        expect(fetchMock).toHaveBeenCalledTimes(2);
-      },
-      { timeout: 1_000 },
-    );
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+
+      // 不依赖真实机器是否在 160ms 内完成 DOM 断言，显式推进合并窗口。
+      // 这样既验证高频事件只调度一次，也避免全量并行测试时偶发提前刷新。
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(128);
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("从 SSE 转发完整文件流事件，且高频增量不触发聚合快照", async () => {

@@ -36,6 +36,7 @@ import type { AgentStore } from "@/domains/agent/store";
 import { assembleProviderMessages } from "@/domains/agent/transcript";
 import {
   ensureContextCheckpoint,
+  normalizeContextCharacters,
   type ContextCheckpointStore,
 } from "@/domains/agent/context-checkpoint";
 import {
@@ -176,6 +177,11 @@ export class AgentOrchestrator {
       model: string;
       usage?: Parameters<typeof ensureContextCheckpoint>[0]["usage"];
     },
+    /**
+     * 该值描述主 Agent 模型，而非摘要模型。Checkpoint 触发和每轮消息裁剪
+     * 必须共享同一预算，避免摘要认为可继续增长、Provider 投影却提前截断。
+     */
+    private readonly providerContextCharacters?: number,
   ) {}
 
   async run(input: {
@@ -326,6 +332,7 @@ export class AgentOrchestrator {
               run,
               transcript,
               systemPrompt,
+              maxContextCharacters: this.providerContextCharacters,
               signal: input.signal,
               usage: this.checkpointRuntime.usage,
             })
@@ -942,9 +949,11 @@ export class AgentOrchestrator {
         const messages = assembleProviderMessages(input.transcript, {
           systemPrompt: input.systemPrompt,
           maxMessageCharacters: input.run.budget.maxToolResultCharacters,
-          // 单条工具结果最多 20,000 字符，但多轮读写会快速累积。
-          // 这里保留最近上下文，避免“继续”请求超过模型上下文窗口。
-          maxContextCharacters: 96_000,
+          // 单条工具结果最多 20,000 字符，但多轮读写会快速累积。已配置
+          // Provider 窗口时使用其字符预算；未知模型继续采用 96k 兜底。
+          maxContextCharacters: normalizeContextCharacters(
+            this.providerContextCharacters,
+          ),
           attachmentContexts: input.attachmentContexts,
           contextCheckpoint: input.contextCheckpoint,
           // Checkpoint 属于 Conversation，而模型循环属于当前 Run。并发 Run

@@ -15,11 +15,8 @@ import type {
   settleContextCheckpointUsageBudget,
 } from "@/infrastructure/quota/service";
 
-const FALLBACK_CONTEXT_CHARACTERS = 96_000;
+export const FALLBACK_CONTEXT_CHARACTERS = 96_000;
 const CHECKPOINT_TRIGGER_RATIO = 0.7;
-const CHECKPOINT_TRIGGER_CHARACTERS = Math.floor(
-  FALLBACK_CONTEXT_CHARACTERS * CHECKPOINT_TRIGGER_RATIO,
-);
 const RETAINED_INTERACTION_GROUPS = 24;
 const SUMMARY_MAX_OUTPUT_TOKENS = 2_048;
 const MAX_CHECKPOINT_CAS_ATTEMPTS = 3;
@@ -62,9 +59,20 @@ export async function ensureContextCheckpoint(input: {
   run: AgentRunRecord;
   transcript: readonly TranscriptMessage[];
   systemPrompt: string;
+  /**
+   * 当前主 Agent 模型可接收的上下文字符预算。Provider 能提供窗口元数据时
+   * 按其 70% 提前压缩；代理模型或未知模型没有可靠数据时回退 96k。
+   */
+  maxContextCharacters?: number;
   signal?: AbortSignal;
   usage?: CheckpointUsagePorts;
 }): Promise<ContextCheckpoint> {
+  const maxContextCharacters = normalizeContextCharacters(
+    input.maxContextCharacters,
+  );
+  const checkpointTriggerCharacters = Math.floor(
+    maxContextCharacters * CHECKPOINT_TRIGGER_RATIO,
+  );
   let checkpoint = await input.store.getContextCheckpoint({
     ownerId: input.run.ownerId,
     conversationId: input.run.conversationId,
@@ -80,8 +88,7 @@ export async function ensureContextCheckpoint(input: {
       maxContextCharacters: Number.MAX_SAFE_INTEGER,
     });
     if (
-      estimateProviderContextCharacters(projected) <
-      CHECKPOINT_TRIGGER_CHARACTERS
+      estimateProviderContextCharacters(projected) < checkpointTriggerCharacters
     ) {
       return checkpoint;
     }
@@ -278,6 +285,16 @@ export async function ensureContextCheckpoint(input: {
   }
 
   return checkpoint;
+}
+
+/**
+ * Provider 元数据属于外部输入，必须在领域边界做一次有限数校验。
+ * 非法值不能把裁剪关闭或制造负数阈值，统一退回经过长期验证的 96k。
+ */
+export function normalizeContextCharacters(value?: number): number {
+  return typeof value === "number" && Number.isFinite(value) && value > 0
+    ? Math.floor(value)
+    : FALLBACK_CONTEXT_CHARACTERS;
 }
 
 async function recordCheckpointUsageSafely(

@@ -182,6 +182,27 @@ function createConversationHistory(options?: {
 }
 
 describe("ContextCheckpoint", () => {
+  it("Provider 提供窗口信息时按 70% 阈值触发摘要", async () => {
+    const provider = new SummaryProvider();
+    const store = new MemoryCheckpointStore();
+
+    await ensureContextCheckpoint({
+      store,
+      provider,
+      providerName: "deepseek",
+      model: "deepseek-v4-flash",
+      run: createRun(),
+      transcript: createConversationHistory(),
+      systemPrompt: "system",
+      // 普通历史不足 96k，但超过这个测试窗口的 70%，可证明阈值来自
+      // Provider 元数据，而不是继续使用固定常量。
+      maxContextCharacters: 500,
+    });
+
+    expect(provider.inputs).toHaveLength(1);
+    expect(store.checkpoint.version).toBe(1);
+  });
+
   it("上下文未达到阈值时不调用摘要模型", async () => {
     const provider = new SummaryProvider();
     const store = new MemoryCheckpointStore();
@@ -197,6 +218,25 @@ describe("ContextCheckpoint", () => {
     });
 
     expect(checkpoint).toEqual(store.checkpoint);
+    expect(provider.inputs).toHaveLength(0);
+    expect(store.compareAndSetCalls).toBe(0);
+  });
+
+  it("没有可靠窗口信息时保留 96k 字符兜底", async () => {
+    const provider = new SummaryProvider();
+    const store = new MemoryCheckpointStore();
+
+    await ensureContextCheckpoint({
+      store,
+      provider,
+      providerName: "deepseek",
+      model: "deepseek-v4-flash",
+      run: createRun(),
+      transcript: createConversationHistory(),
+      systemPrompt: "system",
+      maxContextCharacters: Number.NaN,
+    });
+
     expect(provider.inputs).toHaveLength(0);
     expect(store.compareAndSetCalls).toBe(0);
   });
