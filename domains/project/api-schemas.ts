@@ -38,6 +38,35 @@ export const writeFileRequestSchema = z
   })
   .strict();
 
+const batchFileMutationSchema = z.discriminatedUnion("type", [
+  z
+    .object({
+      type: z.literal("write"),
+      path: projectPathSchema,
+      content: z.string(),
+    })
+    .strict(),
+  z
+    .object({
+      type: z.literal("delete"),
+      path: projectPathSchema,
+    })
+    .strict(),
+]);
+
+/**
+ * 终端导入属于一次 Repository 快照更新，而不是多次独立文件保存。
+ *
+ * HTTP 层只限制协议形状和批次规模；路径规范化、重复路径拒绝及最终 CAS
+ * 仍由 Repository 统一执行，确保 Database 与 Browser Git 共享同一套语义。
+ */
+export const batchFileMutationRequestSchema = z
+  .object({
+    expectedRevision: revisionSchema,
+    mutations: z.array(batchFileMutationSchema).min(1).max(500),
+  })
+  .strict();
+
 export const renameFileRequestSchema = z
   .object({
     fromPath: projectPathSchema,
