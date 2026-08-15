@@ -3767,6 +3767,10 @@ html[data-theme="dark"] .piece-art.travel {
   position: relative;
 }
 
+.mobile-workbench-tabs {
+  display: none;
+}
+
 .workspace-repository-loading,
 .workspace-repository-unavailable {
   border: 1px solid var(--border);
@@ -6940,6 +6944,10 @@ html[data-theme="dark"] .ide-preview-surface {
 }
 
 @media (max-width: 900px) {
+  .workbench-page {
+    overflow: hidden;
+  }
+
   .app-frame {
     padding: 10px;
   }
@@ -6962,27 +6970,94 @@ html[data-theme="dark"] .ide-preview-surface {
 
   .workbench-grid {
     display: grid;
-    grid-template-columns: minmax(300px, 360px) minmax(707px, 1fr);
-    width: max(100%, 1014px);
-    height: auto;
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: auto minmax(0, 1fr);
+    width: 100%;
+    height: 100%;
     min-width: 0;
     min-height: 0;
+    overflow: hidden;
+  }
+
+  .mobile-workbench-tabs {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    grid-column: 1;
+    grid-row: 1;
+    gap: 4px;
+    min-width: 0;
+    padding: 5px;
+    border-bottom: 1px solid var(--border);
+    background: var(--surface);
+  }
+
+  .mobile-workbench-tabs [data-slot="toggle-group-item"] {
+    min-width: 0;
+    height: 32px;
+    gap: 6px;
+    border: 0;
+    border-radius: var(--radius-control);
+    color: var(--muted-foreground);
+    font-size: 0.8125rem;
+  }
+
+  .mobile-workbench-tabs [data-slot="toggle-group-item"][data-state="on"] {
+    color: var(--foreground);
+    background: var(--surface-3);
+  }
+
+  .mobile-workbench-tabs svg {
+    width: 15px;
+    height: 15px;
+  }
+
+  .workbench-grid > .agent-panel-v2,
+  .workbench-grid > .workspace.workspace-ide {
+    grid-column: 1;
+    grid-row: 2;
+    min-width: 0;
+  }
+
+  .workbench-grid[data-mobile-panel="agent"] > .workspace.workspace-ide,
+  .workbench-grid:not([data-mobile-panel="agent"]) > .agent-panel-v2 {
+    display: none;
   }
 
   .agent-panel-v2 {
-    /* 即使窄屏也保持完整的 Agent 工具列，消息区域自己滚动。 */
-    width: auto;
+    position: relative;
+    width: 100%;
     height: 100%;
     min-height: 0;
-    border-right: 1px solid var(--border);
+    border-right: 0;
     border-bottom: 0;
+    box-shadow: none;
   }
 
   .workspace.workspace-ide {
-    grid-template-columns: 190px minmax(0, 1fr);
+    grid-template-columns: minmax(0, 1fr);
     grid-template-rows: minmax(0, 1fr);
+    width: 100%;
     height: 100%;
     min-height: 0;
+  }
+
+  .workbench-grid[data-mobile-panel="explorer"] .ide-main,
+  .workbench-grid[data-mobile-panel="workspace"] .ide-sidebar {
+    display: none;
+  }
+
+  .workbench-grid[data-mobile-panel="explorer"] .ide-sidebar,
+  .workbench-grid[data-mobile-panel="workspace"] .ide-main {
+    display: flex;
+    min-width: 0;
+  }
+
+  .workbench-grid[data-mobile-panel="workspace"] .ide-main {
+    display: grid;
+  }
+
+  .workbench-grid[data-mobile-panel="explorer"] .ide-sidebar {
+    border-right: 0;
   }
 
   .workspace-resize-handle {

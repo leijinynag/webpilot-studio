@@ -88,9 +88,13 @@
       }
     },
     "layout": {
-      "resizeAgent": "Resize Agent panel",
-      "resizeExplorer": "Resize Explorer",
-      "resetWidth": "Double-click to restore the default width"
+      "resizeAgent": "Resize left conversation panel",
+      "resizeExplorer": "Resize file sidebar",
+      "resetWidth": "Double-click to restore the default width",
+      "mobilePanel": "Switch workbench panel",
+      "mobileAgent": "Chat",
+      "mobileExplorer": "Files",
+      "mobileWorkspace": "Workspace"
     },
     "saving": "Saving",
     "save": "Save",

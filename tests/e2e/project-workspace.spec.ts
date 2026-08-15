@@ -1,5 +1,5 @@
 import { expect, test, type Browser, type Page } from "@playwright/test";
-import { postWithCsrf } from "./helpers/api";
+import { getWithBrowserSession, postWithCsrf } from "./helpers/api";
 
 type ProjectResponse = {
   project: {
@@ -95,8 +95,11 @@ test("persists multiple file revisions and restores the latest snapshot", async 
       owned.page.getByText("m1-proof.ts", { exact: true }),
     ).toBeVisible();
 
-    const restored = await owned.request.get(
+    const restored = await getWithBrowserSession(
+      owned.page,
       `/api/projects/${project.id}/files/src/m1-proof.ts`,
+      {},
+      owned.request,
     );
     expect(restored.ok()).toBe(true);
     expect((await restored.json()) as FileResponse).toMatchObject({
@@ -157,8 +160,18 @@ test("edits and saves multiple files from the Monaco workspace", async ({
     ).toBeVisible({ timeout: 15_000 });
 
     const [indexFile, stylesFile] = await Promise.all([
-      owned.request.get(`/api/projects/${project.id}/files/src/index.tsx`),
-      owned.request.get(`/api/projects/${project.id}/files/src/styles.css`),
+      getWithBrowserSession(
+        owned.page,
+        `/api/projects/${project.id}/files/src/index.tsx`,
+        {},
+        owned.request,
+      ),
+      getWithBrowserSession(
+        owned.page,
+        `/api/projects/${project.id}/files/src/styles.css`,
+        {},
+        owned.request,
+      ),
     ]);
     await expect(indexFile.json()).resolves.toMatchObject({
       file: { content: expect.stringContaining("M1 saved from Monaco") },
@@ -218,8 +231,11 @@ test("rejects a stale revision without overwriting the winning content", async (
       },
     });
 
-    const file = await owned.request.get(
+    const file = await getWithBrowserSession(
+      owned.page,
       `/api/projects/${project.id}/files/src/index.tsx`,
+      {},
+      owned.request,
     );
     expect(file.ok()).toBe(true);
     expect((await file.json()) as FileResponse).toMatchObject({
@@ -241,18 +257,29 @@ test("keeps projects isolated between anonymous owners", async ({
 
   try {
     const project = await createProject(ownerA.page, "Owner A private");
-    const foreignProject = await ownerB.request.get(
+    const foreignProject = await getWithBrowserSession(
+      ownerB.page,
       `/api/projects/${project.id}`,
+      {},
+      ownerB.request,
     );
-    const foreignFiles = await ownerB.request.get(
+    const foreignFiles = await getWithBrowserSession(
+      ownerB.page,
       `/api/projects/${project.id}/files`,
+      {},
+      ownerB.request,
     );
 
     // 对外统一表现为 not found，避免泄漏另一个匿名 owner 的项目是否存在。
     expect(foreignProject.status()).toBe(404);
     expect(foreignFiles.status()).toBe(404);
 
-    const ownerBList = await ownerB.request.get("/api/projects");
+    const ownerBList = await getWithBrowserSession(
+      ownerB.page,
+      "/api/projects",
+      {},
+      ownerB.request,
+    );
     expect(ownerBList.ok()).toBe(true);
     await expect(ownerBList.json()).resolves.toMatchObject({ projects: [] });
   } finally {

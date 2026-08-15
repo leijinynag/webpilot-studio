@@ -2,6 +2,23 @@ import { expect, test, type Page } from "@playwright/test";
 import { postWithCsrf } from "./helpers/api";
 
 const previewBaseURL = process.env.PLAYWRIGHT_BASE_URL;
+const isRemotePreviewDeployment = (() => {
+  if (!previewBaseURL) {
+    return false;
+  }
+
+  try {
+    const url = new URL(previewBaseURL);
+    return (
+      (url.protocol === "https:" || url.protocol === "http:") &&
+      url.hostname !== "localhost" &&
+      url.hostname !== "127.0.0.1" &&
+      url.hostname !== "::1"
+    );
+  } catch {
+    return false;
+  }
+})();
 
 async function enableVercelAutomationBypass(page: Page): Promise<void> {
   const bypassSecret = process.env.VERCEL_AUTOMATION_BYPASS_SECRET;
@@ -41,8 +58,8 @@ async function createPreviewProject(page: Page): Promise<string> {
 
 test.describe("Vercel Preview deployment", () => {
   test.skip(
-    !previewBaseURL,
-    "设置 PLAYWRIGHT_BASE_URL 后运行远程 Preview smoke。",
+    !isRemotePreviewDeployment,
+    "设置非 localhost 的 PLAYWRIGHT_BASE_URL 后运行远程 Preview smoke。",
   );
 
   test("保留跨源隔离并完成真实 WebContainer 启动", async ({ page }) => {

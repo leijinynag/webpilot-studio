@@ -62,7 +62,7 @@ describe("WorkspaceResizeHandle", () => {
     render(<ResizeHarness />);
 
     const handle = screen.getByRole("separator", {
-      name: "调整 Agent 面板宽度",
+      name: "调整左侧对话面板宽度",
     });
     const container = handle.parentElement;
 
@@ -102,7 +102,7 @@ describe("WorkspaceResizeHandle", () => {
 
     const view = render(<ResizeHarness />);
     expect(
-      screen.getByRole("separator", { name: "调整 Agent 面板宽度" }),
+      screen.getByRole("separator", { name: "调整左侧对话面板宽度" }),
     ).toHaveAttribute("aria-valuenow", "456");
     view.unmount();
 
@@ -113,7 +113,7 @@ describe("WorkspaceResizeHandle", () => {
     render(<ResizeHarness />);
 
     expect(
-      screen.getByRole("separator", { name: "调整 Agent 面板宽度" }),
+      screen.getByRole("separator", { name: "调整左侧对话面板宽度" }),
     ).toHaveAttribute("aria-valuenow", "340");
   });
 });
@@ -127,7 +127,7 @@ function ResizeHarness() {
         containerRef={containerRef}
         cssVariable="--workspace-agent-width"
         defaultWidth={340}
-        label="调整 Agent 面板宽度"
+        label="调整左侧对话面板宽度"
         maxWidth={520}
         minWidth={300}
         panel="agent"

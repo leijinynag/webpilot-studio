@@ -4,7 +4,7 @@ import {
   type APIRequestContext,
   type Page,
 } from "@playwright/test";
-import { postWithCsrf } from "./helpers/api";
+import { getWithBrowserSession, postWithCsrf } from "./helpers/api";
 import { unzipSync } from "fflate";
 
 const RUN_WEBCONTAINER_E2E = process.env.RUN_M8_WEBCONTAINER_E2E === "1";
@@ -254,7 +254,8 @@ test.describe("M8 export and i18n smoke", () => {
       (await databaseResponse.json()) as { project: Project }
     ).project;
     expect(databaseProject.revision).toBe(0);
-    const databaseFilesResponse = await page.request.get(
+    const databaseFilesResponse = await getWithBrowserSession(
+      page,
       `/api/projects/${databaseProject.id}/files`,
     );
     expect(databaseFilesResponse.status()).toBe(200);

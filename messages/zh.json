@@ -88,9 +88,13 @@
       }
     },
     "layout": {
-      "resizeAgent": "调整 Agent 面板宽度",
-      "resizeExplorer": "调整 Explorer 宽度",
-      "resetWidth": "双击恢复默认宽度"
+      "resizeAgent": "调整左侧对话面板宽度",
+      "resizeExplorer": "调整文件侧栏宽度",
+      "resetWidth": "双击恢复默认宽度",
+      "mobilePanel": "切换工作台面板",
+      "mobileAgent": "对话",
+      "mobileExplorer": "文件",
+      "mobileWorkspace": "工作区"
     },
     "saving": "Saving",
     "save": "Save",

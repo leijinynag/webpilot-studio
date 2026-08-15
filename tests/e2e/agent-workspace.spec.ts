@@ -1,5 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
-import { postWithCsrf } from "./helpers/api";
+import { getWithBrowserSession, postWithCsrf } from "./helpers/api";
 
 const AGENT_E2E_ENABLED = process.env.RUN_AGENT_E2E === "1";
 const TERMINAL_STATUSES = new Set([
@@ -188,7 +188,10 @@ async function waitForTerminalRun(
   await expect
     .poll(
       async () => {
-        const response = await page.request.get(`/api/agent-runs/${runId}`);
+        const response = await getWithBrowserSession(
+          page,
+          `/api/agent-runs/${runId}`,
+        );
         expect(response.ok()).toBe(true);
         const body = (await response.json()) as { run: Run };
         lastRun = body.run;
@@ -235,7 +238,8 @@ async function readProjectFile(
   projectId: string,
   path: string,
 ): Promise<ProjectFile> {
-  const response = await page.request.get(
+  const response = await getWithBrowserSession(
+    page,
     `/api/projects/${projectId}/files/${path}`,
   );
   expect(response.ok()).toBe(true);
@@ -248,7 +252,8 @@ async function readAgentSnapshot(
   projectId: string,
   conversationId: string,
 ): Promise<AgentSnapshot> {
-  const response = await page.request.get(
+  const response = await getWithBrowserSession(
+    page,
     `/api/projects/${projectId}/agent?conversationId=${conversationId}`,
   );
   expect(response.ok()).toBe(true);
@@ -259,18 +264,20 @@ async function readAgentSnapshot(
   return body.snapshot;
 }
 
-test("keeps the workbench inside the viewport at tablet width", async ({
+test("keeps every workbench panel reachable without mobile overflow", async ({
   page,
 }) => {
-  const project = await createProject(page, "Tablet Agent layout");
-  await page.setViewportSize({ width: 708, height: 800 });
+  const project = await createProject(page, "Mobile Agent layout");
+  await page.setViewportSize({ width: 390, height: 844 });
   await page.goto(`/p/${project.id}`);
 
   const workbenchGrid = page.locator(".workbench-grid");
   const agentPanel = page.locator(".agent-panel-v2");
   const composer = page.locator(".agent-composer-v2");
+  const mobileTabs = page.locator(".mobile-workbench-tabs");
 
   await expect(workbenchGrid).toBeVisible();
+  await expect(mobileTabs).toBeVisible();
   await expect(agentPanel).toBeVisible();
   await expect(composer).toBeVisible();
   // 该布局回归与国际化文案无关，使用 Composer 内部的 textbox 角色。
@@ -321,10 +328,10 @@ test("keeps the workbench inside the viewport at tablet width", async ({
   expect(layout.gridDisplay).toBe("grid");
   expect(layout.gridMinWidth).toBe("0px");
   expect(layout.bodyScrollWidth).toBeLessThanOrEqual(layout.bodyClientWidth);
-  expect(layout.workbenchScrollWidth).toBeGreaterThanOrEqual(
-    layout.workbenchClientWidth,
+  expect(layout.workbenchScrollWidth).toBeLessThanOrEqual(
+    layout.workbenchClientWidth + 1,
   );
-  expect(layout.workbenchOverflowX).toBe("auto");
+  expect(layout.workbenchOverflowX).toBe("hidden");
   expect(layout.panelWidth).toBeGreaterThan(0);
   expect(layout.transcriptOverflowY).toBe("auto");
   expect(layout.composerBottom).toBeLessThanOrEqual(layout.viewportHeight + 1);
@@ -334,9 +341,20 @@ test("keeps the workbench inside the viewport at tablet width", async ({
   ).toBeLessThanOrEqual(16);
   expect(layout.composerDisplay).toBe("flex");
   expect(layout.composerFooterDisplay).toBe("flex");
+
+  await mobileTabs.locator('[data-mobile-panel-target="explorer"]').click();
+  await expect(page.locator(".file-tree")).toBeVisible();
+  await expect(agentPanel).toBeHidden();
+
+  await mobileTabs.locator('[data-mobile-panel-target="workspace"]').click();
+  await expect(page.locator(".ide-main")).toBeVisible();
+  await expect(page.locator(".workspace-statusbar")).toBeVisible();
+
+  await mobileTabs.locator('[data-mobile-panel-target="agent"]').click();
+  await expect(composer).toBeVisible();
 });
 
-test("keeps Agent fixed and lets the Explorer scroll independently", async ({
+test("lets the narrow Explorer scroll independently without moving the page", async ({
   page,
 }) => {
   // 该用例会顺序写入多份文件以制造真实滚动高度。远程 PostgreSQL 在开发环境
@@ -362,18 +380,17 @@ test("keeps Agent fixed and lets the Explorer scroll independently", async ({
   const agentPanel = page.locator(".agent-panel-v2");
   const fileTree = page.locator(".file-tree");
   const workbenchPage = page.locator(".workbench-page");
+  const mobileTabs = page.locator(".mobile-workbench-tabs");
 
   await expect(agentPanel).toBeVisible();
+  await mobileTabs.locator('[data-mobile-panel-target="explorer"]').click();
   await expect(fileTree).toBeVisible();
 
   const beforeScroll = await page.evaluate(() => {
-    const agent = document.querySelector<HTMLElement>(".agent-panel-v2");
     const tree = document.querySelector<HTMLElement>(".file-tree");
     const pageElement = document.querySelector<HTMLElement>(".workbench-page");
 
     return {
-      agentLeft: agent?.getBoundingClientRect().left ?? 0,
-      agentWidth: agent?.getBoundingClientRect().width ?? 0,
       treeClientHeight: tree?.clientHeight ?? 0,
       treeScrollHeight: tree?.scrollHeight ?? 0,
       pageScrollWidth: pageElement?.scrollWidth ?? 0,
@@ -381,55 +398,39 @@ test("keeps Agent fixed and lets the Explorer scroll independently", async ({
     };
   });
 
-  expect(beforeScroll.agentWidth).toBeGreaterThan(0);
   expect(beforeScroll.treeScrollHeight).toBeGreaterThan(
     beforeScroll.treeClientHeight,
   );
-  expect(beforeScroll.pageScrollWidth).toBeGreaterThan(
-    beforeScroll.pageClientWidth,
+  expect(beforeScroll.pageScrollWidth).toBeLessThanOrEqual(
+    beforeScroll.pageClientWidth + 1,
   );
 
   await fileTree.evaluate((element) => {
     element.scrollTop = element.scrollHeight;
   });
-  await workbenchPage.evaluate((element) => {
-    element.scrollLeft = element.scrollWidth;
-  });
 
   const afterScroll = await page.evaluate(() => {
-    const agent = document.querySelector<HTMLElement>(".agent-panel-v2");
     const tree = document.querySelector<HTMLElement>(".file-tree");
 
     return {
-      agentLeft: agent?.getBoundingClientRect().left ?? 0,
       treeScrollTop: tree?.scrollTop ?? 0,
       treeMaxScrollTop: tree
         ? tree.scrollHeight - tree.clientHeight
         : Number.POSITIVE_INFINITY,
-      composerBottom:
-        document
-          .querySelector<HTMLElement>(".agent-composer-v2")
-          ?.getBoundingClientRect().bottom ?? 0,
-      statusbarBottom:
-        document
-          .querySelector<HTMLElement>(".workspace-statusbar")
-          ?.getBoundingClientRect().bottom ?? 0,
-      viewportHeight: window.innerHeight,
     };
   });
 
-  expect(afterScroll.agentLeft).toBeGreaterThanOrEqual(-1);
   expect(afterScroll.treeScrollTop).toBeGreaterThan(0);
   expect(afterScroll.treeScrollTop).toBeCloseTo(
     afterScroll.treeMaxScrollTop,
     0,
   );
-  expect(afterScroll.composerBottom).toBeLessThanOrEqual(
-    afterScroll.viewportHeight + 1,
-  );
-  expect(afterScroll.statusbarBottom).toBeLessThanOrEqual(
-    afterScroll.viewportHeight + 1,
-  );
+
+  await mobileTabs.locator('[data-mobile-panel-target="agent"]').click();
+  await expect(page.locator(".agent-composer-v2")).toBeVisible();
+  await mobileTabs.locator('[data-mobile-panel-target="workspace"]').click();
+  await expect(page.locator(".workspace-statusbar")).toBeVisible();
+  await expect(workbenchPage).toHaveJSProperty("scrollLeft", 0);
 });
 
 test("resizes desktop panels, persists widths, and restores responsive layout", async ({
@@ -508,18 +509,39 @@ test("resizes desktop panels, persists widths, and restores responsive layout", 
     ),
   ).toBeGreaterThanOrEqual(520);
 
+  // pointerup 会把拖动期间仅存在于 CSS 变量里的宽度提交到 localStorage。
+  // 显式等待持久化完成，再刷新页面验证恢复，避免测试与 React 事件尾部竞争。
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        window.localStorage.getItem("webpilot:workspace-layout:v1"),
+      ),
+    )
+    .toContain(`"agent":${Math.round(resizedAgentWidth)}`);
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        window.localStorage.getItem("webpilot:workspace-layout:v1"),
+      ),
+    )
+    .toContain(`"explorer":${Math.round(resizedExplorerWidth)}`);
+
   await page.reload();
   await expect(agentHandle).toBeVisible();
-  expect(
-    await agentPanel.evaluate(
-      (element) => element.getBoundingClientRect().width,
-    ),
-  ).toBeCloseTo(resizedAgentWidth, 0);
-  expect(
-    await explorerPanel.evaluate(
-      (element) => element.getBoundingClientRect().width,
-    ),
-  ).toBeCloseTo(resizedExplorerWidth, 0);
+  // 水合首帧使用默认宽度，effect 随后读取 localStorage。这里等待最终布局，
+  // 避免把正常的客户端恢复过程误判成宽度持久化失效。
+  await expect
+    .poll(() =>
+      agentPanel.evaluate((element) => element.getBoundingClientRect().width),
+    )
+    .toBeCloseTo(resizedAgentWidth, 0);
+  await expect
+    .poll(() =>
+      explorerPanel.evaluate(
+        (element) => element.getBoundingClientRect().width,
+      ),
+    )
+    .toBeCloseTo(resizedExplorerWidth, 0);
 
   await agentHandle.dblclick();
   await explorerHandle.dblclick();
@@ -538,6 +560,9 @@ test("resizes desktop panels, persists widths, and restores responsive layout", 
   await expect(agentHandle).toBeHidden();
   await expect(explorerHandle).toBeHidden();
   await expect(page.locator(".agent-composer-v2")).toBeVisible();
+  await page
+    .locator('.mobile-workbench-tabs [data-mobile-panel-target="workspace"]')
+    .click();
   await expect(page.locator(".workspace-statusbar")).toBeVisible();
 });
 
@@ -550,7 +575,10 @@ async function waitForRunStatus(
   const deadline = Date.now() + timeout;
 
   while (Date.now() < deadline) {
-    const response = await page.request.get(`/api/agent-runs/${runId}`);
+    const response = await getWithBrowserSession(
+      page,
+      `/api/agent-runs/${runId}`,
+    );
     expect(response.ok()).toBe(true);
     const body = (await response.json()) as { run: Run };
 
@@ -764,7 +792,8 @@ test.describe("Agent workspace live flow", () => {
       page.getByLabel(`Repository revision ${run.currentRevision}`),
     ).toBeVisible();
 
-    const changeSetResponse = await page.request.get(
+    const changeSetResponse = await getWithBrowserSession(
+      page,
       `/api/agent-runs/${run.id}/change-set`,
     );
     expect(changeSetResponse.ok()).toBe(true);
@@ -788,7 +817,8 @@ test.describe("Agent workspace live flow", () => {
       ]),
     );
 
-    const previewResponse = await page.request.get(
+    const previewResponse = await getWithBrowserSession(
+      page,
       `/api/agent-runs/${run.id}/restore-preview`,
     );
     expect(previewResponse.ok()).toBe(true);
@@ -988,7 +1018,8 @@ test.describe("Agent workspace live flow", () => {
     expect(finalRun.status).toBe("cancelled");
     expect(finalRun.currentRevision).toBe(project.revision);
 
-    const fileResponse = await page.request.get(
+    const fileResponse = await getWithBrowserSession(
+      page,
       `/api/projects/${project.id}/files/src/index.tsx`,
     );
     expect(fileResponse.ok()).toBe(true);
@@ -1124,7 +1155,8 @@ createRoot(document.getElementById("root")!).render(<App />);
   }) => {
     test.setTimeout(360_000);
     const project = await createProject(page, "M3 install evidence");
-    const packageResponse = await page.request.get(
+    const packageResponse = await getWithBrowserSession(
+      page,
       `/api/projects/${project.id}/files/package.json`,
     );
     expect(packageResponse.ok()).toBe(true);
@@ -1708,7 +1740,8 @@ createRoot(document.getElementById("root")!).render(<App />);
       repositoryRevision: newerRevision,
     });
 
-    const waitingRunResponse = await page.request.get(
+    const waitingRunResponse = await getWithBrowserSession(
+      page,
       `/api/agent-runs/${createdRun.id}`,
     );
     const waitingRunBody = (await waitingRunResponse.json()) as { run: Run };

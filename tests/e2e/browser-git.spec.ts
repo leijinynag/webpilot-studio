@@ -1,5 +1,5 @@
 import { expect, test, type Page } from "@playwright/test";
-import { postWithCsrf } from "./helpers/api";
+import { getWithBrowserSession, postWithCsrf } from "./helpers/api";
 
 type Project = {
   id: string;
@@ -213,7 +213,8 @@ test.describe("Browser Git M7 Gate", () => {
       }),
     ).toBeVisible();
 
-    const projectResponse = await page.request.get(
+    const projectResponse = await getWithBrowserSession(
+      page,
       `/api/projects/${project.id}`,
     );
     expect(projectResponse.ok()).toBe(true);

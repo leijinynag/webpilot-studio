@@ -11,10 +11,13 @@ import {
 } from "react";
 import type { editor } from "monaco-editor";
 import {
+  Bot,
   Code2,
   ExternalLink,
   FilePlus2,
+  FolderTree,
   GitBranch,
+  PanelsTopLeft,
   Play,
   Save,
   WandSparkles,
@@ -83,6 +86,7 @@ import { useUiI18n } from "@/infrastructure/i18n/ui";
 import { cn } from "@/lib/utils";
 
 type WorkspaceView = "code" | "preview";
+type MobileWorkspacePanel = "agent" | "explorer" | "workspace";
 type FileOperation =
   | { mode: "create"; path: "" }
   | { mode: "rename"; path: string }
@@ -142,6 +146,7 @@ export function ProjectWorkspace({
     (() => void) | null
   >(null);
   const [view, setView] = useState<WorkspaceView>("preview");
+  const [mobilePanel, setMobilePanel] = useState<MobileWorkspacePanel>("agent");
   const [operation, setOperation] = useState<FileOperation>(null);
   const [mutationPending, setMutationPending] = useState(false);
   const [agentRevision, setAgentRevision] = useState(project.revision);
@@ -1228,7 +1233,50 @@ export function ProjectWorkspace({
           </Button>
         </section>
       ) : (
-        <div className="workbench-grid" ref={workbenchGridRef}>
+        <div
+          className="workbench-grid"
+          data-mobile-panel={mobilePanel}
+          ref={workbenchGridRef}
+        >
+          {/*
+           * 窄屏不再保留可横向滚动的桌面画布，而是让三个高频区域共享同一视口。
+           * 面板不会卸载，Agent 历史、Monaco 草稿和 Preview Runtime 都能继续保留。
+           */}
+          <ToggleGroup
+            aria-label={t("workbench.layout.mobilePanel")}
+            className="mobile-workbench-tabs"
+            onValueChange={(value) => {
+              if (
+                value === "agent" ||
+                value === "explorer" ||
+                value === "workspace"
+              ) {
+                setMobilePanel(value);
+              }
+            }}
+            type="single"
+            value={mobilePanel}
+          >
+            <ToggleGroupItem data-mobile-panel-target="agent" value="agent">
+              <Bot />
+              {t("workbench.layout.mobileAgent")}
+            </ToggleGroupItem>
+            <ToggleGroupItem
+              data-mobile-panel-target="explorer"
+              value="explorer"
+            >
+              <FolderTree />
+              {t("workbench.layout.mobileExplorer")}
+            </ToggleGroupItem>
+            <ToggleGroupItem
+              data-mobile-panel-target="workspace"
+              value="workspace"
+            >
+              <PanelsTopLeft />
+              {t("workbench.layout.mobileWorkspace")}
+            </ToggleGroupItem>
+          </ToggleGroup>
+
           <AgentPanel
             dirtyPaths={dirtyPaths}
             onClientToolRequest={handleClientToolRequest}
@@ -1277,6 +1325,7 @@ export function ProjectWorkspace({
                 onOpen={(path) => {
                   dispatch({ type: "open", path });
                   setView("code");
+                  setMobilePanel("workspace");
                 }}
                 onRename={(path) => setOperation({ mode: "rename", path })}
               />
