@@ -276,17 +276,8 @@ describe("WebContainerRuntimeManager", () => {
         return process;
       }
 
-      const controlledProcess = new FakeWebContainerProcess(0);
-      Object.defineProperty(controlledProcess, "exit", {
-        value: runtime.devExit,
-      });
-      Object.defineProperty(controlledProcess, "output", {
-        value: new ReadableStream<string>({
-          start(controller) {
-            emitDevOutput = (line) => controller.enqueue(line);
-          },
-        }),
-      });
+      const controlledProcess = new FakeWebContainerProcess(runtime.devExit);
+      emitDevOutput = (line) => controlledProcess.emitOutput(line);
       return controlledProcess;
     };
     const manager = new WebContainerRuntimeManager({
@@ -482,13 +473,10 @@ describe("WebContainerRuntimeManager", () => {
       const process = await originalSpawn(command, args);
 
       if (args[0] === "install") {
-        Object.defineProperty(process, "output", {
-          value: new ReadableStream<string>({
-            start(controller) {
-              controller.enqueue("install still streaming\n");
-            },
-          }),
-        });
+        expect(process).toBeInstanceOf(FakeWebContainerProcess);
+        (process as FakeWebContainerProcess).emitOutput(
+          "install still streaming\n",
+        );
       }
 
       return process;
@@ -504,10 +492,9 @@ describe("WebContainerRuntimeManager", () => {
 
   it("安装超时后终止旧进程，并允许下一次启动使用干净进程重试", async () => {
     const runtime = new FakeWebContainer();
-    const blockedInstall = new FakeWebContainerProcess(0);
-    Object.defineProperty(blockedInstall, "exit", {
-      value: new Promise<number>(() => undefined),
-    });
+    const blockedInstall = new FakeWebContainerProcess(
+      new Promise<number>(() => undefined),
+    );
     const retryInstall = new FakeWebContainerProcess(0, [
       "retry dependencies installed",
     ]);
@@ -545,10 +532,9 @@ describe("WebContainerRuntimeManager", () => {
 
   it("teardown 会终止仍在运行的依赖安装进程", async () => {
     const runtime = new FakeWebContainer();
-    const blockedInstall = new FakeWebContainerProcess(0);
-    Object.defineProperty(blockedInstall, "exit", {
-      value: new Promise<number>(() => undefined),
-    });
+    const blockedInstall = new FakeWebContainerProcess(
+      new Promise<number>(() => undefined),
+    );
     const installSpawned = createDeferred<void>();
     const originalSpawn = runtime.spawn.bind(runtime);
 
@@ -599,6 +585,99 @@ describe("WebContainerRuntimeManager", () => {
     // Vitest 会把这次预期 teardown 记录为 unhandled rejection 并使测试失败。
     await Promise.resolve();
     expect(manager.getSnapshot().phase).toBe("idle");
+  });
+
+  it("复用交互式终端并支持输入、resize 与显式重启", async () => {
+    const runtime = new FakeWebContainer();
+    const manager = new WebContainerRuntimeManager({
+      boot: async () => runtime,
+      isCrossOriginIsolated: () => true,
+    });
+
+    await manager.start({}, "project-a", 3);
+    const first = await manager.startTerminal({
+      projectKey: "project-a",
+      cols: 90,
+      rows: 28,
+    });
+    const firstProcess = runtime.terminalProcess;
+    await first.input("pnpm test\r");
+    const reused = await manager.startTerminal({
+      projectKey: "project-a",
+      cols: 120,
+      rows: 36,
+    });
+
+    expect(reused).toBe(first);
+    expect(runtime.calls.filter((call) => call === "jsh")).toHaveLength(1);
+    expect(runtime.terminalProcess?.inputs).toEqual(["pnpm test\r"]);
+    expect(runtime.terminalProcess?.dimensions).toEqual([
+      { cols: 90, rows: 28 },
+      { cols: 120, rows: 36 },
+    ]);
+
+    const restarted = await manager.restartTerminal({
+      projectKey: "project-a",
+      cols: 80,
+      rows: 24,
+    });
+    expect(firstProcess?.killed).toBe(true);
+    expect(restarted).not.toBe(first);
+    expect(runtime.calls.filter((call) => call === "jsh")).toHaveLength(2);
+  });
+
+  it("终端输出支持回放订阅，项目 teardown 会终止终端", async () => {
+    const runtime = new FakeWebContainer();
+    const manager = new WebContainerRuntimeManager({
+      boot: async () => runtime,
+      isCrossOriginIsolated: () => true,
+    });
+
+    await manager.start({}, "project-a", 1);
+    const terminal = await manager.startTerminal({
+      projectKey: "project-a",
+      cols: 80,
+      rows: 24,
+    });
+    runtime.terminalProcess?.emitOutput("first command\n");
+    const output: string[] = [];
+    const unsubscribe = terminal.subscribeOutput((chunk) => output.push(chunk));
+
+    expect(output.join("")).toContain("WebContainer shell ready");
+    expect(output.join("")).toContain("first command");
+
+    unsubscribe();
+    manager.teardown();
+    expect(runtime.terminalProcess?.killed).toBe(true);
+  });
+
+  it("运行环境未 ready 或项目身份不匹配时拒绝启动终端", async () => {
+    const runtime = new FakeWebContainer();
+    const manager = new WebContainerRuntimeManager({
+      boot: async () => runtime,
+      isCrossOriginIsolated: () => true,
+    });
+
+    await expect(
+      manager.startTerminal({
+        projectKey: "project-a",
+        cols: 80,
+        rows: 24,
+      }),
+    ).rejects.toMatchObject({
+      diagnostic: { code: "terminal_unavailable" },
+    });
+
+    await manager.start({}, "project-a", 1);
+    await expect(
+      manager.startTerminal({
+        projectKey: "project-b",
+        cols: 80,
+        rows: 24,
+      }),
+    ).rejects.toMatchObject({
+      diagnostic: { code: "terminal_unavailable" },
+    });
   });
 
   it("当前 generation 的 dev 进程异常 rejection 会转成结构化失败", async () => {

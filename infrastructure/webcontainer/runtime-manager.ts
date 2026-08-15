@@ -1,4 +1,8 @@
-import type { FileSystemTree, WebContainerProcess } from "@webcontainer/api";
+import type {
+  FileSystemTree,
+  SpawnOptions,
+  WebContainerProcess,
+} from "@webcontainer/api";
 
 import {
   getErrorDetail,
@@ -19,17 +23,41 @@ import { createShowcaseArtifact } from "@/infrastructure/showcase/artifact";
 
 type RuntimeListener = () => void;
 type ServerReadyListener = (port: number, url: string) => void;
+type ProcessOutputListener = (chunk: string) => void;
+type ProcessExitListener = (state: WebContainerProcessExitState) => void;
 
-// Manager 只依赖运行所需的最小接口，而不是把 SDK 实例直接暴露给业务层。
-// 这样单元测试可以注入轻量 Fake，也便于未来替换进程输出或容器实现。
-export type WebContainerProcessAdapter = Pick<
-  WebContainerProcess,
-  "exit" | "kill" | "output"
->;
+export type WebContainerProcessExitState =
+  | { status: "running"; code: null; error: null }
+  | { status: "exited"; code: number; error: null }
+  | { status: "failed"; code: null; error: string };
+
+/**
+ * SDK 原生进程把输入、输出直接暴露为 Web Streams。项目层改为小型适配器：
+ * - 输出只读取一次，再广播给 Runtime 日志与 xterm，避免 ReadableStream 被重复锁定；
+ * - 每次 input 都短暂获取 writer，组件重挂载不会遗留永久锁；
+ * - exit rejection 会被适配层观察，用户停止进程时不会产生未处理异常。
+ */
+export type WebContainerProcessAdapter = {
+  readonly exit: Promise<number>;
+  input(data: string): Promise<void>;
+  resize(cols: number, rows: number): void;
+  kill(): void;
+  subscribeOutput(
+    listener: ProcessOutputListener,
+    options?: { replay?: boolean },
+  ): () => void;
+  subscribeExit(listener: ProcessExitListener): () => void;
+  getExitState(): WebContainerProcessExitState;
+  waitForOutput(): Promise<void>;
+};
 
 export type WebContainerAdapter = {
   mount(tree: FileSystemTree): Promise<void>;
-  spawn(command: string, args: string[]): Promise<WebContainerProcessAdapter>;
+  spawn(
+    command: string,
+    args: string[],
+    options?: SpawnOptions,
+  ): Promise<WebContainerProcessAdapter>;
   on(event: "server-ready", listener: ServerReadyListener): () => void;
   fs: {
     readdir(
@@ -80,6 +108,7 @@ export type ProductionBuildResult = ShowcaseArtifact & {
 
 // 日志属于高频状态，必须设置上限，避免长时间运行后 snapshot 无限增长并拖慢 React 更新。
 const MAX_LOG_LINES = 160;
+const MAX_PROCESS_REPLAY_CHARACTERS = 128_000;
 const ANSI_ESCAPE_PATTERN =
   /[\u001B\u009B][[\]()#;?]*(?:(?:(?:[a-zA-Z\d]*(?:;[-a-zA-Z\d/#&.:=?%@~_]+)*)?\u0007)|(?:(?:\d{1,4}(?:[;:]\d{0,4})*)?[\dA-PR-TZcf-nq-uy=><~]))/g;
 const NPM_SPINNER_LINE_PATTERN = /^[|/\\-]$/;
@@ -97,13 +126,26 @@ async function bootWebContainer(): Promise<WebContainerAdapter> {
   // 动态加载确保 Next.js 服务端构建阶段不会执行依赖浏览器环境的 WebContainer 代码。
   const { WebContainer } = await import("@webcontainer/api");
 
-  return WebContainer.boot({
+  const instance = await WebContainer.boot({
     // 与 next.config.ts 返回的 COEP 响应头保持一致，SharedArrayBuffer 才能在页面中使用。
     coep: "require-corp",
     // 将预览页中的编译和运行异常转交宿主页面，后续可统一接入 Diagnostics。
     forwardPreviewErrors: true,
     workdirName: "webpilot-preview",
   });
+
+  // WebContainer 本身仍由 infrastructure 层持有。业务代码只接触稳定的
+  // Adapter 契约，SDK 升级导致的流接口变化不会扩散到 React 组件。
+  return {
+    mount: (tree) => instance.mount(tree),
+    spawn: async (command, args, options) =>
+      createWebContainerProcessAdapter(
+        await instance.spawn(command, args, options),
+      ),
+    on: (event, listener) => instance.on(event, listener),
+    fs: instance.fs,
+    teardown: () => instance.teardown(),
+  };
 }
 
 function isBrowserCrossOriginIsolated(): boolean {
@@ -160,6 +202,11 @@ export class WebContainerRuntimeManager {
   private syncTail: Promise<void> = Promise.resolve();
   private installProcess: WebContainerProcessAdapter | null = null;
   private devProcess: WebContainerProcessAdapter | null = null;
+  // 交互式终端与 dev server 共用同一 WebContainer，但生命周期彼此独立。
+  // React 面板卸载时不停止 jsh；只有显式重启、项目切换或 teardown 才终止它。
+  private terminalProcess: WebContainerProcessAdapter | null = null;
+  private terminalStartPromise: Promise<WebContainerProcessAdapter> | null =
+    null;
   // ready 状态只对当前项目有效；切换项目必须销毁旧容器，避免 mount 合并出跨项目残留文件。
   private activeProjectKey: string | null = null;
   // Repository revision 与运行镜像身份并不总是一一对应。run_preview 会在相同
@@ -219,6 +266,111 @@ export class WebContainerRuntimeManager {
     return (
       this.activeProjectKey === projectKey && this.snapshot.phase !== "idle"
     );
+  }
+
+  /**
+   * 在当前项目运行镜像中启动交互式 jsh。
+   *
+   * 同一标签页只保留一个终端进程；重复打开只同步最新尺寸并复用输出历史。
+   * generation 校验阻止项目切换期间迟到的 spawn 重新挂到新项目界面。
+   */
+  startTerminal(input: {
+    projectKey: string;
+    cols: number;
+    rows: number;
+  }): Promise<WebContainerProcessAdapter> {
+    const cols = normalizeTerminalDimension(input.cols, 80);
+    const rows = normalizeTerminalDimension(input.rows, 24);
+
+    if (
+      !this.instance ||
+      this.activeProjectKey !== input.projectKey ||
+      this.snapshot.phase !== "ready"
+    ) {
+      return Promise.reject(
+        new WebContainerRuntimeError(
+          "terminal_unavailable",
+          "项目运行环境尚未就绪，暂时无法打开终端。",
+        ),
+      );
+    }
+
+    if (
+      this.terminalProcess &&
+      this.terminalProcess.getExitState().status === "running"
+    ) {
+      this.terminalProcess.resize(cols, rows);
+      return Promise.resolve(this.terminalProcess);
+    }
+
+    if (this.terminalStartPromise) {
+      return this.terminalStartPromise.then((process) => {
+        process.resize(cols, rows);
+        return process;
+      });
+    }
+
+    const generation = this.generation;
+    const instance = this.instance;
+    this.appendLog("[terminal] 正在启动交互式 jsh...");
+    const currentStart = instance
+      .spawn("jsh", [], {
+        terminal: { cols, rows },
+      })
+      .then((process) => {
+        if (
+          generation !== this.generation ||
+          this.activeProjectKey !== input.projectKey
+        ) {
+          process.kill();
+          this.assertGeneration(generation);
+        }
+
+        this.terminalProcess = process;
+        process.subscribeExit((state) => {
+          if (
+            generation !== this.generation ||
+            state.status === "running" ||
+            this.terminalProcess !== process
+          ) {
+            return;
+          }
+
+          this.terminalProcess = null;
+          this.appendLog(
+            state.status === "exited"
+              ? `[terminal] jsh 已退出，退出码 ${state.code}。`
+              : `[terminal] jsh 异常中止：${state.error}`,
+          );
+        });
+        this.appendLog("[terminal] 交互式 jsh 已连接。");
+        return process;
+      })
+      .finally(() => {
+        if (this.terminalStartPromise === currentStart) {
+          this.terminalStartPromise = null;
+        }
+      });
+    this.terminalStartPromise = currentStart;
+
+    return currentStart;
+  }
+
+  /**
+   * 重启只影响交互式 shell，不触碰 dev server、已安装依赖或 Repository 镜像。
+   */
+  restartTerminal(input: {
+    projectKey: string;
+    cols: number;
+    rows: number;
+  }): Promise<WebContainerProcessAdapter> {
+    this.stopTerminal();
+    return this.startTerminal(input);
+  }
+
+  stopTerminal(): void {
+    this.terminalProcess?.kill();
+    this.terminalProcess = null;
   }
 
   start(
@@ -596,6 +748,8 @@ export class WebContainerRuntimeManager {
    */
   teardown(): void {
     this.generation += 1;
+    this.stopTerminal();
+    this.terminalStartPromise = null;
     this.installProcess?.kill();
     this.installProcess = null;
     this.devProcess?.kill();
@@ -982,33 +1136,31 @@ export class WebContainerRuntimeManager {
     generation: number,
     collectedLogs?: string[],
   ): Promise<void> {
-    try {
-      await process.output.pipeTo(
-        new WritableStream<string>({
-          write: (chunk) => {
-            if (generation !== this.generation) {
-              return;
-            }
+    const unsubscribe = process.subscribeOutput((chunk) => {
+      if (generation !== this.generation) {
+        return;
+      }
 
-            // 终端控制符和 npm 单字符 spinner 对诊断没有价值，还会污染浏览器文本布局。
-            // 按行清洗后再写入 snapshot，可让真实错误内容保持可复制、可测试。
-            for (const line of chunk
-              .replace(ANSI_ESCAPE_PATTERN, "")
-              .split(/\r?\n/)
-              .map((value) => value.trimEnd())
-              .filter(
-                (value) =>
-                  value.length > 0 && !NPM_SPINNER_LINE_PATTERN.test(value),
-              )) {
-              this.appendLog(`[${source}] ${line}`);
-              collectedLogs?.push(line);
-              if (source === "dev") {
-                this.captureForwardedPreviewError(line);
-              }
-            }
-          },
-        }),
-      );
+      // 终端控制符和 npm 单字符 spinner 对诊断没有价值，还会污染浏览器文本布局。
+      // 按行清洗后再写入 snapshot，可让真实错误内容保持可复制、可测试。
+      for (const line of chunk
+        .replace(ANSI_ESCAPE_PATTERN, "")
+        .split(/\r?\n/)
+        .map((value) => value.trimEnd())
+        .filter(
+          (value) =>
+            value.length > 0 && !NPM_SPINNER_LINE_PATTERN.test(value),
+        )) {
+        this.appendLog(`[${source}] ${line}`);
+        collectedLogs?.push(line);
+        if (source === "dev") {
+          this.captureForwardedPreviewError(line);
+        }
+      }
+    });
+
+    try {
+      await process.waitForOutput();
     } catch (error) {
       if (generation !== this.generation) {
         return;
@@ -1018,6 +1170,8 @@ export class WebContainerRuntimeManager {
       this.appendLog(
         `[runtime] 无法继续读取 ${source} 输出：${getErrorDetail(error) ?? "未知错误"}`,
       );
+    } finally {
+      unsubscribe();
     }
   }
 
@@ -1111,6 +1265,109 @@ if (typeof window !== "undefined") {
 
 // 只导出项目自己的最小接口，避免上层组件依赖 WebContainer SDK 的具体实现。
 export type WebContainerInstance = WebContainerAdapter;
+
+/**
+ * 将 SDK WebContainerProcess 转成可多订阅的进程适配器。
+ *
+ * outputPump 在创建时立即读取原始流，并保留有限回放缓冲。这样极快命令即使在
+ * React 完成订阅前已经输出，也不会丢失首屏提示；缓冲有硬上限，长时间终端不会
+ * 让宿主页面内存无限增长。
+ */
+function createWebContainerProcessAdapter(
+  process: WebContainerProcess,
+): WebContainerProcessAdapter {
+  const outputListeners = new Set<ProcessOutputListener>();
+  const exitListeners = new Set<ProcessExitListener>();
+  let replayBuffer = "";
+  let exitState: WebContainerProcessExitState = {
+    status: "running",
+    code: null,
+    error: null,
+  };
+
+  const outputResult = process.output.pipeTo(
+    new WritableStream<string>({
+      write(chunk) {
+        replayBuffer = `${replayBuffer}${chunk}`.slice(
+          -MAX_PROCESS_REPLAY_CHARACTERS,
+        );
+        for (const listener of outputListeners) {
+          listener(chunk);
+        }
+      },
+    }),
+  ).then(
+    () => ({ ok: true as const }),
+    (error: unknown) => ({ ok: false as const, error }),
+  );
+
+  // 这里始终注册 rejection 分支。WebContainer 在 kill 后可能 reject exit，
+  // 适配层将其归一化成状态，而不是把预期的用户操作泄漏成 unhandled rejection。
+  void process.exit.then(
+    (code) => {
+      exitState = { status: "exited", code, error: null };
+      for (const listener of exitListeners) {
+        listener(exitState);
+      }
+    },
+    (error: unknown) => {
+      exitState = {
+        status: "failed",
+        code: null,
+        error: getErrorDetail(error) ?? "进程异常中止",
+      };
+      for (const listener of exitListeners) {
+        listener(exitState);
+      }
+    },
+  );
+
+  return {
+    exit: process.exit,
+    async input(data) {
+      const writer = process.input.getWriter();
+      try {
+        await writer.write(data);
+      } finally {
+        writer.releaseLock();
+      }
+    },
+    resize(cols, rows) {
+      process.resize({
+        cols: normalizeTerminalDimension(cols, 80),
+        rows: normalizeTerminalDimension(rows, 24),
+      });
+    },
+    kill: () => process.kill(),
+    subscribeOutput(listener, options) {
+      outputListeners.add(listener);
+      if (options?.replay !== false && replayBuffer.length > 0) {
+        listener(replayBuffer);
+      }
+      return () => {
+        outputListeners.delete(listener);
+      };
+    },
+    subscribeExit(listener) {
+      exitListeners.add(listener);
+      listener(exitState);
+      return () => {
+        exitListeners.delete(listener);
+      };
+    },
+    getExitState: () => exitState,
+    async waitForOutput() {
+      const result = await outputResult;
+      if (!result.ok) {
+        throw result.error;
+      }
+    },
+  };
+}
+
+function normalizeTerminalDimension(value: number, fallback: number): number {
+  return Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
+}
 
 function toRuntimeAssetFilePath(asset: WebContainerRuntimeAsset): string {
   const normalized = asset.assetPath.replace(/^\/+/, "");

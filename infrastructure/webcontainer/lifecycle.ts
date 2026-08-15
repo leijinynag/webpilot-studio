@@ -19,7 +19,8 @@ export type WebContainerErrorCode =
   | "mount_failed"
   | "install_failed"
   | "dev_server_failed"
-  | "asset_sync_failed";
+  | "asset_sync_failed"
+  | "terminal_unavailable";
 
 export type WebContainerDiagnostic = {
   code: WebContainerErrorCode;

@@ -1,34 +1,107 @@
-import type { FileSystemTree } from "@webcontainer/api";
+import type { FileSystemTree, SpawnOptions } from "@webcontainer/api";
 
 import type {
   WebContainerAdapter,
   WebContainerProcessAdapter,
+  WebContainerProcessExitState,
 } from "@/infrastructure/webcontainer/runtime-manager";
-
-// 测试流按真实 WebContainer 的文本流形态逐行输出，让日志清洗逻辑也能被覆盖。
-function createOutputStream(lines: string[]): ReadableStream<string> {
-  return new ReadableStream<string>({
-    start(controller) {
-      for (const line of lines) {
-        controller.enqueue(`${line}\n`);
-      }
-      controller.close();
-    },
-  });
-}
 
 export class FakeWebContainerProcess implements WebContainerProcessAdapter {
   readonly exit: Promise<number>;
-  readonly output: ReadableStream<string>;
+  readonly inputs: string[] = [];
+  readonly dimensions: Array<{ cols: number; rows: number }> = [];
   killed = false;
+  private readonly outputListeners = new Set<(chunk: string) => void>();
+  private readonly exitListeners = new Set<
+    (state: WebContainerProcessExitState) => void
+  >();
+  private replayBuffer = "";
+  private readonly outputCompletion: Promise<void>;
+  private exitState: WebContainerProcessExitState = {
+    status: "running",
+    code: null,
+    error: null,
+  };
 
-  constructor(exitCode: number, lines: string[] = []) {
+  constructor(
+    exitCode: number | Promise<number>,
+    lines: string[] = [],
+    outputCompletion?: Promise<void>,
+  ) {
     this.exit = Promise.resolve(exitCode);
-    this.output = createOutputStream(lines);
+    // 默认让输出流与进程一起结束；需要模拟“exit 已完成但 stdout 未关闭”时，
+    // 测试可以单独传入一个 pending Promise，保持两条生命周期彼此独立。
+    this.outputCompletion =
+      outputCompletion ?? this.exit.then(() => undefined);
+    this.replayBuffer = lines.map((line) => `${line}\n`).join("");
+    void this.exit.then(
+      (code) => {
+        this.exitState = { status: "exited", code, error: null };
+        for (const listener of this.exitListeners) {
+          listener(this.exitState);
+        }
+      },
+      (error: unknown) => {
+        this.exitState = {
+          status: "failed",
+          code: null,
+          error: error instanceof Error ? error.message : String(error),
+        };
+        for (const listener of this.exitListeners) {
+          listener(this.exitState);
+        }
+      },
+    );
+  }
+
+  async input(data: string): Promise<void> {
+    this.inputs.push(data);
+  }
+
+  resize(cols: number, rows: number): void {
+    this.dimensions.push({ cols, rows });
   }
 
   kill(): void {
     this.killed = true;
+  }
+
+  subscribeOutput(
+    listener: (chunk: string) => void,
+    options?: { replay?: boolean },
+  ): () => void {
+    this.outputListeners.add(listener);
+    if (options?.replay !== false && this.replayBuffer) {
+      listener(this.replayBuffer);
+    }
+    return () => {
+      this.outputListeners.delete(listener);
+    };
+  }
+
+  subscribeExit(
+    listener: (state: WebContainerProcessExitState) => void,
+  ): () => void {
+    this.exitListeners.add(listener);
+    listener(this.exitState);
+    return () => {
+      this.exitListeners.delete(listener);
+    };
+  }
+
+  getExitState(): WebContainerProcessExitState {
+    return this.exitState;
+  }
+
+  async waitForOutput(): Promise<void> {
+    await this.outputCompletion;
+  }
+
+  emitOutput(chunk: string): void {
+    this.replayBuffer += chunk;
+    for (const listener of this.outputListeners) {
+      listener(chunk);
+    }
   }
 }
 
@@ -39,6 +112,8 @@ export class FakeWebContainer implements WebContainerAdapter {
   installExitCode = 0;
   // dev server 在正常运行时不会退出。默认永不 settle，避免 ready 后立刻被标记为 failed。
   devExit: Promise<number> = new Promise<number>(() => undefined);
+  terminalExit: Promise<number> = new Promise<number>(() => undefined);
+  terminalProcess: FakeWebContainerProcess | null = null;
   previewUrl = "https://5173-webpilot.local";
   private serverReadyListener: ((port: number, url: string) => void) | null =
     null;
@@ -90,10 +165,9 @@ export class FakeWebContainer implements WebContainerAdapter {
   async spawn(
     command: string,
     args: string[],
-    options?: Record<string, unknown>,
+    options?: SpawnOptions,
   ): Promise<WebContainerProcessAdapter> {
-    void options;
-    const invocation = `${command} ${args.join(" ")}`;
+    const invocation = [command, ...args].join(" ");
     this.calls.push(invocation);
 
     if (args[0] === "install") {
@@ -104,15 +178,25 @@ export class FakeWebContainer implements WebContainerAdapter {
       ]);
     }
 
-    const process = new FakeWebContainerProcess(0, [
-      args[0] === "build" ? "production build complete" : "dev server starting",
-    ]);
-    // exit 在接口上是 readonly，这里用测试专用 Promise 替换默认的立即成功结果。
-    if (args[0] === "run" && args[1] === "dev") {
-      Object.defineProperty(process, "exit", {
-        value: this.devExit,
-      });
+    if (command === "jsh") {
+      const process = new FakeWebContainerProcess(this.terminalExit, [
+        "WebContainer shell ready",
+      ]);
+      if (options?.terminal) {
+        process.resize(options.terminal.cols, options.terminal.rows);
+      }
+      this.terminalProcess = process;
+      return process;
     }
+
+    const process = new FakeWebContainerProcess(
+      args[0] === "run" && args[1] === "dev" ? this.devExit : 0,
+      [
+        args[0] === "build"
+          ? "production build complete"
+          : "dev server starting",
+      ],
+    );
 
     // 使用 microtask 模拟 spawn 返回后异步触发 server-ready，
     // 同时验证 Manager 必须在 spawn 之前完成事件订阅。
