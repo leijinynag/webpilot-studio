@@ -71,6 +71,17 @@
     "backToProjects": "Back to projects",
     "createFile": "New file",
     "formatFile": "Format current file",
+    "codeCompletion": {
+      "title": "AI inline completion",
+      "automatic": "Show completions automatically",
+      "trigger": "Generate completion now",
+      "status": {
+        "loading": "Reading model configuration",
+        "configured": "Model ready",
+        "unconfigured": "No completion model configured",
+        "error": "Unable to read model status"
+      }
+    },
     "saving": "Saving",
     "save": "Save",
     "livePreview": "Live preview",

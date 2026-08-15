@@ -4,6 +4,7 @@ import {
   createAgentProviderRuntime,
   createCodeCompletionProviderRuntime,
   createContextSummaryProviderRuntime,
+  getCodeCompletionModelStatus as resolveCodeCompletionModelStatus,
   getAgentModelOptions as resolveAgentModelOptions,
   type AgentProviderRuntime,
 } from "@/infrastructure/agent/provider-runtime-config";
@@ -29,4 +30,8 @@ export function getContextSummaryProviderRuntime(): AgentProviderRuntime {
 
 export function getCodeCompletionProviderRuntime(): AgentProviderRuntime {
   return createCodeCompletionProviderRuntime(serverEnv);
+}
+
+export function getCodeCompletionModelStatus() {
+  return resolveCodeCompletionModelStatus(serverEnv);
 }

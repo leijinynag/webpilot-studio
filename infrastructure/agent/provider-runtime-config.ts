@@ -3,6 +3,7 @@ import type { LlmProvider } from "@/domains/agent/provider";
 import { DeepSeekProvider } from "@/infrastructure/agent/deepseek-provider";
 import { OpenAiCompatibleAgentProvider } from "@/infrastructure/agent/openai-compatible-agent-provider";
 import type { ServerEnv } from "@/infrastructure/env/schema";
+import type { CodeCompletionStatus } from "@/domains/code-completion/types";
 
 export type AgentProviderName = "deepseek" | "openai-compatible";
 
@@ -24,6 +25,15 @@ type ConfiguredAgentModel = AgentModelOption & {
 
 const DEFAULT_AGENT_MODEL = "deepseek-v4-pro";
 const DEFAULT_FAST_MODEL = "deepseek-v4-flash";
+
+type CodeCompletionEnvironment = Pick<
+  ServerEnv,
+  | "AGENT_ENABLED"
+  | "LLM_PROVIDER"
+  | "LLM_API_KEY"
+  | "LLM_FAST_MODEL"
+  | "CODE_COMPLETION_MODEL"
+>;
 
 /**
  * 模型配置只允许来自服务端预留的两个环境变量。
@@ -246,15 +256,7 @@ export function createContextSummaryProviderRuntime(
  * 并沿用主 LLM Provider 的密钥与 Base URL。
  */
 export function createCodeCompletionProviderRuntime(
-  environment: Pick<
-    ServerEnv,
-    | "AGENT_ENABLED"
-    | "LLM_PROVIDER"
-    | "LLM_API_KEY"
-    | "LLM_BASE_URL"
-    | "LLM_FAST_MODEL"
-    | "CODE_COMPLETION_MODEL"
-  >,
+  environment: CodeCompletionEnvironment & Pick<ServerEnv, "LLM_BASE_URL">,
 ): AgentProviderRuntime {
   if (environment.AGENT_ENABLED !== "true") {
     throw new AgentError(
@@ -291,5 +293,25 @@ export function createCodeCompletionProviderRuntime(
       apiKey,
       baseUrl: environment.LLM_BASE_URL || "https://api.deepseek.com",
     }),
+  };
+}
+
+/**
+ * 工具栏只需要知道补全是否可用以及最终选择了哪个模型。这里绝不返回
+ * API Key 或 Base URL；即使公开项目页面可访问，该状态也不会扩大密钥边界。
+ */
+export function getCodeCompletionModelStatus(
+  environment: CodeCompletionEnvironment,
+): CodeCompletionStatus {
+  return {
+    configured:
+      environment.AGENT_ENABLED === "true" &&
+      environment.LLM_PROVIDER?.toLowerCase() === "deepseek" &&
+      Boolean(environment.LLM_API_KEY?.trim()),
+    model:
+      environment.CODE_COMPLETION_MODEL?.trim() ||
+      environment.LLM_FAST_MODEL?.trim() ||
+      DEFAULT_FAST_MODEL,
+    provider: "deepseek",
   };
 }

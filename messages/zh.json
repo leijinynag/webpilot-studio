@@ -71,6 +71,17 @@
     "backToProjects": "返回项目列表",
     "createFile": "新建文件",
     "formatFile": "格式化当前文件",
+    "codeCompletion": {
+      "title": "AI 行内补全",
+      "automatic": "自动显示补全",
+      "trigger": "立即生成补全",
+      "status": {
+        "loading": "正在读取模型配置",
+        "configured": "模型已就绪",
+        "unconfigured": "生产环境尚未配置模型",
+        "error": "模型状态读取失败"
+      }
+    },
     "saving": "Saving",
     "save": "Save",
     "livePreview": "Live preview",

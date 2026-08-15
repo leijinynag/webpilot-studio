@@ -4,6 +4,7 @@ export const CODE_COMPLETION_LANGUAGES = [
   "typescript",
   "javascript",
   "css",
+  "scss",
   "html",
   "json",
   "markdown",
@@ -95,6 +96,16 @@ export const codeCompletionResponseSchema = z
 export type CodeCompletionResponse = z.infer<
   typeof codeCompletionResponseSchema
 >;
+
+export const codeCompletionStatusSchema = z
+  .object({
+    configured: z.boolean(),
+    model: z.string().trim().min(1).max(160),
+    provider: z.literal("deepseek"),
+  })
+  .strict();
+
+export type CodeCompletionStatus = z.infer<typeof codeCompletionStatusSchema>;
 
 export type CodeCompletionSourceFile = {
   path: string;

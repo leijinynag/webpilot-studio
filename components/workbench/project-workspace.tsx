@@ -28,6 +28,10 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
+import {
+  CodeCompletionMenu,
+  useCodeCompletionSettings,
+} from "@/components/workbench/code-completion-menu";
 import { CodeEditor } from "@/components/workbench/code-editor";
 import { AgentPanel } from "@/components/workbench/agent-panel";
 import { BrowserGitMigrationDialog } from "@/components/workbench/browser-git-migration-dialog";
@@ -107,6 +111,10 @@ export function ProjectWorkspace({
     projectWorkspaceReducer,
     createProjectWorkspaceState(initialFiles, project.revision),
   );
+  const codeCompletionSettings = useCodeCompletionSettings(project.id);
+  const [codeCompletionTrigger, setCodeCompletionTrigger] = useState<
+    (() => void) | null
+  >(null);
   const [view, setView] = useState<WorkspaceView>("preview");
   const [operation, setOperation] = useState<FileOperation>(null);
   const [mutationPending, setMutationPending] = useState(false);
@@ -150,6 +158,29 @@ export function ProjectWorkspace({
   const [repositoryToolRetryNonce, setRepositoryToolRetryNonce] = useState(0);
   const stateRef = useRef(state);
   stateRef.current = state;
+
+  /**
+   * Browser Git 文件没有服务端副本，补全请求必须读取工作台 reducer 的最新草稿。
+   * 回调本身保持稳定，Provider 每次触发时再从 ref 取值，避免用户每敲一个字符
+   * 都让 Monaco Provider 因 props 变化而重新注册。
+   */
+  const getBrowserCodeCompletionFiles = useCallback(
+    () =>
+      Object.values(stateRef.current.files).map((file) => ({
+        path: file.path,
+        content: file.draftContent,
+      })),
+    [],
+  );
+
+  const handleCompletionTriggerReady = useCallback(
+    (trigger: (() => void) | null) => {
+      // React 会把函数参数当作 state updater，因此需要再包一层，保存的是
+      // Monaco 显式触发命令本身，而不是在注册阶段立刻执行它。
+      setCodeCompletionTrigger(trigger ? () => trigger : null);
+    },
+    [],
+  );
 
   useEffect(() => {
     const retryTimers = repositoryToolRetryTimersRef.current;
@@ -928,6 +959,11 @@ export function ProjectWorkspace({
                       openPaths={state.openPaths}
                     />
                     <div className="editor-actions">
+                      <CodeCompletionMenu
+                        activeFile={activeFile !== null}
+                        onTrigger={codeCompletionTrigger}
+                        settings={codeCompletionSettings}
+                      />
                       <Tooltip>
                         <TooltipTrigger asChild>
                           <Button
@@ -975,6 +1011,15 @@ export function ProjectWorkspace({
                   {view === "code" ? (
                     activeFile ? (
                       <CodeEditor
+                        codeCompletion={{
+                          automaticEnabled:
+                            codeCompletionSettings.automaticEnabled,
+                          enabled: codeCompletionSettings.configured,
+                          projectId: project.id,
+                          projectRevision: state.revision,
+                          storageKind: project.storageKind,
+                          getBrowserFiles: getBrowserCodeCompletionFiles,
+                        }}
                         file={activeFile}
                         onChange={(content) =>
                           dispatch({
@@ -986,6 +1031,7 @@ export function ProjectWorkspace({
                         onEditorReady={(editorInstance) => {
                           editorRef.current = editorInstance;
                         }}
+                        onCompletionTriggerReady={handleCompletionTriggerReady}
                         onSave={saveActiveFile}
                       />
                     ) : (
