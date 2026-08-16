@@ -56,9 +56,15 @@ export function SourceControlPage({
   const [commitMessage, setCommitMessage] = useState("");
   const [authorName, setAuthorName] = useState("Guest Builder");
   const [authorEmail, setAuthorEmail] = useState("guest@local");
-  const [loading, setLoading] = useState(isBrowserGit);
+  const [loading, setLoading] = useState(
+    isBrowserGit && project.status !== "unavailable",
+  );
   const [pendingAction, setPendingAction] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(
+    project.status === "unavailable"
+      ? t("sourceControl.repositoryDataLost")
+      : null,
+  );
   const [selectedCommitOid, setSelectedCommitOid] = useState<string | null>(
     null,
   );
@@ -68,6 +74,8 @@ export function SourceControlPage({
       return;
     }
 
+    // 服务端项目索引已经确认本地仓库丢失时，不再自动重复等待同一个 Worker
+    // 恢复。用户仍可主动点击“重试恢复”，用于浏览器权限或存储只是暂时异常的情况。
     setLoading(true);
     setError(null);
     try {
@@ -91,13 +99,17 @@ export function SourceControlPage({
   }, [repository, t]);
 
   useEffect(() => {
+    if (project.status === "unavailable") {
+      return;
+    }
+
     // 延后一帧启动 IndexedDB/Worker 恢复，避免 effect 执行阶段触发级联渲染。
     const task = window.setTimeout(() => {
       void refresh();
     }, 0);
 
     return () => window.clearTimeout(task);
-  }, [refresh]);
+  }, [project.status, refresh]);
 
   const groups = useMemo(
     () => groupBrowserGitChanges(state?.files ?? []),

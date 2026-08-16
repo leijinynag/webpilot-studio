@@ -427,6 +427,7 @@
     "databaseDescription": "当前项目使用 Database Repository。只有 Browser Git 项目才会在当前浏览器提供 stage、commit、历史和备份导出。",
     "backToWorkbench": "返回 Agent 工作台",
     "unavailable": "本地仓库不可用",
+    "repositoryDataLost": "当前浏览器中的本地仓库数据已经丢失。",
     "unavailableDescription": "WebPilot Studio 不会自动创建空仓库覆盖原项目。若只是浏览器临时故障，可以重试恢复；若站点数据已被清理，请返回项目列表处理该项目。",
     "retryRestore": "重试恢复",
     "backToProjects": "返回项目列表",

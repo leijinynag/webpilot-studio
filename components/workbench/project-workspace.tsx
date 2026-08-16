@@ -1200,7 +1200,12 @@ export function ProjectWorkspace({
             />
           ) : null}
           <Button asChild size="sm" variant="outline">
-            <Link href={`/p/${project.id}/source-control`}>
+            {/*
+             * Browser Git 丢失后，工作台会先把项目索引标记为 unavailable。
+             * 禁止预取可避免点击时复用标记前缓存的 ready 页面，Source Control
+             * 因而总能读取最新恢复状态，而不是再次等待一个已不存在的仓库。
+             */}
+            <Link href={`/p/${project.id}/source-control`} prefetch={false}>
               <GitBranch data-icon="inline-start" />
               {t("workbench.sourceControl")}
             </Link>

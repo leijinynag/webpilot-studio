@@ -81,6 +81,10 @@ test("soft deletes and restores a project from the workspace", async ({
 });
 
 test("exposes all 0.2 routes", async ({ page }) => {
+  // 该用例只验证路由能够完成应用 DOM 提交，不要求字体、图片等所有子资源都触发
+  // load。开发模式下连续访问多个动态路由会按需编译，等待完整 load 容易把资源
+  // 延迟误判为路由不可用。
+  test.setTimeout(90_000);
   const projectId = await createProject(page, "Route coverage project");
   const routes = [
     "/",
@@ -92,8 +96,13 @@ test("exposes all 0.2 routes", async ({ page }) => {
   ];
 
   for (const route of routes) {
-    await page.goto(route);
-    await expect(page.locator("main").first()).toBeVisible();
+    await page.goto(route, {
+      waitUntil: "domcontentloaded",
+      timeout: 30_000,
+    });
+    await expect(page.locator("main").first()).toBeVisible({
+      timeout: 10_000,
+    });
   }
 });
 

@@ -149,8 +149,32 @@ export function ProjectsPage() {
         );
       }
 
+      const updatedAt = new Date().toISOString();
+
+      // mutation 接口成功已经是服务端的权威确认，不必再让用户等待第二次项目列表
+      // 请求。这里先乐观更新当前快照，让删除/恢复立即反映到 UI；随后静默校准
+      // 完整列表，补回其它标签页或并发操作带来的变化。
+      setProjects((currentProjects) =>
+        currentProjects.map((currentProject) =>
+          currentProject.id === project.id
+            ? {
+                ...currentProject,
+                deletedAt: action === "delete" ? updatedAt : null,
+                updatedAt,
+              }
+            : currentProject,
+        ),
+      );
       setProjectToDelete(null);
-      await loadProjects();
+
+      void fetchProjects(locale)
+        .then((loadedProjects) => {
+          setProjects(loadedProjects);
+        })
+        .catch(() => {
+          // 后台校准失败不能回滚已经成功的 mutation。下一次页面刷新或用户主动
+          // 重试仍会重新读取服务端，当前交互则保持确定、可用的成功状态。
+        });
     } catch (mutationError) {
       setError(
         mutationError instanceof Error

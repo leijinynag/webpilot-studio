@@ -427,6 +427,7 @@
     "databaseDescription": "This project uses a Database Repository. Stage, commit, history, and backup export are available in the browser only for Browser Git projects.",
     "backToWorkbench": "Back to Agent workspace",
     "unavailable": "Local repository unavailable",
+    "repositoryDataLost": "The local repository data in this browser is no longer available.",
     "unavailableDescription": "WebPilot Studio will not create an empty repository over the original project. Retry a temporary browser failure, or return to the project list if site data was cleared.",
     "retryRestore": "Retry restore",
     "backToProjects": "Back to projects",

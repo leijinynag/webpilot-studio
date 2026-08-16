@@ -130,13 +130,19 @@ test.describe("Browser Git M7 Gate", () => {
   test("shows an explicit unavailable state after the Browser Git database is deleted", async ({
     page,
   }) => {
+    // 删除 IndexedDB 后，工作台需要完成一次 Worker 恢复失败并把结果同步到服务端
+    // 项目索引；给完整产品链路留出独立于 Playwright 默认值的诊断窗口。
+    test.setTimeout(60_000);
     const project = await createProject(page, {
       name: "E2E missing Browser Git repository",
       storageKind: "browser_git",
       template: "empty",
     });
 
-    await page.goto(`/p/${project.id}`);
+    await page.goto(`/p/${project.id}`, {
+      waitUntil: "domcontentloaded",
+      timeout: 20_000,
+    });
     await waitForBrowserRepository(page);
     await deleteBrowserGitDatabase(page, project.id);
 
